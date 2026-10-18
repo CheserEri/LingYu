@@ -16,17 +16,18 @@ from unittest import mock
 
 import httpx
 
-from wechat_mcp.adapters.deepseekgirl import (
-    DeepSeekGirlAdapter,
+from lingyu.adapters.wechat import (
+    WeChatAdapter,
     _looks_like_chat_id,
 )
-from wechat_mcp.bot import BotConfig, BotEngine, get_persona, reset_persona
-from wechat_mcp.bot import browser as browser_mod
-from wechat_mcp.bot import douyin as douyin_mod
-from wechat_mcp.bot import links as links_mod
-from wechat_mcp.bot.links import LinkInfo, extract_urls, format_link_block
-from wechat_mcp.bot.llm import LLMClient, LLMError
-from wechat_mcp.schemas import (
+from lingyu.bridge import bridge_file
+from lingyu.bot import BotConfig, BotEngine, get_persona, reset_persona
+from lingyu.bot import browser as browser_mod
+from lingyu.bot import douyin as douyin_mod
+from lingyu.bot import links as links_mod
+from lingyu.bot.links import LinkInfo, extract_urls, format_link_block
+from lingyu.bot.llm import LLMClient, LLMError
+from lingyu.schemas import (
     ConnectionState,
     MessageRecord,
     SendResult,
@@ -243,12 +244,12 @@ class TriggerTests(unittest.TestCase):
 
     def test_explain_no_reply_prints_bot_nickname(self):
         """群里没 @ 到机器人时给一行可读原因，并打出机器人当前昵称。"""
-        engine = BotEngine(FakeAdapter(names={"Viollete"}), BotConfig())
+        engine = BotEngine(FakeAdapter(names={"小助手"}), BotConfig())
         engine._explain_no_reply(make_record(content="@群助手 在吗"))
         lines = [line["message"] for line in engine.get_logs(0)]
         self.assertEqual(len(lines), 1)
         self.assertIn("未 @ 机器人", lines[0])
-        self.assertIn("Viollete", lines[0])
+        self.assertIn("小助手", lines[0])
 
     def test_explain_no_reply_reports_unknown_nickname(self):
         engine = BotEngine(FakeAdapter(names=set()), BotConfig())
@@ -398,7 +399,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_untriggered_group_message_is_explained_in_log(self):
         """端到端：群里没 @ 到机器人 → 不回复，但日志里能看到原因与机器人昵称。"""
-        adapter = FakeAdapter(names={"Viollete"})
+        adapter = FakeAdapter(names={"小助手"})
         cfg = BotConfig(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
         engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
         await engine.start()
@@ -408,7 +409,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent, [])
         lines = [line["message"] for line in engine.get_logs(0)]
         self.assertTrue(
-            any("未 @ 机器人" in m and "Viollete" in m for m in lines), lines
+            any("未 @ 机器人" in m and "小助手" in m for m in lines), lines
         )
 
     async def test_continuation_replies_without_at(self):
@@ -878,17 +879,17 @@ class ChatIdentityTests(unittest.TestCase):
         self.assertFalse(_looks_like_chat_id("玩什么游戏？！都给劳资打米！！"))
 
     def test_non_id_passthrough(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         self.assertEqual(
             adapter.resolve_chat_identifier("玩什么游戏？"), "玩什么游戏？"
         )
 
     def test_id_without_db_unresolved(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         self.assertEqual(adapter.resolve_chat_identifier(ROOM_ID), "")
 
     def test_id_resolved_from_contact_db(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(
             db=_FakeDB(
                 [
@@ -906,7 +907,7 @@ class ChatIdentityTests(unittest.TestCase):
         )
 
     def test_id_not_found_unresolved(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         # 命中的是别的会话（模糊匹配），不是该 ID 本身 → 拒绝
         adapter._bridge = _FakeBridge(
             db=_FakeDB([{"username": "other@chatroom", "nick_name": "别的群"}])
@@ -915,7 +916,7 @@ class ChatIdentityTests(unittest.TestCase):
 
     def test_cached_name_used_when_db_unavailable(self):
         # DB 快照偶发不可用（锁/WAL），用曾成功解析过的名字兜底
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._chat_id_names[ROOM_ID] = "玩什么游戏？"
         self.assertEqual(adapter.resolve_chat_identifier(ROOM_ID), "玩什么游戏？")
 
@@ -926,7 +927,7 @@ class ChatIdentityTests(unittest.TestCase):
             sender_name="张三",
             content="你好",
         )
-        record = DeepSeekGirlAdapter._to_record(msg)
+        record = WeChatAdapter._to_record(msg)
         self.assertEqual(record.chat, "玩什么游戏？！都给劳资打米！！")
         self.assertEqual(record.chat_id, ROOM_ID)
 
@@ -938,7 +939,7 @@ class ChatIdentityTests(unittest.TestCase):
             sender_name="张三",
             content="你好",
         )
-        record = DeepSeekGirlAdapter._to_record(msg)
+        record = WeChatAdapter._to_record(msg)
         self.assertEqual(record.chat, ROOM_ID)
         self.assertEqual(record.chat_id, ROOM_ID)
 
@@ -947,7 +948,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
     """发送目标为会话 ID 时：能反查就发显示名，查不到就明确失败。"""
 
     async def test_unresolved_id_rejected(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(db=_FakeDB([]))
         result = await adapter.send_message(ROOM_ID, "hi")
         self.assertFalse(result.ok)
@@ -960,7 +961,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         无名群是最容易踩的坑：群里 @ 了机器人、模型也答了，但微信搜索框没有名字
         可用，回复就是发不出去。只报「无法解析会话名」用户根本猜不到原因。
         """
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(db=_FakeDB([]))
         result = await adapter.send_message(ROOM_ID, "hi")
         self.assertFalse(result.ok)
@@ -969,7 +970,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unresolved_private_error_has_no_group_hint(self):
         """私聊没有群名一说，不要给出误导性的提示。"""
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(db=_FakeDB([]))
         result = await adapter.send_message("wxid_abc123", "hi")
         self.assertFalse(result.ok)
@@ -977,7 +978,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("群名称", result.error["message"])
 
     async def test_id_resolved_before_send(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(
             db=_FakeDB(
                 [{"username": ROOM_ID, "nick_name": "玩什么游戏？", "remark": ""}]
@@ -988,7 +989,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._bridge.sent, [("玩什么游戏？", "hi")])
 
     async def test_on_message_caches_resolved_name(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         msg = SimpleNamespace(
             room_id=ROOM_ID,
             room_name="玩什么游戏？",
@@ -1022,8 +1023,7 @@ class QuoteParserTests(unittest.TestCase):
     def _parser():
         import importlib.util
 
-        root = Path(__file__).resolve().parents[1]
-        module_file = root / "packaging" / "wechat_bridge.py"
+        module_file = bridge_file()
         spec = importlib.util.spec_from_file_location(
             "packaged_wechat_bridge", module_file
         )
@@ -1125,8 +1125,7 @@ class BridgeNormalizeTests(unittest.TestCase):
     def _module():
         import importlib.util
 
-        root = Path(__file__).resolve().parents[1]
-        module_file = root / "packaging" / "wechat_bridge.py"
+        module_file = bridge_file()
         spec = importlib.util.spec_from_file_location(
             "packaged_wechat_bridge_norm", module_file
         )
@@ -1180,8 +1179,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
     def _module():
         import importlib.util
 
-        root = Path(__file__).resolve().parents[1]
-        module_file = root / "packaging" / "wechat_bridge.py"
+        module_file = bridge_file()
         spec = importlib.util.spec_from_file_location(
             "packaged_wechat_bridge_at", module_file
         )
@@ -1209,17 +1207,17 @@ class BridgeAtDetectionTests(unittest.TestCase):
         """没有 is_at / is_at_me 字段的消息对象（同 wechatauto 实际行为）。"""
 
     def test_matches_bot_name(self):
-        bridge = self._bridge(names={"Viollete"})
-        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete 在吗"))
-        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete？"))
-        self.assertTrue(bridge._is_at_me(self._Msg(), "在吗 @Viollete"))
+        bridge = self._bridge(names={"小助手"})
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@小助手 在吗"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@小助手？"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "在吗 @小助手"))
         # 零宽字符（微信 @ 后常带）也要认
-        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete\u200b在吗"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@小助手\u200b在吗"))
         self.assertFalse(bridge._is_at_me(self._Msg(), "@群助手 在吗"))
         self.assertFalse(bridge._is_at_me(self._Msg(), "随便聊聊"))
 
     def test_at_flag_on_message_object_is_respected(self):
-        bridge = self._bridge(names={"Viollete"})
+        bridge = self._bridge(names={"小助手"})
 
         class _Flagged:
             is_at = True
@@ -1228,7 +1226,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
 
     def test_rename_is_picked_up_without_restart(self):
         """改完昵称后，下一条 @ 消息就能自动跟上，不必重启程序。"""
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         def fake_load():
             bridge._bot_names = {"群助手"}
@@ -1239,7 +1237,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
         self.assertEqual(bridge._bot_names, {"群助手"})
 
     def test_refresh_is_throttled(self):
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
         calls = []
 
         def fake_load():
@@ -1253,7 +1251,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_no_refresh_without_at_sign(self):
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
         calls = []
 
         def fake_load():
@@ -1266,7 +1264,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
     def test_load_keeps_previous_names_when_nothing_readable(self):
         """读不到昵称时保留旧值——清空会让群里 @ 机器人彻底失效。"""
         module = self._module()
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         class _FakeWx:
             nickname = ""
@@ -1278,10 +1276,10 @@ class BridgeAtDetectionTests(unittest.TestCase):
 
         bridge._wx = _FakeWx()
         bridge._load_bot_identity()
-        self.assertEqual(bridge._bot_names, {"Viollete"})
+        self.assertEqual(bridge._bot_names, {"小助手"})
 
     def test_load_reads_nickname_and_wxid(self):
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         class _FakeWx:
             nickname = "群助手"
@@ -1310,8 +1308,7 @@ class BridgeRoomNameTests(unittest.TestCase):
     def _module():
         import importlib.util
 
-        root = Path(__file__).resolve().parents[1]
-        module_file = root / "packaging" / "wechat_bridge.py"
+        module_file = bridge_file()
         spec = importlib.util.spec_from_file_location(
             "packaged_wechat_bridge_room", module_file
         )
@@ -1439,8 +1436,7 @@ class BridgeMediaContextTests(unittest.TestCase):
     def _module():
         import importlib.util
 
-        root = Path(__file__).resolve().parents[1]
-        module_file = root / "packaging" / "wechat_bridge.py"
+        module_file = bridge_file()
         spec = importlib.util.spec_from_file_location(
             "packaged_wechat_bridge_media", module_file
         )
@@ -1512,10 +1508,11 @@ class BridgeMediaContextTests(unittest.TestCase):
 class StubResolver:
     """替代 LinkResolver 的测试替身：完全不触网。"""
 
-    def __init__(self, infos=None, download_path=""):
+    def __init__(self, infos=None, download_path="", download_error=None):
         self.timeout = 5.0
         self._infos = dict(infos or {})
         self.download_path = download_path
+        self.download_error = download_error
         self.batches = []
         self.downloads = []
 
@@ -1528,6 +1525,8 @@ class StubResolver:
 
     async def download(self, url, outdir, max_mb=0):
         self.downloads.append((url, outdir, max_mb))
+        if self.download_error is not None:
+            raise self.download_error
         return self.download_path
 
 
@@ -1780,8 +1779,7 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
     def _module():
         import importlib.util
 
-        root = Path(__file__).resolve().parents[1]
-        module_file = root / "packaging" / "wechat_bridge.py"
+        module_file = bridge_file()
         spec = importlib.util.spec_from_file_location(
             "packaged_wechat_bridge_filesend", module_file
         )
@@ -2370,7 +2368,7 @@ class WeChatWindowVisibilityTests(unittest.TestCase):
         module = self._module()
         try:
             hwnd = win32gui.CreateWindow(
-                "STATIC", "wechat-mcp-hidden-test", 0, 0, 0, 10, 10, 0, 0, 0, None
+                "STATIC", "lingyu-hidden-test", 0, 0, 0, 10, 10, 0, 0, 0, None
             )
         except Exception as exc:  # pragma: no cover - 桌面会话受限时跳过
             self.skipTest(f"无法创建测试窗口: {exc}")
@@ -2423,7 +2421,7 @@ class BrowserBridgeTests(unittest.TestCase):
     def test_sweep_removes_stale_and_keeps_fresh(self):
         stale = self._make("unittest-stale", browser_mod._PROFILE_STALE_SECONDS + 60)
         fresh = self._make("unittest-fresh", 5)
-        other = Path(tempfile.gettempdir()) / "wechat-mcp-unrelated"
+        other = Path(tempfile.gettempdir()) / "lingyu-unrelated"
         other.mkdir(exist_ok=True)
         try:
             browser_mod._sweep_stale_profiles()
@@ -2961,6 +2959,80 @@ class DouyinTests(unittest.TestCase):
         self.assertEqual(calls, ["44", "44"])
 
 
+class DouyinImagePostTests(unittest.TestCase):
+    """图文作品：``play_addr`` 里是背景音乐，不是视频。
+
+    回归点：2026-10-07 一条 ``douyin.com/note/...`` 图文链接被下成了 **385 KB** 的
+    「视频」——ffmpeg 认出那是 24 秒 / 128 kbps 的纯 mp3 音轨。原因是图文作品的
+    ``bit_rate`` 为空，``_pick_play_url`` 兜底取了 ``play_addr.url_list[0]``，
+    也就是 ``douyinstatic.com/obj/ies-music/xxx.mp3``，再被 ``download_video``
+    存成 ``.mp4`` 发了出去。
+    """
+
+    def test_is_audio_url(self):
+        cases = {
+            "https://sf6-cdn-tos.douyinstatic.com/obj/ies-music/7649249341135276806.mp3": True,
+            "https://sf6-cdn-tos.douyinstatic.com/obj/ies-music/1.mp3?a=1&b=2": True,
+            "https://x.com/obj/ies-music/1": True,
+            "https://x.com/a.m4a": True,
+            "https://v26-web.douyinvod.com/xxx/video/tos/cn/oABC/?a=6383&br=2417": False,
+            "https://www.douyin.com/aweme/v1/play/?video_id=v2800": False,
+            "": False,
+        }
+        for url, expected in cases.items():
+            self.assertEqual(douyin_mod._is_audio_url(url), expected, url)
+
+    def test_image_post_music_is_not_a_video(self):
+        detail = {
+            "aweme_id": "7692846453023337718",
+            "aweme_type": 68,
+            "desc": "就这一段动静",
+            "images": [{"url_list": ["https://img/1.jpg"]}],
+            "video": {
+                "duration": 0,
+                "play_addr": {
+                    "url_list": [
+                        "https://sf6-cdn-tos.douyinstatic.com/obj/ies-music/7649.mp3"
+                    ]
+                },
+            },
+        }
+        video = douyin_mod.parse_detail(detail)
+        self.assertEqual(video.video_url, "", "图文作品的背景音乐不能被当成视频")
+        self.assertTrue(video.is_images, "置空后才应被识别成图文作品")
+        self.assertEqual(video.images, ["https://img/1.jpg"])
+
+    def test_real_video_url_is_kept(self):
+        detail = {
+            "aweme_id": "1",
+            "aweme_type": 0,
+            "video": {
+                "duration": 128834,
+                "play_addr": {
+                    "url_list": [
+                        "https://v26-web.douyinvod.com/b55/video/tos/cn/og8y/?a=6383"
+                    ]
+                },
+            },
+        }
+        video = douyin_mod.parse_detail(detail)
+        self.assertTrue(video.video_url.startswith("https://v26-web.douyinvod.com/"))
+        self.assertFalse(video.is_images)
+
+    def test_pick_play_url_skips_audio_candidates(self):
+        video = {
+            "bit_rate": [
+                {"bit_rate": 900, "play_addr": {"url_list": ["https://x/music.mp3"]}},
+                {"bit_rate": 100, "play_addr": {"url_list": ["https://x/v.mp4"]}},
+            ]
+        }
+        self.assertEqual(douyin_mod._pick_play_url(video), "https://x/v.mp4")
+
+    def test_pick_play_url_empty_when_only_audio(self):
+        video = {"play_addr": {"url_list": ["https://x/obj/ies-music/1.mp3"]}}
+        self.assertEqual(douyin_mod._pick_play_url(video), "")
+
+
 class DouyinLinkTests(unittest.TestCase):
     """抖音在 links.py 里的接线：解析走浏览器桥，下载走 play_addr 直链。"""
 
@@ -3048,7 +3120,12 @@ class DouyinLinkTests(unittest.TestCase):
         self.assertEqual(seen["max_bytes"], 5 * 1024 * 1024)
         self.assertTrue(path.endswith("标题.mp4"))
 
-    def test_download_skips_image_posts(self):
+    def test_download_image_posts_ask_for_a_notice(self):
+        """图文作品没有视频流：抛带提示语的异常，而不是返回 None 静默跳过。
+
+        静默跳过时群里只看到一句「正在解析链接」然后什么都没有；现在明确回一句
+        「此链接为图文配乐，暂不支持下载」。
+        """
         resolver = links_mod.LinkResolver()
         video = douyin_mod.DouyinVideo(
             aweme_id="123", ok=True, title="图文", images=["https://i1.jpg"]
@@ -3058,17 +3135,18 @@ class DouyinLinkTests(unittest.TestCase):
                  mock.patch.object(
                      douyin_mod, "download_video", side_effect=AssertionError("不该下载")
                  ):
-                path = resolver._download_sync(
-                    "https://www.douyin.com/video/1234567890", tmp, 0
-                )
-        self.assertIsNone(path)
+                with self.assertRaises(links_mod.UnsupportedLinkContent) as ctx:
+                    resolver._download_sync(
+                        "https://www.douyin.com/video/1234567890", tmp, 0
+                    )
+        self.assertEqual(str(ctx.exception), links_mod.IMAGE_POST_NOTICE)
 
 
 class TweetTests(unittest.TestCase):
     """X 推文：URL 识别、token、JSON 解析、卡片渲染。"""
 
     def test_is_tweet_url(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         for url in (
             "https://x.com/Interior/status/507185938620219395",
@@ -3084,20 +3162,20 @@ class TweetTests(unittest.TestCase):
             self.assertFalse(tweet_mod.is_tweet_url(url), url)
 
     def test_tweet_id(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         self.assertEqual(tweet_mod.tweet_id("https://x.com/a/status/123"), "123")
         self.assertIsNone(tweet_mod.tweet_id("https://x.com/a"))
 
     def test_token_matches_react_tweet_algorithm(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         self.assertEqual(
             tweet_mod._token("507185938620219395"), "189ddm8u5hzych3nyqhvvx6r"
         )
 
     def test_parse_tweet(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         payload = {
             "id_str": "123",
@@ -3125,7 +3203,7 @@ class TweetTests(unittest.TestCase):
         self.assertIn("含视频", info.summary())
 
     def test_parse_tweet_without_media_is_not_video(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.parse_tweet(
             {"id_str": "1", "text": "纯文字", "user": {"screen_name": "a"}},
@@ -3135,13 +3213,13 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(info.photos, [])
 
     def test_parse_tweet_rejects_payload_without_id(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         self.assertIsNone(tweet_mod.parse_tweet({}, "https://x.com/a/status/1"))
 
     def test_parse_tweet_picks_best_video_variant(self):
         """有多个 mp4 变体时取码率最高的那条；非 mp4 一律忽略。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         payload = {
             "id_str": "9",
@@ -3165,7 +3243,7 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(info.video_url, "https://high.mp4")
 
     def test_parse_tweet_without_variants_has_no_video_url(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.parse_tweet(
             {"id_str": "9", "mediaDetails": [{"type": "video"}]}, "https://x.com/a/status/9"
@@ -3175,7 +3253,7 @@ class TweetTests(unittest.TestCase):
 
     def test_parse_tweet_uses_video_poster_as_thumbnail(self):
         """视频/动图没有 photos 条目，须用封面帧当卡片缩略图。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         payload = {
             "id_str": "9",
@@ -3201,7 +3279,7 @@ class TweetTests(unittest.TestCase):
         self.assertNotIn("张图", info.summary())
 
     def test_parse_tweet_without_poster_has_no_video_poster(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.parse_tweet(
             {"id_str": "9", "mediaDetails": [{"type": "video"}]}, "https://x.com/a/status/9"
@@ -3210,7 +3288,7 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(info.photos, [])
 
     def test_download_video_streams_to_file(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         class _Resp:
             headers = {"Content-Length": "6"}
@@ -3239,7 +3317,7 @@ class TweetTests(unittest.TestCase):
             self.assertEqual(Path(path).read_bytes(), b"abcdef")
 
     def test_download_video_respects_size_limit(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         class _Resp:
             headers = {"Content-Length": str(10 * 1024 * 1024)}
@@ -3266,7 +3344,7 @@ class TweetTests(unittest.TestCase):
 
     def test_render_card_writes_png(self):
         """不触网渲染（无头像/无配图）也要能出图，且中英 emoji 混排不报错。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.Tweet(
             id="1",
@@ -3300,7 +3378,7 @@ class TweetTests(unittest.TestCase):
 
     def test_fit_cover_crops_instead_of_stretching(self):
         """等比覆盖裁切：300×100 塞进 100×100 应只剩中间那一条，而不是压扁三色。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         out = tweet_mod._fit_cover(self._striped(300, 100), 100, 100)
         self.assertEqual(out.size, (100, 100))
@@ -3312,7 +3390,7 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(squeezed.getpixel((95, 50)), (0, 0, 255))
 
     def test_media_boxes_single_keeps_aspect_ratio(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
         inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
@@ -3327,7 +3405,7 @@ class TweetTests(unittest.TestCase):
         self.assertAlmostEqual(box[2] / box[3], 0.5, places=2)
 
     def test_media_boxes_multi_grid_is_uniform_and_inside_card(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
         inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
@@ -3347,7 +3425,7 @@ class TweetTests(unittest.TestCase):
 
     def test_render_card_with_multiple_photos(self):
         """多图推文：横竖混排也要出图且不报错（回归「多图变形」）。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
         info = tweet_mod.Tweet(
@@ -3385,7 +3463,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
         return BotEngine(adapter, cfg, llm_factory=lambda c: llm)
 
     async def _run(self, has_video: bool):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         engine = self._engine(adapter, link_download_enabled=True)
@@ -3430,7 +3508,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tweet_card_can_be_disabled(self):
         """关掉卡片开关后，含视频的推文只发视频。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         engine = self._engine(
@@ -3458,7 +3536,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tweet_video_prefers_direct_link(self):
         """有 mp4 直链时直接下载，不该再走 yt-dlp。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         # 本用例只关心视频下载路径，关掉卡片开关以免多出一张卡片图。
@@ -3493,7 +3571,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tweet_video_falls_back_to_ytdlp(self):
         """直链下载失败时退回 yt-dlp。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         engine = self._engine(
@@ -4043,6 +4121,33 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.files, [("测试群", "C:/tmp/v.mp4")])
         await engine.stop()
 
+    async def test_image_post_gets_notice_instead_of_bogus_video(self):
+        """图文作品没有视频流，要回一句明确提示，而不是发一个几百 KB 的假 mp4。
+
+        回归点：2026-10-07 一条 ``douyin.com/note/...`` 图文链接被下成 385 KB 的
+        mp3（顶着 .mp4 的名字）发了出去，群里只会看到「视频打不开」。
+        """
+        adapter = FakeAdapter()
+        engine, _llm = self._engine(adapter, link_download_enabled=True)
+        url = "https://v.douyin.com/PH_gPpFjPmE/"
+        engine._links = StubResolver(
+            download_error=links_mod.UnsupportedLinkContent(
+                links_mod.IMAGE_POST_NOTICE
+            )
+        )
+        await engine.start()
+        await adapter.dispatch(
+            make_record(is_at_me=True, message_id="m1", content=f"看看 {url}")
+        )
+        await adapter.pump()
+        self.assertEqual(adapter.files, [], "不该发出任何文件")
+        self.assertIn(
+            ("测试群", links_mod.IMAGE_POST_NOTICE),
+            adapter.sent,
+            "应把「图文配乐」的提示发到聊天里",
+        )
+        await engine.stop()
+
     async def test_download_disabled_sends_no_file(self):
         adapter = FakeAdapter()
         engine, _llm = self._engine(adapter)
@@ -4176,6 +4281,42 @@ class LinkDownloadTests(unittest.TestCase):
         finally:
             links_mod.load_yt_dlp = original
 
+    def test_douyin_image_post_raises_unsupported(self):
+        """图文作品只有背景音乐：抛 UnsupportedLinkContent，文本就是给用户的提示。"""
+        original = douyin_mod.video_for
+        douyin_mod.video_for = lambda *a, **k: douyin_mod.DouyinVideo(
+            aweme_id="7692846453023337718",
+            ok=True,
+            title="图文",
+            images=["https://img/1.jpg"],
+            video_url="",
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(links_mod.UnsupportedLinkContent) as ctx:
+                    links_mod.LinkResolver()._download_douyin(
+                        "https://www.douyin.com/note/7692846453023337718", tmp, 0
+                    )
+            self.assertEqual(str(ctx.exception), links_mod.IMAGE_POST_NOTICE)
+        finally:
+            douyin_mod.video_for = original
+
+    def test_douyin_without_any_media_returns_none(self):
+        """既没有视频也不是图文（直链缺失）时仍是普通的 None，不该抛异常。"""
+        original = douyin_mod.video_for
+        douyin_mod.video_for = lambda *a, **k: douyin_mod.DouyinVideo(
+            aweme_id="1", ok=True, title="x", video_url="", images=[]
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertIsNone(
+                    links_mod.LinkResolver()._download_douyin(
+                        "https://www.douyin.com/video/1", tmp, 0
+                    )
+                )
+        finally:
+            douyin_mod.video_for = original
+
 
 class StorageQuotaTests(unittest.TestCase):
     """下载目录占用统计与「最旧优先」自动清理。"""
@@ -4189,7 +4330,7 @@ class StorageQuotaTests(unittest.TestCase):
         return path
 
     def test_dir_usage_and_total_size(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(storage.dir_usage(tmp), 0)
@@ -4201,7 +4342,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.total_size([Path(tmp) / "缺.bin"]), 0)
 
     def test_enforce_quota_removes_oldest_first(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             oldest = self._touch(tmp, "old.bin", 400, 1000)
@@ -4215,7 +4356,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.dir_usage(tmp), 800)
 
     def test_enforce_quota_noop_when_within_limit_or_disabled(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             keep = self._touch(tmp, "a.bin", 100, 1000)
@@ -4225,7 +4366,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertTrue(keep.exists())
 
     def test_enforce_quota_never_deletes_protected_files(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             old = self._touch(tmp, "old.bin", 400, 1000)
@@ -4237,7 +4378,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.dir_usage(tmp), 400)
 
     def test_enforce_quota_handles_missing_directory(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(storage.enforce_quota(Path(tmp) / "缺", 10), [])

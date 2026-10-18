@@ -1,39 +1,39 @@
-; 灵语（wechat-mcp）Windows 安装脚本 —— Inno Setup 6。
+; 灵语（Lingyu）Windows 安装脚本 —— Inno Setup 6。
 ;
-; 编译（仓库根目录，或用 packaging/build.py --installer 自动调用）：
+; 编译（仓库根目录，或由 packaging/build.py 自动调用）：
 ;
-;     "F:\SoftWare\Inno Setup 6\ISCC.exe" packaging\installer.iss
+;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
 ;
-; 产物：dist\wechat-mcp-setup-x64.exe
+; 产物：dist\lingyu-setup-x64.exe
 ;
 ; 设计取舍：
 ; * **按用户安装**（PrivilegesRequired=lowest + {localappdata}）：不弹 UAC，
-;   且安装目录可写——程序会在 exe 同级写 logs\，装到 Program Files 反而会失败。
+;   且安装目录可写——程序会在 exe 同级写运行日志，装到 Program Files 反而会失败。
 ; * 安装程序自己写文件，**不会**带上「Internet 区域」标记（该标记只由浏览器
 ;   下载/资源管理器解压产生），从根上避免 pythonnet 被 .NET 拒绝加载而黑屏。
 
 #ifndef AppVersion
-  #define AppVersion "0.8.13"
+  #define AppVersion "0.8.14"
 #endif
 
 #define AppName "灵语"
-#define AppExe "wechat-mcp.exe"
-#define SourceDir "..\dist\wechat-mcp"
+#define AppExe "lingyu.exe"
+#define SourceDir "..\dist\lingyu"
 
 [Setup]
 ; 应用唯一标识（升级/卸载靠它匹配，不要随意改）。
-AppId={{7F3A9C2E-4B18-4D6A-9E5F-1C8B0A6D3E72}
+AppId={{232EF569-4E6C-48FD-9DEE-18826233CED8}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=wechat-mcp
-DefaultDirName={localappdata}\Programs\wechat-mcp
+AppPublisher=Lingyu
+DefaultDirName={localappdata}\Programs\lingyu
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=wechat-mcp-setup-x64
-SetupIconFile=wechat-mcp.ico
+OutputBaseFilename=lingyu-setup-x64
+SetupIconFile=lingyu.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 LicenseFile=..\LICENSE
@@ -53,10 +53,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; 随附的许可证与第三方声明，便于合规查阅。
+; 随附的许可证与说明，便于查阅。
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\docs\TECHNICAL.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--gui"; Comment: "启动灵语"

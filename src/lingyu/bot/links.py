@@ -4,12 +4,12 @@
 --------
 - **媒体站点**（YouTube / Bilibili 等）走 yt-dlp 的 ``extract_info``
   （``skip_download=True``，只取元数据）。
-- **抖音**单独走浏览器桥（见 :mod:`wechat_mcp.bot.douyin`）：它的接口要求
+- **抖音**单独走浏览器桥（见 :mod:`lingyu.bot.douyin`）：它的接口要求
   ``a_bogus`` 签名，内置 yt-dlp 没实现，网页兜底也只能拿到空壳。
 - **普通网页**回退到直接抓取 ``<title>`` 与 ``meta description``。
 - 结果按 URL **缓存**（成功永久、失败带 TTL 允许重试），重复出现不再请求。
 - yt-dlp 是阻塞调用，统一放到线程池执行，避免卡住事件循环。
-- yt-dlp 源码**内置在仓库** ``vendor/yt_dlp``（见 THIRD_PARTY_NOTICES.md），
+- yt-dlp 源码**内置在仓库** ``vendor/yt_dlp``（含其 LICENSE，Unlicense），
   源码模式与 PyInstaller 冻结模式都能导入。
 """
 
@@ -101,11 +101,11 @@ def _vendor_dir() -> Path | None:
     """返回内置 ``yt_dlp`` 所在目录（该目录需加入 ``sys.path``）。"""
     if getattr(sys, "frozen", False):
         base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-        for candidate in (base, base / "wechat_mcp" / "_vendor"):
+        for candidate in (base, base / "lingyu" / "_vendor"):
             if (candidate / "yt_dlp" / "__init__.py").is_file():
                 return candidate
         return None
-    # src/wechat_mcp/bot/links.py -> 仓库根
+    # src/lingyu/bot/links.py -> 仓库根
     root = Path(__file__).resolve().parents[3]
     vendor = root / "vendor"
     return vendor if (vendor / "yt_dlp" / "__init__.py").is_file() else None
@@ -220,7 +220,7 @@ def _cookie_hint(detail: str) -> str:
     用户只看到「未能提取标题」，根本不知道该做什么。
 
     注意**抖音不在此列**：它另有 ``a_bogus`` 签名这道门槛，配 Cookie 也解不开，
-    已改走浏览器桥（见 :mod:`wechat_mcp.bot.douyin`）。
+    已改走浏览器桥（见 :mod:`lingyu.bot.douyin`）。
     """
     if _COOKIE_HINT_RE.search(detail or ""):
         return (
@@ -451,6 +451,19 @@ def _html_description(markup: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+class UnsupportedLinkContent(RuntimeError):
+    """链接能解析，但内容里没有可下载的媒体（如抖音图文作品只有配乐）。
+
+    单独成一种异常，是为了让引擎能给用户一句**明确提示**，而不是静默跳过——
+    群里看到「机器人一句话都不说」和「机器人说这条是图文配乐」，体验完全不同。
+    异常文本就是给用户看的那句话。
+    """
+
+
+#: 抖音图文作品（只有图片 + 背景音乐、没有视频流）给用户看的那句提示。
+IMAGE_POST_NOTICE = "此链接为图文配乐，暂不支持下载"
+
+
 class _QuietLogger:
     """吞掉 yt-dlp 的内部日志，避免污染助手日志。"""
 
@@ -645,7 +658,7 @@ class LinkResolver:
         return _rekey(page_info, url, lookup)
 
     def _douyin_link_info(self, url: str) -> LinkInfo:
-        """抖音解析：交给浏览器桥（见 :mod:`wechat_mcp.bot.browser`）。"""
+        """抖音解析：交给浏览器桥（见 :mod:`lingyu.bot.browser`）。"""
         aweme_id = douyin.extract_aweme_id(url)
         if not aweme_id:
             return LinkInfo(url=url, ok=False, error="未能从抖音链接中识别作品 ID")
@@ -764,6 +777,11 @@ class LinkResolver:
     async def download(
         self, url: str, outdir: str, max_mb: int = 0
     ) -> str | None:
+        """下载链接内容到 ``outdir``，返回本地路径；没有可下的东西返回 ``None``。
+
+        内容本身没有可下载媒体时（如抖音图文作品只有配乐）抛
+        :class:`UnsupportedLinkContent`，异常文本即给用户看的提示语。
+        """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, self._download_sync, url, str(outdir), int(max_mb or 0)
@@ -870,10 +888,16 @@ class LinkResolver:
                 self._log("warning", f"下载抖音内容失败 {url}：{video.error}")
                 return None
             if not video.video_url:
-                self._log(
-                    "info",
-                    f"抖音图文作品暂不支持下载（{len(video.images)} 张图片）：{url}",
-                )
+                if video.is_images:
+                    # 图文作品的 play_addr 里是背景音乐，不是视频。静默跳过会让
+                    # 群里以为机器人坏了，明确回一句更好。
+                    self._log(
+                        "info",
+                        f"抖音图文作品（{len(video.images)} 张图片，"
+                        f"play_addr 是背景音乐、无视频流）：{url}",
+                    )
+                    raise UnsupportedLinkContent(IMAGE_POST_NOTICE)
+                self._log("info", f"抖音作品没有可下载的直链：{url}")
                 return None
             path = douyin.download_video(
                 video.video_url,

@@ -1,21 +1,21 @@
 # =============================================================================
 # 来源声明 / Source attribution
 #
-# 本文件是从上游项目 `deepseekgirl`（https://github.com/linxisama/deepseekgirl）
-# 原样复制的第三方源码：
-#   上游本地目录：F:\Code\deepseekgirl-main
-#   上游文件路径：src/wechat_bridge.py
-#   引入用途：wechat-mcp 复用其 WeChatBridge（微信 UI 自动化桥接），
-#             供源码模式与 PyInstaller 冻结打包内置。
+# 本文件以开源项目 deepseekgirl（https://github.com/linxisama/deepseekgirl）的
+# src/wechat_bridge.py 为基础改写，作为灵语（Lingyu）的微信桥接层。
 #
 # 重要：上游项目**未声明任何开源许可证**（其仓库根目录不存在 LICENSE 文件）。
-# 本仓库（wechat-mcp，MPL-2.0）以「如实标注来源」的方式收录该文件，
-# 但标注来源并不等同于获得授权；如进行再分发，请自行确认上游授权情况。
-# 详见仓库根目录 THIRD_PARTY_NOTICES.md。
+# 本项目在保留来源声明的前提下收录并大幅改写该文件；如实标注来源并不等同于
+# 获得授权，如对本项目或其构建产物进行再分发，请自行确认上游授权情况。
 #
-# 除本声明注释块，以及为支持「引用/回复消息」检测而做的最小增量
-# （WeChatMessage.reply_to_name 字段、WeChatBridge._extract_reply_target 解析及
-# 构造处的一次调用，均为新增、不改变任何原有行为）外，本文件未做其他修改。
+# 本项目在其基础上做的主要改动（非完整列表）：
+#   * 输入框定位：严格探测 + UIA 优先，定位失败返回 None，替代按窗口比例猜测的
+#     兜底坐标（猜测坐标会让所有「失败即重试」的安全网变成死代码）；
+#   * 附件发送：发完回查聊天库确认、回车补按、发送闸门与分场景重试策略；
+#   * 窗口可见性：发送前确认主窗未缩到托盘，否则抓屏会抓到别的程序；
+#   * 引用/回复消息识别（reply_to_name）；
+#   * 群聊无群名时按成员昵称拼出可搜索名，避免回复发不出去；
+#   * 移除与原项目业务模块（ChatBot / 人设 / 自动回复循环）的耦合。
 # =============================================================================
 
 """微信桥接模块：通过 wxauto (UI Automation) 连接微信桌面客户端"""
@@ -816,12 +816,12 @@ class WeChatMessage:
     poke_sender: str = ""       # 拍一拍发起人的显示名
     is_image_request: bool = False  # 是否要求机器人联网找图片
     voice_path: str = ""        # 已提取到本地的语音文件（供 ASR 使用）
-    # wechat-mcp 新增：已提取到本地的图片文件（供视觉模型识别）。
+    # lingyu 新增：已提取到本地的图片文件（供视觉模型识别）。
     image_path: str = ""
     voice_url: str = ""         # 远端语音附件地址（QQ）
     voice_mime: str = ""        # 语音附件 MIME
     voice_filename: str = ""    # 远端语音附件文件名
-    # wechat-mcp 为「引用/回复消息」检测新增：被引用者显示名，非引用消息为空。
+    # lingyu 为「引用/回复消息」检测新增：被引用者显示名，非引用消息为空。
     reply_to_name: str = ""
 
 
@@ -1668,12 +1668,12 @@ class WeChatBridge:
             voice_path = ""
             if message_type == "voice":
                 voice_path = self._extract_voice_file(msg, chat_id)
-            # wechat-mcp 新增：图片消息提取到本地，供视觉模型识别。
+            # lingyu 新增：图片消息提取到本地，供视觉模型识别。
             image_path = ""
             if message_type == "image":
                 image_path = self._extract_image_file(msg, chat_id)
 
-            # wechat-mcp 新增：解析引用/回复的目标显示名。
+            # lingyu 新增：解析引用/回复的目标显示名。
             reply_to_name = self._extract_reply_target(raw_content)
 
             # 同一实例/多实例重复投递的消息只处理一次
@@ -1764,7 +1764,7 @@ class WeChatBridge:
         local_id, db, user = ctx
 
         # 写到系统临时目录：冻结打包后包内路径不可靠，临时目录一定可写。
-        save_dir = os.path.join(tempfile.gettempdir(), "wechat-mcp", "voice")
+        save_dir = os.path.join(tempfile.gettempdir(), "lingyu", "voice")
         try:
             from wechatauto.media import MediaDownloader
 
@@ -1786,7 +1786,7 @@ class WeChatBridge:
     def _extract_image_file(self, msg, chat_id: str) -> str:
         """Extract a wechatauto image message from the local media database.
 
-        wechat-mcp 新增：镜像 ``_extract_voice_file``，把图片解密落盘，
+        lingyu 新增：镜像 ``_extract_voice_file``，把图片解密落盘，
         供上层交给视觉模型识别。群聊图片默认只有缩略图，原图需在微信中
         点开过才会下载，故这里通常拿到的是缩略图。
         """
@@ -1801,7 +1801,7 @@ class WeChatBridge:
         local_id, db, user = ctx
 
         # 写到系统临时目录：冻结打包后包内路径不可靠，临时目录一定可写。
-        save_dir = os.path.join(tempfile.gettempdir(), "wechat-mcp", "images")
+        save_dir = os.path.join(tempfile.gettempdir(), "lingyu", "images")
         try:
             from wechatauto.media import MediaDownloader
 
@@ -2051,7 +2051,7 @@ class WeChatBridge:
                 return "[图片]"
 
             # 链接/分享卡片：原实现只保留标题、丢掉 <url>，下游拿不到链接，
-            # 无法做链接解析。wechat-mcp 修改：保留标题的同时附上链接 URL。
+            # 无法做链接解析。lingyu 修改：保留标题的同时附上链接 URL。
             link_url = ""
             url_match = re.search(
                 r"<url\b[^>]*>(.*?)</url>",
@@ -2104,7 +2104,7 @@ class WeChatBridge:
     def _extract_reply_target(raw_content: str) -> str:
         """引用/回复消息：返回被引用者的显示名；非引用或解析不到时返回空串。
 
-        wechat-mcp 新增。微信引用消息（appmsg）原始内容里含 ``<refermsg>``，
+        lingyu 新增。微信引用消息（appmsg）原始内容里含 ``<refermsg>``，
         其 ``<displayname>`` 为被引用者显示名，用于判断是否在回复本机器人。
         本方法只读取，不改变任何原有逻辑。
         """

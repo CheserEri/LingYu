@@ -213,7 +213,7 @@ _RETRY_DELAY_SECONDS = 1.0
 #: 退出诊断里回显 stderr 的最大字符数。
 _STDERR_TAIL_CHARS = 600
 #: 浏览器 stderr 的落盘文件名。放在临时 profile 目录里，随目录一起被清掉。
-_STDERR_NAME = "_wechat-mcp-stderr.log"
+_STDERR_NAME = "_lingyu-stderr.log"
 
 
 class BrowserExitedError(RuntimeError):
@@ -582,8 +582,8 @@ class BrowserSession:
         return body
 
 
-_PROFILE_PREFIX = "wechat-mcp-browser-"
-# 目录名里带创建者的 PID（``wechat-mcp-browser-<pid>-xxxx``）。正常关闭时会自己
+_PROFILE_PREFIX = "lingyu-browser-"
+# 目录名里带创建者的 PID（``lingyu-browser-<pid>-xxxx``）。正常关闭时会自己
 # 删掉临时目录，只有进程被强杀 / 短命脚本来不及跑完异步清理时才会残留，
 # 这里兜底清扫。
 _PROFILE_STALE_SECONDS = 1800.0

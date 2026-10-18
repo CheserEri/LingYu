@@ -6,9 +6,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_DEEPSEEKGIRL_PATH = Path(r"F:\Code\deepseekgirl-main")
-# 审计日志默认写到项目根目录下的 logs/audit.jsonl（可用 WECHAT_AUDIT_LOG 覆盖）。
-DEFAULT_AUDIT_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "audit.jsonl"
+from .paths import logs_dir
+
+# 审计日志默认写到用户数据目录下的 logs/audit.jsonl（可用 WECHAT_AUDIT_LOG 覆盖）。
+DEFAULT_AUDIT_LOG_PATH = logs_dir() / "audit.jsonl"
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -27,8 +28,6 @@ def _split_list(raw: str) -> tuple[str, ...]:
 class AdapterConfig:
     """微信适配层运行参数。"""
 
-    # 原项目位置：适配层从这里复用 WeChatBridge。
-    deepseekgirl_path: Path = DEFAULT_DEEPSEEKGIRL_PATH
     # auto / wechatauto / wxauto4 / wxauto
     backend: str = "auto"
     # 读取能力依赖监听回调，故连接后默认启动监听。
@@ -60,8 +59,6 @@ class AdapterConfig:
 
     @classmethod
     def from_env(cls) -> "AdapterConfig":
-        raw_path = os.environ.get("DEEPSEEKGIRL_PATH", "").strip()
-        path = Path(raw_path) if raw_path else DEFAULT_DEEPSEEKGIRL_PATH
         backend = os.environ.get("WECHAT_BACKEND", "auto").strip() or "auto"
         listen = (
             os.environ.get("WECHAT_LISTEN_ON_CONNECT", "1").strip().lower()
@@ -96,7 +93,6 @@ class AdapterConfig:
             monitor_mode = "allow"
 
         return cls(
-            deepseekgirl_path=path,
             backend=backend,
             listen_on_connect=listen,
             send_timeout_seconds=send_timeout,

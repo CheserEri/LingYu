@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from wechat_mcp.selfcheck import collect, resolve, tweet_card
+from lingyu.selfcheck import collect, resolve, tweet_card
 
 
 class SelfCheckTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class ResolveCliTests(unittest.TestCase):
     """``--resolve`` 诊断命令（不触网，靠替换 LinkResolver.resolve）。"""
 
     def _run_with(self, fake) -> tuple[int, str]:
-        from wechat_mcp.bot import links
+        from lingyu.bot import links
 
         original = links.LinkResolver.resolve
         links.LinkResolver.resolve = fake
@@ -54,7 +54,7 @@ class ResolveCliTests(unittest.TestCase):
         self.assertEqual(resolve(""), 2)
 
     def test_success_prints_summary_and_returns_zero(self):
-        from wechat_mcp.bot import links
+        from lingyu.bot import links
 
         async def _fake(self, url):
             return links.LinkInfo(url=url, ok=True, title="示例标题", extractor="Example")
@@ -66,7 +66,7 @@ class ResolveCliTests(unittest.TestCase):
         self.assertIn("Example", out)
 
     def test_failure_returns_one_and_prints_error(self):
-        from wechat_mcp.bot import links
+        from lingyu.bot import links
 
         async def _fake(self, url):
             return links.LinkInfo(url=url, ok=False, error="网络不可达")
@@ -86,7 +86,7 @@ class TweetCardCliTests(unittest.TestCase):
         self.assertEqual(tweet_card("https://example.com/x"), 2)
 
     def test_render_failure_returns_one(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         original = (tweet_mod.fetch_tweet, tweet_mod.render_card)
         tweet_mod.fetch_tweet = lambda *a, **k: tweet_mod.Tweet(
@@ -103,7 +103,7 @@ class TweetCardCliTests(unittest.TestCase):
         self.assertIn("渲染失败", buffer.getvalue())
 
     def test_success_returns_zero_and_prints_path(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         original = (tweet_mod.fetch_tweet, tweet_mod.render_card)
         tweet_mod.fetch_tweet = lambda *a, **k: tweet_mod.Tweet(

@@ -1,37 +1,37 @@
-"""对 deepseekgirl 微信自动化能力的适配封装。
+"""微信自动化适配层。
+
+把底层桥接层（``lingyu.bridge``）的微信连接、状态、发送与消息监听回调能力，
+封装成本项目内部统一的结构化接口。
 
 设计原则：
 
-- 只复用其 ``WeChatBridge`` 的连接、状态、发送与消息监听回调能力；
-  不导入、不启动原项目的 ``ChatBot`` / ``MessageHandler`` / 人设 / 自动回复逻辑。
+- 只使用桥接层的连接、状态、发送与消息监听回调能力；适配层自己不做人设、
+  不做自动回复循环，那些属于 ``lingyu.bot``。
 - 所有调用返回结构化结果；底层失败不伪装成成功。
 - 发送操作做目标校验、同名消歧与串行化，不依赖当前焦点窗口。
 
-已知限制（阶段 0 结论）：底层库不提供「按需拉取会话列表 / 历史消息」接口，
-读取能力只能基于监听回调收集到的消息，故 ``get_chat_list`` / ``get_chat_history``
-返回的是「适配层运行期间被动接收到的消息」，不是微信完整历史。
+已知限制：底层不提供「按需拉取会话列表 / 历史消息」接口，读取能力只能基于
+监听回调收集到的消息，故 ``get_chat_list`` / ``get_chat_history`` 返回的是
+「适配层运行期间被动接收到的消息」，不是微信完整历史。
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.util
 import logging
 import re
-import sys
 import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
+from ..bridge import load_bridge_class
 from ..config import AdapterConfig
 from ..errors import (
-    BackendUnavailableError,
     ConfirmationRequiredError,
+    LingyuError,
     NotConnectedError,
     TargetAmbiguousError,
-    WeChatMCPError,
 )
 from ..monitoring import MonitoredChats
 from ..schemas import (
@@ -100,67 +100,6 @@ def _unresolved_target_error(recipient: str) -> dict[str, Any]:
     }
 
 
-def _bundled_bridge_file() -> Path | None:
-    """返回随包内置的 ``wechat_bridge.py`` 路径。
-
-    冻结打包（PyInstaller）时该文件被作为数据文件内置到解包目录，
-    使分发的 exe 无需外部 deepseekgirl 项目即可运行；源码模式下返回 ``None``。
-    """
-    base = getattr(sys, "_MEIPASS", None)
-    if not base:
-        return None
-    candidate = Path(base) / "wechat_bridge.py"
-    return candidate if candidate.is_file() else None
-
-
-def _load_bridge_from_file(module_file: Path) -> Any:
-    """按文件路径加载 ``wechat_bridge`` 模块，避免污染 ``sys.path``。"""
-    spec = importlib.util.spec_from_file_location("wechat_bridge", module_file)
-    if spec is None or spec.loader is None:
-        raise BackendUnavailableError(
-            f"无法加载内置微信桥接模块: {module_file}",
-            detail={"module_file": str(module_file)},
-        )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["wechat_bridge"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_wechat_bridge(project_path: Path) -> type:
-    """加载 ``WeChatBridge`` 类。
-
-    优先使用随包内置的副本（冻结打包时存在），使分发的 exe 无需外部项目；
-    否则回退到 ``DEEPSEEKGIRL_PATH`` 指定的源码项目。
-
-    仅加载 ``wechat_bridge`` 模块本身（它只依赖标准库与 loguru），
-    不会触发原项目的机器人业务模块导入。
-    """
-    bundled = _bundled_bridge_file()
-    if bundled is not None:
-        return _load_bridge_from_file(bundled).WeChatBridge
-
-    src_dir = Path(project_path) / "src"
-    module_file = src_dir / "wechat_bridge.py"
-    if not module_file.is_file():
-        raise BackendUnavailableError(
-            f"未找到 deepseekgirl 微信桥接模块: {module_file}",
-            detail={"expected_file": str(module_file)},
-        )
-
-    src_str = str(src_dir)
-    if src_str not in sys.path:
-        sys.path.insert(0, src_str)
-    try:
-        module = importlib.import_module("wechat_bridge")
-    except ImportError as exc:  # 依赖未安装
-        raise BackendUnavailableError(
-            f"加载 wechat_bridge 失败，请确认依赖已安装: {exc}",
-            detail={"project_path": str(project_path)},
-        ) from exc
-    return module.WeChatBridge
-
-
 def _apply_send_attempts(bridge: Any, attempts: int) -> None:
     """把「附件没发成功时最多再试几次」写进桥接层。
 
@@ -176,7 +115,7 @@ def _apply_send_attempts(bridge: Any, attempts: int) -> None:
         return
 
 
-class DeepSeekGirlAdapter:
+class WeChatAdapter:
     """独立的微信适配层，可脱离原机器人直接调用。"""
 
     def __init__(
@@ -226,7 +165,7 @@ class DeepSeekGirlAdapter:
         if self._bridge_factory is not None:
             bridge = self._bridge_factory()
         else:
-            bridge_cls = load_wechat_bridge(self._config.deepseekgirl_path)
+            bridge_cls = load_bridge_class()
             bridge = bridge_cls(
                 target_groups=[],
                 on_message=self._on_message,
@@ -273,7 +212,7 @@ class DeepSeekGirlAdapter:
 
         try:
             self._bridge = self._create_bridge()
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             self._last_error = exc.to_dict()
             return self._status_result(ConnectionState.ERROR, error=exc.to_dict())
 
@@ -380,7 +319,7 @@ class DeepSeekGirlAdapter:
         try:
             recipient = validate_recipient(recipient)
             message = validate_message(message)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return SendResult(
                 ok=False,
                 status=SendStatus.FAILED,
@@ -527,7 +466,7 @@ class DeepSeekGirlAdapter:
         """返回指定会话在缓冲区内的最近消息（非微信完整历史）。"""
         try:
             chat_name = validate_recipient(chat_name)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return ChatHistoryResult(
                 ok=False,
                 chat=str(chat_name or ""),
@@ -574,7 +513,7 @@ class DeepSeekGirlAdapter:
         if chat_name:
             try:
                 chat_name = validate_recipient(chat_name)
-            except WeChatMCPError as exc:
+            except LingyuError as exc:
                 return RecentMessagesResult(
                     ok=False, next_seq=cursor, error=exc.to_dict()
                 )
@@ -611,7 +550,7 @@ class DeepSeekGirlAdapter:
         """返回已确认可获取的会话信息（名称、类型、观察到的消息数等）。"""
         try:
             chat_name = validate_recipient(chat_name)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return ChatInfoResult(
                 ok=False, name=str(chat_name or ""), error=exc.to_dict()
             )
@@ -751,7 +690,7 @@ class DeepSeekGirlAdapter:
             resolved_path = validate_send_path(
                 file_path, self._config.allow_send_dirs
             )
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return FileSendResult(
                 ok=False,
                 status=SendStatus.FAILED,
@@ -869,7 +808,7 @@ class DeepSeekGirlAdapter:
         """运行时增删关注/忽略会话，或切换 allow/block 模式。"""
         try:
             self._monitor.apply(add=add, remove=remove, mode=mode)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             snapshot = self._monitor.snapshot()
             return MonitoredChatsResult(
                 ok=False,

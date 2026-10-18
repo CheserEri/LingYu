@@ -1,17 +1,16 @@
 [project]
-name = "wechat-mcp"
-version = "0.8.13"
-description = "WeChat MCP Server - 面向通用 AI Agent 的微信桌面自动化工具服务"
+name = "lingyu"
+version = "0.8.14"
+description = "灵语（Lingyu）—— 面向 AI Agent 的微信桌面自动化服务"
 requires-python = ">=3.10"
 dependencies = ["mcp>=2"]
 
 [project.scripts]
-wechat-mcp = "wechat_mcp.server:main"
-wechat-mcp-desktop = "wechat_mcp.desktop:run"
+lingyu = "lingyu.server:main"
+lingyu-desktop = "lingyu.desktop:run"
 
 [project.optional-dependencies]
 # 微信桌面自动化所需的运行时依赖（仅在目标 Windows 环境安装）。
-# 适配层默认从 deepseekgirl 复用 WeChatBridge，故需要其依赖可用。
 wechat = [
     "loguru>=0.7",
     "wechatauto-replica==1.2.2.6",
@@ -25,3 +24,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# 桥接层与前端资源以数据文件形式随包分发：桥接层运行期按路径加载（可单独热替换），
+# 前端静态文件由 pywebview 直接读取。
+lingyu = ["bridge/*.py", "webui/*"]

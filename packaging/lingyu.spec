@@ -1,16 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 配置：把 wechat-mcp 打成 Windows onedir 独立 exe。
+"""PyInstaller 配置：把灵语（Lingyu）打成 Windows onedir 独立 exe。
 
-请通过 ``packaging/build.py`` 调用。它会把本仓库内的
-``packaging/wechat_bridge.py``（从上游 deepseekgirl 收录，来源见文件头注释与
-``THIRD_PARTY_NOTICES.md``）作为数据文件内置进包，使分发的 exe 无需外部
-deepseekgirl 项目即可运行。
+请通过 ``packaging/build.py`` 调用。
+
+数据文件：
+* ``src/lingyu/bridge/wechat_bridge.py`` —— 桥接层实现。运行期按**文件路径**加载，
+  因此这里作为数据文件投放到解包根目录，而不是编进 PYZ。好处是发布后可以只替换
+  这一个文件来热更新桥接逻辑，不必重新打包整个程序。
+* ``src/lingyu/webui/`` —— 桌面端前端静态资源。
+* ``packaging/lingyu.ico`` —— 窗口图标（与 exe 内嵌图标同一文件）。
 
 体积说明：``wechatauto`` / ``wxauto4`` / ``uiautomation`` 会带进较多依赖；
-``cv2`` / ``numpy`` 等仅在朋友圈等本适配层未启用的路径中被惰性导入，故剔除。
+``cv2`` / ``numpy`` 等仅在未启用的路径中被惰性导入，故剔除。
 ``imageio_ffmpeg``（自带 ffmpeg 二进制，约 84 MB）为「链接下载」合流 DASH
-分离流所必需，``winsdk``（约 43 MB）为 wechatauto 的 UIA 发送路径所必需，
-二者均保留内置，会使产物体积明显增大。
+分离流所必需，``winsdk``（约 43 MB）为 UIA 发送路径所必需，二者均保留内置，
+会使产物体积明显增大。
 
 内置 yt-dlp（``vendor/yt_dlp``，链接解析用）通过 ``pathex`` + ``hiddenimports``
 交给 PyInstaller 做**静态分析**，并启用其自带的官方 hook（``vendor/yt_dlp/
@@ -25,18 +29,16 @@ from PyInstaller.utils.hooks import collect_all
 
 SPEC_DIR = Path(SPECPATH).resolve()
 ROOT = SPEC_DIR.parent
-BRIDGE = SPEC_DIR / "wechat_bridge.py"
-WEBUI = ROOT / "src" / "wechat_mcp" / "webui"
+BRIDGE = ROOT / "src" / "lingyu" / "bridge" / "wechat_bridge.py"
+WEBUI = ROOT / "src" / "lingyu" / "webui"
 VENDOR = ROOT / "vendor"
 # 应用图标（由 packaging/make_icon.py 生成），同时供 exe 与安装包使用。
-ICON = SPEC_DIR / "wechat-mcp.ico"
+ICON = SPEC_DIR / "lingyu.ico"
 
 if not BRIDGE.is_file():
-    raise SystemExit(
-        "缺少 packaging/wechat_bridge.py；该文件应随仓库一同提供。"
-    )
+    raise SystemExit("缺少 src/lingyu/bridge/wechat_bridge.py；该文件应随仓库一同提供。")
 if not WEBUI.is_dir():
-    raise SystemExit("缺少 src/wechat_mcp/webui 前端目录。")
+    raise SystemExit("缺少 src/lingyu/webui 前端目录。")
 if not (VENDOR / "yt_dlp" / "__init__.py").is_file():
     raise SystemExit(
         "缺少 vendor/yt_dlp；内置的 yt-dlp 源码应随仓库一同提供。"
@@ -73,7 +75,7 @@ hiddenimports = [
     "yt_dlp",
     # 抖音解析的浏览器桥：douyin.py 里是函数内惰性导入，静态分析未必扫到，
     # 漏掉会在冻结包里报 ModuleNotFoundError（只依赖标准库，不增加体积）。
-    "wechat_mcp.bot.browser",
+    "lingyu.bot.browser",
 ]
 
 for _pkg in (
@@ -127,7 +129,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="wechat-mcp",
+    name="lingyu",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -143,5 +145,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="wechat-mcp",
+    name="lingyu",
 )

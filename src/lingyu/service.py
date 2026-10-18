@@ -14,10 +14,10 @@ import asyncio
 import logging
 from typing import Any
 
-from .adapters.deepseekgirl import DeepSeekGirlAdapter
+from .adapters.wechat import WeChatAdapter
 from .audit import AuditLogger
 from .config import AdapterConfig
-from .errors import WeChatMCPError
+from .errors import LingyuError
 
 logger = logging.getLogger(__name__)
 
@@ -27,16 +27,16 @@ class WeChatService:
 
     def __init__(
         self,
-        adapter: DeepSeekGirlAdapter | None = None,
+        adapter: WeChatAdapter | None = None,
         audit: AuditLogger | None = None,
     ):
-        self._adapter = adapter or DeepSeekGirlAdapter(AdapterConfig.from_env())
+        self._adapter = adapter or WeChatAdapter(AdapterConfig.from_env())
         config = self._adapter.config
         self._audit = audit or AuditLogger(config.audit_log_path, config.audit_enabled)
         self._connect_lock = asyncio.Lock()
 
     @property
-    def adapter(self) -> DeepSeekGirlAdapter:
+    def adapter(self) -> WeChatAdapter:
         return self._adapter
 
     @property
@@ -52,7 +52,7 @@ class WeChatService:
                 return None
             try:
                 status = await self._adapter.connect()
-            except WeChatMCPError as exc:
+            except LingyuError as exc:
                 return exc.to_dict()
             except Exception as exc:  # 兜底，避免异常穿透到协议层
                 logger.exception("连接微信失败")

@@ -24,11 +24,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ..adapters.deepseekgirl import DeepSeekGirlAdapter
+from ..adapters.wechat import WeChatAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
 from . import storage, tweet
-from .links import LinkResolver, extract_urls, format_link_block, usable_cookies_file
+from .links import (
+    LinkResolver,
+    UnsupportedLinkContent,
+    extract_urls,
+    format_link_block,
+    usable_cookies_file,
+)
 from .llm import LLMClient, LLMError
 from .persona import get_persona
 
@@ -129,7 +135,7 @@ class BotEngine:
 
     def __init__(
         self,
-        adapter: DeepSeekGirlAdapter,
+        adapter: WeChatAdapter,
         config: BotConfig | None = None,
         llm_factory: Callable[[BotConfig], Any] | None = None,
     ):
@@ -876,9 +882,19 @@ class BotEngine:
         self, record: MessageRecord, url: str, outdir: Path
     ) -> None:
         self._log("info", f"开始下载链接内容：{url}")
-        path = await self._links.download(
-            url, str(outdir), max_mb=self._config.link_download_max_mb
-        )
+        try:
+            path = await self._links.download(
+                url, str(outdir), max_mb=self._config.link_download_max_mb
+            )
+        except UnsupportedLinkContent as exc:
+            # 内容里没有可下载的媒体（如抖音图文作品只有配乐）。静默跳过会让人
+            # 以为机器人坏了，所以明确回一句——异常文本就是那句话。
+            self._log("info", f"链接内容无可下载媒体：{url}（{exc}）")
+            if await self._send_reply(record.chat, str(exc)):
+                self._log("info", f"已发送链接内容提示 [{record.chat}]：{exc}")
+            else:
+                self._log("warning", f"链接内容提示发送失败 [{record.chat}]。")
+            return
         if not path:
             self._log("warning", f"下载失败或超出体积上限，已跳过：{url}")
             return

@@ -7,9 +7,9 @@
 
 产物：
 
-    dist\\wechat-mcp\\                     PyInstaller onedir 目录
-    dist\\wechat-mcp-win32-x64.zip         供 GitHub Release 与 npm 插件分发的压缩包
-    dist\\wechat-mcp-setup-x64.exe         Windows 安装包（需本机装有 Inno Setup 6）
+    dist\\lingyu\\                     PyInstaller onedir 目录
+    dist\\lingyu-win32-x64.zip         供 GitHub Release 与 npm 插件分发的压缩包
+    dist\\lingyu-setup-x64.exe         Windows 安装包（需本机装有 Inno Setup 6）
 
 前置：
 
@@ -21,8 +21,8 @@
   未安装时会**跳过**安装包并给出提示，不影响前两项产物。可用环境变量
   ``ISCC`` 指定编译器路径。
 
-构建会把本仓库内的 ``packaging/wechat_bridge.py``（从上游 deepseekgirl 收录，
-来源见文件头注释与 ``THIRD_PARTY_NOTICES.md``）作为数据文件内置进包。
+构建会把 ``src/lingyu/bridge/wechat_bridge.py`` 作为数据文件内置进包，
+产物无需任何外部项目即可运行。
 """
 
 from __future__ import annotations
@@ -37,15 +37,14 @@ from pathlib import Path
 
 SPEC_DIR = Path(__file__).resolve().parent
 ROOT = SPEC_DIR.parent
-BRIDGE = SPEC_DIR / "wechat_bridge.py"
+BRIDGE = ROOT / "src" / "lingyu" / "bridge" / "wechat_bridge.py"
 ISS = SPEC_DIR / "installer.iss"
-ZIP_NAME = "wechat-mcp-win32-x64.zip"
-SETUP_NAME = "wechat-mcp-setup-x64.exe"
+ZIP_NAME = "lingyu-win32-x64.zip"
+SETUP_NAME = "lingyu-setup-x64.exe"
 
 # ISCC.exe 的常见位置（PATH 之外）。Inno Setup 允许装到任意目录，
-# 所以这里只覆盖常见几种，其余情况请设环境变量 ISCC。
+# 所以这里只覆盖标准安装位置，其余情况请设环境变量 ISCC。
 _ISCC_CANDIDATES = (
-    r"F:\SoftWare\Inno Setup 6\ISCC.exe",
     r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
     r"C:\Program Files\Inno Setup 6\ISCC.exe",
     r"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe",
@@ -53,11 +52,9 @@ _ISCC_CANDIDATES = (
 
 
 def check_bridge() -> None:
-    """确认仓库内的 wechat_bridge.py 存在，供 spec 内置。"""
+    """确认桥接层实现文件存在，供 spec 作为数据文件内置。"""
     if not BRIDGE.is_file():
-        raise SystemExit(
-            f"未找到 {BRIDGE}\n该文件应随仓库一同提供（见 THIRD_PARTY_NOTICES.md）。"
-        )
+        raise SystemExit(f"未找到 {BRIDGE}；该文件应随仓库一同提供。")
     print(f"[build] 将内置 wechat_bridge.py <- {BRIDGE}")
 
 
@@ -75,7 +72,7 @@ def run_pyinstaller() -> Path:
         sys.executable,
         "-m",
         "PyInstaller",
-        str(SPEC_DIR / "wechat-mcp.spec"),
+        str(SPEC_DIR / "lingyu.spec"),
         "--noconfirm",
         "--clean",
         "--distpath",
@@ -85,7 +82,7 @@ def run_pyinstaller() -> Path:
     ]
     print("[build] " + " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(ROOT))
-    out = dist / "wechat-mcp"
+    out = dist / "lingyu"
     if not out.is_dir():
         raise SystemExit(f"打包失败，未生成目录: {out}")
     return out
@@ -102,14 +99,49 @@ def zip_dir(src: Path, target: Path) -> None:
     print(f"[build] 已生成 {target} ({size_mb:.1f} MB)")
 
 
+def _iscc_from_registry() -> Path | None:
+    """从卸载信息里读 Inno Setup 的安装目录。
+
+    Inno Setup 允许装到任意目录（不在 PATH 里、也不在 Program Files 下），
+    靠固定候选路径会漏掉。它安装时会在卸载项里登记 ``InstallLocation``，
+    这是唯一与安装位置无关的定位方式。
+    """
+    try:
+        import winreg
+    except ImportError:  # 非 Windows
+        return None
+
+    subkeys = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+    )
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for subkey in subkeys:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    location = winreg.QueryValueEx(key, "InstallLocation")[0]
+            except OSError:
+                continue
+            candidate = Path(location) / "ISCC.exe"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def find_iscc() -> Path | None:
-    """定位 Inno Setup 的命令行编译器 ISCC.exe。"""
+    """定位 Inno Setup 的命令行编译器 ISCC.exe。
+
+    顺序：环境变量 ``ISCC`` → PATH → 卸载信息登记的安装目录 → 常见默认目录。
+    """
     override = os.environ.get("ISCC")
     if override and Path(override).is_file():
         return Path(override)
     found = shutil.which("ISCC")
     if found:
         return Path(found)
+    registered = _iscc_from_registry()
+    if registered is not None:
+        return registered
     for candidate in _ISCC_CANDIDATES:
         path = Path(os.path.expandvars(candidate))
         if path.is_file():

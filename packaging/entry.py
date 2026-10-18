@@ -10,10 +10,10 @@
 
 import sys
 
-from wechat_mcp.selfcheck import main as run_selfcheck
-from wechat_mcp.selfcheck import resolve as run_resolve
-from wechat_mcp.selfcheck import tweet_card as run_tweet_card
-from wechat_mcp.server import main as run_server
+from lingyu.selfcheck import main as run_selfcheck
+from lingyu.selfcheck import resolve as run_resolve
+from lingyu.selfcheck import tweet_card as run_tweet_card
+from lingyu.server import main as run_server
 
 
 def _flag_value(args: list[str], flag: str) -> str | None:
@@ -30,7 +30,7 @@ def _hide_gui_console() -> None:
 
     打包出的 exe 是控制台程序（MCP stdio 模式要靠 stdout 通信），双击运行时
     系统会给它分配一个黑色命令行窗口。桌面端用不到它：这里直接隐藏，原本打在
-    控制台的内容由 ``wechat_mcp.desktop`` 转投到界面「运行日志」。
+    控制台的内容由 ``lingyu.desktop`` 转投到界面「运行日志」。
 
     只在打包产物中隐藏，且在已有终端里运行时（控制台与其它进程共享，例如用户
     在 cmd 里手动执行）不动它，免得把用户的终端窗口一起藏掉。
@@ -75,7 +75,7 @@ if __name__ == "__main__":
         # 先隐藏控制台再导入桌面端：desktop 会拉起 pywebview/pythonnet，
         # 导入耗时较长，不先隐藏的话那个黑窗口会在屏幕上多停留一会儿。
         _hide_gui_console()
-        from wechat_mcp.desktop import run as run_desktop
+        from lingyu.desktop import run as run_desktop
 
         run_desktop()
     else:

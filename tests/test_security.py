@@ -9,12 +9,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wechat_mcp.errors import (  # noqa: E402
+from lingyu.errors import (  # noqa: E402
     FilePathInvalidError,
     FilePathNotAllowedError,
     TargetInvalidError,
 )
-from wechat_mcp.security import (  # noqa: E402
+from lingyu.security import (  # noqa: E402
     resolve_target,
     validate_message,
     validate_recipient,

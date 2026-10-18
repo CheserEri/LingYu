@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 
-class WeChatMCPError(Exception):
+class LingyuError(Exception):
     """所有适配层错误的基类。"""
 
     code = "wechat_error"
@@ -28,25 +28,25 @@ class WeChatMCPError(Exception):
         }
 
 
-class BackendUnavailableError(WeChatMCPError):
+class BackendUnavailableError(LingyuError):
     """微信自动化后端或依赖不可用（未安装、模块缺失等）。"""
 
     code = "backend_unavailable"
 
 
-class NotConnectedError(WeChatMCPError):
+class NotConnectedError(LingyuError):
     """尚未连接微信，或连接已失效。"""
 
     code = "not_connected"
 
 
-class TargetInvalidError(WeChatMCPError):
+class TargetInvalidError(LingyuError):
     """发送目标不合法（为空、含非法字符、超长等）。"""
 
     code = "target_invalid"
 
 
-class TargetAmbiguousError(WeChatMCPError):
+class TargetAmbiguousError(LingyuError):
     """存在多个同名/相似候选，拒绝执行以避免误发。"""
 
     code = "target_ambiguous"
@@ -64,25 +64,25 @@ class TargetAmbiguousError(WeChatMCPError):
         self.candidates = list(candidates)
 
 
-class UnsupportedOperationError(WeChatMCPError):
+class UnsupportedOperationError(LingyuError):
     """当前后端或运行环境不支持该操作。"""
 
     code = "unsupported_operation"
 
 
-class FilePathInvalidError(WeChatMCPError):
+class FilePathInvalidError(LingyuError):
     """待发送文件路径不合法（为空、不存在、不是文件或不可读）。"""
 
     code = "file_invalid"
 
 
-class FilePathNotAllowedError(WeChatMCPError):
+class FilePathNotAllowedError(LingyuError):
     """文件路径不在允许发送的目录范围内。"""
 
     code = "path_not_allowed"
 
 
-class ConfirmationRequiredError(WeChatMCPError):
+class ConfirmationRequiredError(LingyuError):
     """配置要求发送前确认，但本次调用未显式确认。"""
 
     code = "confirmation_required"

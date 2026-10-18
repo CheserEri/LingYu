@@ -28,10 +28,9 @@
 --------------
 ``sm3_digest``：纯 Python 国密 SM3，已用标准测试向量与 ``gmssl`` 交叉验证，
 可独立复用（不引入 ``gmssl`` 依赖）。
-``ABogus``：与 f2 参考实现**逐字节一致**（用固定时间与随机序列对拍验证过），
-算法本身正确，只是对不上抖音当前版本；作为参考保留，**不在解析链路里使用**。
-
-署名见 ``THIRD_PARTY_NOTICES.md``（a_bogus 移植自 f2，Apache-2.0）。
+``ABogus``：与 f2（Apache-2.0）的参考实现**逐字节一致**（用固定时间与随机序列
+对拍验证过），算法本身正确，只是对不上抖音当前版本；作为参考保留，
+**不在解析链路里使用**。署名与许可见该实现所在的源文件头注释。
 """
 
 from __future__ import annotations
@@ -320,10 +319,14 @@ class _BrowserFingerprintGenerator:
 
 
 class ABogus:
-    """a_bogus 签名生成器（移植自 f2）。
+    """a_bogus 签名生成器（移植自 f2，Apache-2.0）。
 
     每个实例只应用一次：``transform_bytes`` 会改写内部的 256 字节置换表，
     复用实例会让后续签名结果错误。
+
+    来源：f2 项目（https://github.com/Johnserf-Seed/f2）的 a_bogus 实现，
+    以 Apache License 2.0 授权；本类为其 Python 移植，算法与原实现逐字节一致。
+    该类当前**不在解析链路里使用**（抖音已轮换签名算法），仅作参考保留。
     """
 
     def __init__(
@@ -587,6 +590,20 @@ class DouyinVideo:
         return bool(self.images) and not self.video_url
 
 
+#: 图文作品（``aweme_type == 68``）没有视频流，抖音会把**背景音乐**填进
+#: ``video.play_addr``（``douyinstatic.com/obj/ies-music/xxx.mp3``）。真实视频的
+#: 直链都在 ``douyinvod.com/.../video/tos/...``，两者不会混淆（实测比对过）。
+_AUDIO_SUFFIXES = (".mp3", ".m4a", ".aac", ".wav", ".flac")
+
+
+def _is_audio_url(url: str) -> bool:
+    """判断 ``play_addr`` 给的是不是音频（图文作品的背景音乐）。"""
+    text = str(url or "").split("?", 1)[0].strip().lower()
+    if not text:
+        return False
+    return text.endswith(_AUDIO_SUFFIXES) or "/ies-music/" in text
+
+
 def _pick_play_url(video: dict[str, Any]) -> str:
     """挑一个可下载的播放地址（优先码率最高的 ``bit_rate``）。"""
     candidates: list[tuple[int, str]] = []
@@ -595,12 +612,14 @@ def _pick_play_url(video: dict[str, Any]) -> str:
             continue
         urls = ((entry.get("play_addr") or {}).get("url_list")) or []
         bitrate = entry.get("bit_rate") or 0
-        if urls:
+        if urls and not _is_audio_url(urls[0]):
             candidates.append((int(bitrate or 0), str(urls[0])))
     if candidates:
         return max(candidates, key=lambda item: item[0])[1]
     urls = ((video.get("play_addr") or {}).get("url_list")) or []
-    return str(urls[0]) if urls else ""
+    if urls and not _is_audio_url(urls[0]):
+        return str(urls[0])
+    return ""
 
 
 def parse_detail(detail: dict[str, Any]) -> DouyinVideo:
@@ -621,6 +640,13 @@ def parse_detail(detail: dict[str, Any]) -> DouyinVideo:
         if urls:
             images.append(str(urls[-1]))
 
+    # 图文作品会把背景音乐填进 ``play_addr``。取到音频就说明这条没有可下载的
+    # 视频：置空后 ``is_images`` 才成立，上层才能给出「图文配乐」的提示。否则
+    # 一个几百 KB 的 mp3 会被当成视频下下来（还顶着 .mp4 的名字发出去）。
+    video_url = _pick_play_url(video)
+    if _is_audio_url(video_url):
+        video_url = ""
+
     return DouyinVideo(
         aweme_id=str(detail.get("aweme_id") or ""),
         ok=True,
@@ -628,7 +654,7 @@ def parse_detail(detail: dict[str, Any]) -> DouyinVideo:
         uploader=str(author.get("nickname") or "").strip(),
         duration=duration if duration else None,
         description=str(detail.get("desc") or "").strip(),
-        video_url=_pick_play_url(video),
+        video_url=video_url,
         images=images,
     )
 

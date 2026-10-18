@@ -58,7 +58,7 @@ def server_params(env_overrides: dict[str, str] | None = None) -> StdioServerPar
         env.update(env_overrides)
     return StdioServerParameters(
         command=sys.executable,
-        args=["-m", "wechat_mcp.server"],
+        args=["-m", "lingyu.server"],
         env=env,
     )
 
@@ -248,7 +248,7 @@ async def run_wrong_whitelist_scenario() -> bool:
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="wechat-mcp 阶段4 真实联调")
+    parser = argparse.ArgumentParser(description="lingyu 阶段4 真实联调")
     parser.add_argument(
         "--send-dir",
         default="",
@@ -261,10 +261,10 @@ async def main() -> int:
         send_dir = Path(args.send_dir)
         send_dir.mkdir(parents=True, exist_ok=True)
     else:
-        cleanup = tempfile.TemporaryDirectory(prefix="wechat_mcp_phase4_")
+        cleanup = tempfile.TemporaryDirectory(prefix="lingyu_phase4_")
         send_dir = Path(cleanup.name)
 
-    audit_cleanup = tempfile.TemporaryDirectory(prefix="wechat_mcp_audit_")
+    audit_cleanup = tempfile.TemporaryDirectory(prefix="lingyu_audit_")
     audit_log = Path(audit_cleanup.name) / "audit.jsonl"
 
     try:

@@ -2,7 +2,7 @@
 
 用法：
 
-    .venv\\Scripts\\python.exe -m wechat_mcp.desktop
+    .venv\\Scripts\\python.exe -m lingyu.desktop
 
 pywebview 6.x 不支持把 ``async def`` 暴露给 JS（其桥接无 asyncio 集成），
 因此这里采用经典模式：一个后台线程跑专用 asyncio loop，承载适配层与 bot
@@ -24,10 +24,11 @@ from typing import Any
 
 import webview
 
-from .adapters.deepseekgirl import DeepSeekGirlAdapter
-from .bot import BotConfig, BotEngine, default_config_path
+from .adapters.wechat import WeChatAdapter
+from .bot import BotConfig, BotEngine
 from .bot.llm import LLMClient, LLMError
 from .config import AdapterConfig
+from .paths import logs_dir as paths_logs_dir
 from .unblock import unblock_bundled_assemblies
 
 
@@ -42,7 +43,7 @@ def webui_dir() -> Path:
 
 
 def window_icon() -> Path | None:
-    """定位窗口图标：冻结包用 _MEIPASS/wechat-mcp.ico，源码用 packaging/wechat-mcp.ico。
+    """定位窗口图标：冻结包用 _MEIPASS/lingyu.ico，源码用 packaging/lingyu.ico。
 
     必须显式传给 ``webview.start(icon=...)``：不传时 pywebview 会从
     ``sys.executable`` 提取图标，而源码方式运行时那里是 ``python.exe``，
@@ -51,9 +52,9 @@ def window_icon() -> Path | None:
     base = getattr(sys, "_MEIPASS", None)
     candidates = []
     if base:
-        candidates.append(Path(base) / "wechat-mcp.ico")
+        candidates.append(Path(base) / "lingyu.ico")
     candidates.append(
-        Path(__file__).resolve().parents[2] / "packaging" / "wechat-mcp.ico"
+        Path(__file__).resolve().parents[2] / "packaging" / "lingyu.ico"
     )
     for candidate in candidates:
         if candidate.is_file():
@@ -72,7 +73,7 @@ def window_icon() -> Path | None:
 #: 界面 sink 是同步调用（没有 ``enqueue=True``），所以 contextvar 能可靠地跨越
 #: 这条调用链——即便日志来自别的线程，置位与检查也在同一调用栈里完成。
 _ENGINE_FORWARDING: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "wechat_mcp_engine_forwarding", default=False
+    "lingyu_engine_forwarding", default=False
 )
 
 
@@ -244,8 +245,8 @@ class _TeeStream(io.TextIOBase):
 
 
 def log_dir() -> Path:
-    """运行日志目录：``%APPDATA%\\wechat-mcp\\logs``。"""
-    return default_config_path().parent / "logs"
+    """运行日志目录（``%APPDATA%\\lingyu\\logs``）。"""
+    return paths_logs_dir()
 
 
 def install_file_logging(level: str = "INFO", retention_days: int = 7) -> Path | None:
@@ -340,7 +341,7 @@ class DesktopApi:
 
     def __init__(self, hub: _AsyncHub) -> None:
         self._hub = hub
-        self.adapter: DeepSeekGirlAdapter | None = None
+        self.adapter: WeChatAdapter | None = None
         self.engine: BotEngine | None = None
         self.config: BotConfig | None = None
         self._ready = threading.Event()
@@ -352,7 +353,7 @@ class DesktopApi:
     # ------------------------------------------------------------------ 初始化
 
     async def _bootstrap_async(self) -> None:
-        self.adapter = DeepSeekGirlAdapter(AdapterConfig.from_env())
+        self.adapter = WeChatAdapter(AdapterConfig.from_env())
         self.config = BotConfig.load()
         self.engine = BotEngine(self.adapter, self.config)
         # 引擎就绪后接管控制台输出，连接微信期间的日志即可直接显示到界面。

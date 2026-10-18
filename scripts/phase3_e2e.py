@@ -19,7 +19,8 @@ import sys
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
 SELF_TARGET = "文件传输助手"
-BOGUS_PATH = r"F:\__no_such_project__"
+# 故意指定一个本机未安装的后端，用来验证「后端不可用」时的错误返回。
+UNAVAILABLE_BACKEND = "wxauto"
 
 
 def _payload(result) -> dict:
@@ -46,7 +47,7 @@ def server_params(env_overrides: dict[str, str] | None = None) -> StdioServerPar
         env.update(env_overrides)
     return StdioServerParameters(
         command=sys.executable,
-        args=["-m", "wechat_mcp.server"],
+        args=["-m", "lingyu.server"],
         env=env,
     )
 
@@ -196,22 +197,27 @@ async def _check_ambiguity(session: ClientSession, chats: list[dict]) -> tuple[b
 
 
 async def run_error_path_scenario() -> bool:
-    """场景 6：后端不可用时返回结构化错误，而非虚报成功。"""
-    params = server_params({"DEEPSEEKGIRL_PATH": BOGUS_PATH})
+    """场景 6：后端不可用时返回结构化错误，而非虚报成功。
+
+    把后端强制指向本机未安装的 ``wxauto``，此时连接必然失败；要求返回
+    **带错误码的结构化失败**，而不是 ``ok=true`` 这种虚报。
+    """
+    params = server_params({"WECHAT_BACKEND": UNAVAILABLE_BACKEND})
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             status = _payload(await session.call_tool("get_wechat_status", {}))
     error = status.get("error") or {}
+    code = error.get("code")
     return report(
         "6-backend-unavailable",
-        (not status.get("ok")) and error.get("code") == "backend_unavailable",
-        f"ok={status.get('ok')} code={error.get('code')}",
+        (not status.get("ok")) and code in {"backend_unavailable", "connect_failed"},
+        f"ok={status.get('ok')} code={code}",
     )
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="wechat-mcp 阶段3 端到端测试")
+    parser = argparse.ArgumentParser(description="lingyu 阶段3 端到端测试")
     parser.add_argument(
         "--wait-inbound",
         type=float,
