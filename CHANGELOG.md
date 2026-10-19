@@ -2,9 +2,134 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
-## [Unreleased] - 2026-10-19
+## [0.8.14] - 2026-10-20
 
-**项目改名为「灵语 / LingYu」，功能与 0.8.13 完全一致。**
+**UIA 失效时的 OCR 兜底不再失效；项目改名为「灵语 / LingYu」；链接下载失败会重试并给出提示。**
+
+### 修复 · UIA 不可用时 OCR 全废（`No module named 'winsdk'`）
+
+**现象**：微信 4.1.15.13 上 UIA 树不可用，程序切到「OCR 兼容模式」。此时只要
+需要切换会话再发送，就报 `发送消息失败: No module named 'winsdk'`，那条消息
+直接丢失；已打开的会话则一切正常。02:07 的实测日志里，链接提示
+「正在解析链接……」就是这么没的。
+
+**根因有两层，缺一不可**：
+
+1. `wechatauto` 的 `guia.py` 里写死 `from winsdk.windows.media.ocr import OcrEngine`。
+   而 `winsdk` 已停止维护，wheel 只到 **cp311**，本项目跑在 Python 3.13 上
+   根本装不了它。环境里实际有的是它的继任者 `winrt`（模块名从
+   `winsdk.windows.*` 变成 `winrt.windows.*`，API 一致）。
+2. 就算把 `winrt` 改名成 `winsdk`，OCR 仍然**死锁**：`uiautomation` 在 import
+   时把主线程 `CoInitialize` 成 **STA**，而 `winrt` 3.x 的 `IAsyncOperation`
+   在 STA 线程里 await 会永久挂起（实测 60 秒不返回）。这也解释了 0.8.10 里
+   记的那句「ScreenOCR 挑线程：主线程调用 8314ms 超时」——当时没定位到原因。
+
+**修复**（`packaging/wechat_bridge.py` 新增 `_install_wechatauto_ocr_compat()`）：
+
+- `_ensure_winsdk_alias()`：把 `winrt` 连同 9 个 `winrt.windows.*` 子模块注册成
+  `winsdk` 别名，让库里的老 import 语句直接走通，不改第三方代码
+- 把 `ScreenOCR.recognize` 包成「丢进单线程 `ThreadPoolExecutor` 执行」——
+  新线程默认是 MTA，不与 UIA 的 STA 打架；失败或超时返回空列表而不是抛异常
+- 依赖侧：`pyproject.toml` 的 `[wechat]` 补 8 个 `winrt-*` 包，
+  `lingyu.spec` 改为 `collect_all("winrt")` 并显式声明 11 个命名空间子模块
+
+**验证**（微信窗口置前，纯 OCR 路径）：
+
+- 整窗 1610×1121 识别 **0.45 秒 / 32 行**，会话名基本正确
+- 堵死 UIA 两条通路后端到端发送 **3/3 成功**，数据库 seq 逐轮确认落地；
+  首轮 7.13 秒（要 OCR 定位 + 打开会话），同会话后续 3.08 / 3.13 秒
+
+### 修复 · 带噪声前缀的群名定位不到
+
+**现象**：OCR 把群名前的未读角标读成 `．．`、把消息预览的类型标记拼进同一行，
+于是「绝区零群」被读成 `．．绝区`。`_name_matches` 只做子串判断，匹配失败，
+`find_session` 要空转到 20 秒超时才放弃。实测 5 个会话只能定位 3 个。
+
+**修复**：新增 `_install_wechatauto_name_match_compat()`，比较前先剥掉
+`[文件]`/`[图片]` 这类标记与 `．．`/`·`/前导数字等噪声字符；清洗后只剩一个字时
+不做模糊匹配，避免误点到别的会话。
+
+**验证**：纯函数用例 8/8；真实窗口 `find_session` 从 3/5 提升到 **5/5**，
+单个 0.18–0.28 秒，20 秒超时路径消失。
+
+### 修复 · 打包链会静默产出缺 OCR 的包
+
+**现象**：`lingyu.spec` 里写着 `collect_all("winsdk")`，但构建机的 venv 里
+根本没有这个包（Python 3.13 装不上），`collect_all` 对没装的包**静默返回空**。
+于是打出一个看起来完全正常、实际 OCR 全废的包——0.8.0 和 0.8.13 都踩过。
+
+**修复**（三重防线）：
+
+- `pyproject.toml` 显式声明 `winrt-*` 依赖，从源头保证装得上
+- `lingyu.spec` 打包前 `import winrt.windows.media.ocr` 校验，失败即中止；
+  collect 之后再数一遍条目，为 0 同样中止
+- `build.py` 新增 `check_ocr_deps()`，在 PyInstaller 启动前逐个导入 5 个关键
+  模块，缺了直接退出并提示 `pip install -e ".[wechat]"`
+
+**验证**：完整构建通过，`[spec] winrt 相关文件已收集 40 个`；产物
+`_internal/winrt/` 下 8 个 pyd 齐全；运行中的 exe 实测加载了
+`_winrt_windows_media_ocr.cp313-win_amd64.pyd` 等 7 个 winrt 模块。
+onedir 体积 142 MB → 162 MB。
+
+### 修复 · 微信缩在托盘时附件发不出去
+
+**现象**：链接内容下载成功（日志里能看到 17.8 MB 的 mp4 落地），紧接着却报
+`微信主窗仍不可见，无法进行依赖画面/点击的发送`，附件被直接放弃。
+
+**根因**：`_ensure_wechat_visible()` 恢复窗口后**只等 0.5 秒**就判死刑，而微信
+从托盘回来常要 1 秒以上；另外只调 `ShowWindow(SW_SHOW)` 时，托盘里的窗口常常
+只是改了状态位、画面并没有回来。
+
+**修复**：
+
+- 恢复后**轮询**最多 `_RESTORE_WINDOW_TIMEOUT`（3 秒），每 100ms 复查一次可见性
+- 补 `SW_RESTORE` 与带 `SWP_SHOWWINDOW` 的 `SetWindowPos`，让窗口真正露出来
+- 缓存句柄失效（微信重启/重登）时按标题 `FindWindowW(None, "微信")` 重新找，
+  并回写 `gui.main_hwnd`
+
+### 修复 · 微信里分享的链接卡片不解析
+
+**现象**：从 B 站 / 抖音 App 分享到微信的链接、转发的公众号文章（消息显示为
+卡片），程序毫无反应；直接粘贴纯文本链接则一切正常。
+
+**根因**：卡片消息在 UIA 监听通道里只有类型占位符 `[文件/链接/卡片]`，正文
+（含 `<url>` 的 appmsg XML）只存在于数据库的 `StrContent` 里。桥接层的
+`normalize_message_content` 本来就能从 XML 里提取 `<url>`，但**压根没拿到 XML**
+——`extract_urls()` 自然抽不出链接，引擎也就什么都不做。
+
+**修复**：
+
+- `WeChatBridge._lookup_raw_content()`：收到卡片占位符时按 `local_id` 回查
+  数据库取原文，再走一遍归一化；监听早于落库时等 0.15 秒重试一次
+- 数据库不可用、消息还没落库、对不上 `local_id` 时静默降级，沿用原占位符，
+  不影响主流程
+
+**验证**：真实会话里的那条卡片 → 归一化为
+`Windows 11 (WoA) on Xiaomi 18 Fold (Xring O3)\nhttps://b23.tv/06Du6Im`，
+`extract_urls()` 抽出 `https://b23.tv/06Du6Im`。
+
+### 新增 · 下载失败自动重试 + 失败提示
+
+起因：实测「发了链接却没收到视频」时，日志是 yt-dlp 偶发的
+`ERROR: [BiliBili] xxx: Unable to extract initial state`——同一条链接连做 4 次
+提取 4/4 成功，说明这是**站点侧偶发**，而 `download()` 一次失败即放弃，把偶发
+放大成了必现。
+
+- 下载失败自动重试，默认 **3 次**（含首次），配置项 `link_download_attempts`（1–10）
+- 两次之间退避 **1.5 秒 / 3 秒**（`_RETRY_DELAYS`）：`Unable to extract initial
+  state` 往往要等对面接口缓过来，立刻重试基本必挂
+- **只重试值得重试的失败**：超时、连接被重置、5xx、`Unable to extract initial
+  state`；`Unsupported URL` / `HTTP 404` / 视频已删除或私密 / 图文作品 / 体积超限
+  属于确定性失败，立即收手，不白等退避
+- 重试用尽后往当前聊天发一句提示（`link_download_fail_notice`，默认开），
+  文案形如「链接内容下载失败（重试 2 次仍不行）：原因，先不发了。」；
+  关掉则只写日志
+- 推文视频的 mp4 直链也按同样次数重试，失败后才退回 yt-dlp；这一路不发提示，
+  由兜底的 yt-dlp 统一发，避免同一段视频连发两条坏消息
+- `LinkResolver.download_detailed()` 返回 `DownloadOutcome(path, error, retryable)`；
+  `download()` 保持原签名，自检与既有调用不受影响
+- 体积超限的识别：yt-dlp 超 `max_filesize` 时**不抛异常**、只是安静跳过，
+  改为从它被吞掉的告警里认 `larger than max-filesize`（`_QuietLogger.messages`）
 
 ### 改名
 

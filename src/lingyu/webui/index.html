@@ -298,6 +298,14 @@
           </div>
           <p class="hint">微信对单文件有体积上限，且<b>随会话类型不同</b>：自聊 / 文件传输助手最宽松（高速传输可达 10 GB），普通聊天较严（旧版 100 MB）。设得过大容易下载到发不出去的文件；默认 100。</p>
           <div class="field">
+            <label>下载失败重试次数（含首次，1=不重试）</label>
+            <input type="number" min="1" max="10" data-key="link_download_attempts"/>
+          </div>
+          <p class="hint">下载失败会自动重试，默认 <b>3 次</b>（两次之间退避 1.5 秒 / 3 秒）。B 站偶发的 <code>Unable to extract initial state</code>、超时、连接被重置都靠这个救回来。<b>体积超限、图文作品、站点不支持</b>这类确定性失败不重试，直接放弃。</p>
+          <label class="switch-row"><span>下载最终失败时往聊天里发一句提示</span>
+            <input type="checkbox" class="switch" data-key="link_download_fail_notice"/></label>
+          <p class="hint">重试用尽仍失败时，往当前聊天发一句「下载失败 + 原因」，免得链接发出去像石沉大海。关掉则只写日志。</p>
+          <div class="field">
             <label>发送失败后重试次数（0=不重试）</label>
             <input type="number" min="0" max="10" data-key="link_send_attempts"/>
           </div>

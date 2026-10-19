@@ -11,6 +11,7 @@ import queue
 import random
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import threading
@@ -300,6 +301,157 @@ def _capture_window_region(
             win32gui.ReleaseDC(hwnd, hwnd_dc)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# OCR 兼容层
+# ---------------------------------------------------------------------------
+
+# OCR 是「UIA 失效时唯一的会话定位手段」（find_session / _search_chat 都靠它），
+# 但它有两个环境坑：
+#
+# 1. wechatauto 里写死了 ``from winsdk...``。winsdk 已停止维护，wheel 只到
+#    cp311，Python 3.13 装不上；当前环境装的是它的继任者 winrt（模块名
+#    ``winrt.windows.*``，API 一致）。这里注册别名，让老 import 语句走通。
+# 2. ``uiautomation`` 在 import 时把主线程 CoInitialize 成 **STA**，而 winrt 3.x
+#    的 IAsyncOperation 在 STA 线程里 await 会**死锁**（实测 60 秒不返回，表现
+#    就是「OCR 卡死」）。新线程默认是 MTA，把 OCR 丢到专用单线程池里跑就正常
+#    （实测 0.13~0.19 秒）。CHANGELOG 里那句「ScreenOCR 挑线程：主线程调用
+#    8314ms 超时」就是这个问题，只是当时没定位到原因。
+_OCR_TIMEOUT_SECONDS = 12.0
+_OCR_EXECUTOR = None
+_OCR_EXECUTOR_LOCK = threading.Lock()
+
+_WINSDK_SUBMODULES = (
+    "windows",
+    "windows.foundation",
+    "windows.foundation.collections",
+    "windows.media",
+    "windows.media.ocr",
+    "windows.graphics",
+    "windows.graphics.imaging",
+    "windows.storage",
+    "windows.storage.streams",
+)
+
+
+def _ensure_winsdk_alias() -> bool:
+    """把 winrt 暴露成 wechatauto 期望的 ``winsdk`` 模块名。"""
+    if "winsdk" in sys.modules:
+        return True
+    try:
+        import winrt
+    except ImportError:
+        return False
+    sys.modules["winsdk"] = winrt
+    for sub in _WINSDK_SUBMODULES:
+        try:
+            sys.modules[f"winsdk.{sub}"] = importlib.import_module(f"winrt.{sub}")
+        except Exception:
+            continue
+    return True
+
+
+def _ocr_executor():
+    """返回专用 OCR 线程池（单线程，固定跑在 MTA 线程上）。"""
+    global _OCR_EXECUTOR
+    with _OCR_EXECUTOR_LOCK:
+        if _OCR_EXECUTOR is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _OCR_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="lingyu-ocr",
+            )
+        return _OCR_EXECUTOR
+
+
+def _install_wechatauto_ocr_compat() -> None:
+    """让 wechatauto 的 WinRT OCR 在 STA 主线程环境里也能用。"""
+    _ensure_winsdk_alias()
+    try:
+        from wechatauto.guia import ScreenOCR
+    except Exception as e:
+        logger.debug(f"加载 wechatauto OCR 兼容层失败: {e}")
+        return
+
+    if getattr(ScreenOCR, "_lingyu_threaded", False):
+        return
+
+    original = ScreenOCR.__dict__.get("recognize")
+    if isinstance(original, staticmethod):
+        original = original.__func__
+    if original is None:
+        return
+
+    def threaded_recognize(image):
+        """在 MTA 线程里执行 OCR；失败或超时返回空列表，不抛异常。"""
+        try:
+            return _ocr_executor().submit(original, image).result(
+                timeout=_OCR_TIMEOUT_SECONDS
+            )
+        except Exception as e:
+            logger.debug(f"OCR 识别失败，返回空结果: {type(e).__name__}: {e}")
+            return []
+
+    ScreenOCR.recognize = staticmethod(threaded_recognize)
+    ScreenOCR._lingyu_threaded = True
+    logger.debug("已启用 OCR 兼容层（winsdk→winrt 别名 + 独立 MTA 线程）")
+
+
+# ---------------------------------------------------------------------------
+# 会话名匹配兼容层
+# ---------------------------------------------------------------------------
+
+# OCR 会把会话名前的未读角标/图标读成「．．」「0」这类噪声，也会把消息预览的
+# 类型标记（[文件] / [图片] / [表情]）拼进同一行。不剥掉这些，
+# ``_name_matches`` 的 ``a in b`` 判断就会失败——实测「绝区零群」被读成
+# 「．．绝区」后直接匹配不上，5 个会话只能定位到 3 个。
+_OCR_NAME_NOISE_RE = re.compile(r"\[[^\]]{1,10}\]")
+_OCR_NAME_STRIP_CHARS = "．.·-—_~ \u3000[]【】()（）:：|｜0123456789"
+
+
+def _clean_ocr_name(text: str) -> str:
+    """剥掉 OCR 会话名里的噪声前缀与消息类型标记。"""
+    value = _OCR_NAME_NOISE_RE.sub("", str(text or ""))
+    return value.strip().lstrip(_OCR_NAME_STRIP_CHARS).strip()
+
+
+def _install_wechatauto_name_match_compat() -> None:
+    """让 wechatauto 的会话名匹配容忍 OCR 噪声前缀。
+
+    原始 ``WeChatGUI._name_matches`` 只做子串判断，清洗后再比较能救回
+    「．．绝区」→「绝区零群」这类命中；同时给模糊匹配加最短长度保护，
+    避免清洗后只剩一个字时误点到别的会话。
+    """
+    try:
+        from wechatauto.guia import WeChatGUI
+    except Exception as e:
+        logger.debug(f"加载 wechatauto 会话名匹配兼容层失败: {e}")
+        return
+
+    if getattr(WeChatGUI, "_lingyu_name_match", False):
+        return
+
+    def tolerant_name_matches(ocr_name: str, target: str) -> bool:
+        a = _clean_ocr_name(ocr_name)
+        b = (target or "").strip()
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        # 清洗后只剩一个字时不做模糊匹配：容易误点到别的会话
+        if len(a) < 2:
+            return False
+        if a in b:
+            return True
+        if b in a and len(a) >= 3:
+            return True
+        return False
+
+    WeChatGUI._name_matches = staticmethod(tolerant_name_matches)
+    WeChatGUI._lingyu_name_match = True
+    logger.debug("已启用会话名匹配兼容层（OCR 噪声前缀清洗）")
 
 
 def _install_wechatauto_screenshot_compat() -> None:
@@ -598,6 +750,14 @@ def _probe_input_box_rightside(gui) -> tuple | None:
 _SW_SHOW = 5
 _SW_RESTORE = 9
 
+#: ``SetWindowPos`` 的标志位：不动位置、不改大小，只把窗口显示出来。
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_SHOWWINDOW = 0x0040
+
+#: 从托盘恢复窗口最多等多久（秒）。0.5 秒太短——实测微信从托盘回来常要 1 秒以上。
+_RESTORE_WINDOW_TIMEOUT = 3.0
+
 #: 私有 user32 句柄（惰性创建）。
 _USER32 = None
 
@@ -609,12 +769,74 @@ def _user32():
         lib = ctypes.WinDLL("user32", use_last_error=True)
         lib.IsWindowVisible.argtypes = [wintypes.HWND]
         lib.IsWindowVisible.restype = wintypes.BOOL
+        lib.IsWindow.argtypes = [wintypes.HWND]
+        lib.IsWindow.restype = wintypes.BOOL
         lib.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         lib.ShowWindow.restype = wintypes.BOOL
         lib.SetForegroundWindow.argtypes = [wintypes.HWND]
         lib.SetForegroundWindow.restype = wintypes.BOOL
+        lib.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        lib.SetWindowPos.restype = wintypes.BOOL
+        # 句柄是 64 位的：不声明 restype 会被截断成 int32，找到的窗口也用不了。
+        lib.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        lib.FindWindowW.restype = wintypes.HWND
         _USER32 = lib
     return _USER32
+
+
+def _force_show_window(hwnd: int) -> None:
+    """把窗口从托盘 / 最小化状态**真正**显示出来。
+
+    只调 ``ShowWindow(SW_SHOW)`` 时，托盘里的微信常常只改了状态位、画面并没有
+    回来（``IsWindowVisible`` 仍为假）。再补一次 ``SW_RESTORE`` 和带
+    ``SWP_SHOWWINDOW`` 的 ``SetWindowPos`` 才稳。
+    """
+    u32 = _user32()
+    handle = wintypes.HWND(hwnd)
+    try:
+        u32.ShowWindow(handle, _SW_SHOW)
+        u32.ShowWindow(handle, _SW_RESTORE)
+        u32.SetWindowPos(
+            handle,
+            wintypes.HWND(0),
+            0,
+            0,
+            0,
+            0,
+            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_SHOWWINDOW,
+        )
+        u32.SetForegroundWindow(handle)
+    except Exception as exc:  # noqa: BLE001 - 恢复失败由调用方按「仍不可见」处理
+        logger.debug(f"恢复窗口显示失败: {exc}")
+
+
+def _wechat_main_hwnd(gui) -> int:
+    """取微信主窗口句柄；缓存句柄失效时按标题重新找一个。
+
+    微信重启 / 重新登录后旧句柄会失效，而 ``gui.main_hwnd`` 是连接时缓存的，
+    拿着失效句柄去 ``ShowWindow`` 什么也不会发生，只能判成「窗口不可见」。
+    """
+    u32 = _user32()
+    hwnd = int(getattr(gui, "main_hwnd", 0) or 0)
+    if hwnd and u32.IsWindow(wintypes.HWND(hwnd)):
+        return hwnd
+    found = int(u32.FindWindowW(None, "微信") or 0)
+    if found:
+        try:
+            gui.main_hwnd = found  # 回写，后续调用不必再找
+        except Exception:  # noqa: BLE001 - 属性只读时忽略
+            pass
+        logger.debug(f"微信主窗口句柄已刷新: {hwnd} -> {found}")
+        return found
+    return hwnd
 
 def _ensure_wechat_visible(gui) -> bool:
     """确认微信主窗**真的可见**；不可见就恢复显示并置前。
@@ -631,20 +853,24 @@ def _ensure_wechat_visible(gui) -> bool:
     不可见且恢复失败**才返回 ``False``。
     """
     try:
-        hwnd = int(getattr(gui, "main_hwnd", 0) or 0)
+        hwnd = _wechat_main_hwnd(gui)
         if not hwnd:
             return True
         u32 = _user32()
         if u32.IsWindowVisible(wintypes.HWND(hwnd)):
             return True
         logger.warning("微信主窗当前不可见（可能在托盘里），正在恢复显示…")
-        u32.ShowWindow(wintypes.HWND(hwnd), _SW_SHOW)
-        u32.ShowWindow(wintypes.HWND(hwnd), _SW_RESTORE)
-        u32.SetForegroundWindow(wintypes.HWND(hwnd))
-        time.sleep(0.5)
-        if u32.IsWindowVisible(wintypes.HWND(hwnd)):
-            logger.info("微信主窗已恢复显示")
-            return True
+        # 从托盘回来不是瞬间的事：轮询到超时为止，别 0.5 秒就判死刑——
+        # 那样只会把一次本来能发出去的附件直接放弃掉。
+        deadline = time.monotonic() + _RESTORE_WINDOW_TIMEOUT
+        while True:
+            _force_show_window(hwnd)
+            if u32.IsWindowVisible(wintypes.HWND(hwnd)):
+                logger.info("微信主窗已恢复显示")
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
         logger.error("微信主窗仍不可见，无法进行依赖画面/点击的发送")
         return False
     except Exception as exc:  # noqa: BLE001
@@ -663,6 +889,8 @@ def _install_wechatauto_uia_compat() -> None:
     """
     _install_wechatauto_screenshot_compat()
     _install_wechatauto_input_box_guard()
+    _install_wechatauto_ocr_compat()
+    _install_wechatauto_name_match_compat()
 
     try:
         from wechatauto.uia_driver import WeChatUIA
@@ -887,6 +1115,13 @@ class WeChatBridge:
     #: 图片=3、视频=43、文件/链接/卡片=49。视频消息正文里没有文件名，
     #: 只能像图片一样靠「类型 + 时序」判断。
     ATTACHMENT_MSG_TYPES = ("图片", "视频", "文件/链接/卡片")
+    #: UIA 监听对「文件/链接/卡片」只给这个占位符（带方括号），卡片正文
+    #: （含 ``<url>``）只落在数据库的 ``StrContent`` 里，收到它时要回查一次。
+    CARD_CONTENT_PLACEHOLDER = "[文件/链接/卡片]"
+    #: 回查原文时最多往回翻多少条（刚到的消息可能还没写进最近一批）。
+    RAW_LOOKUP_LIMIT = 20
+    #: 回查不到时的短暂等待（秒）：监听可能略早于落库，等一下再试一次。
+    RAW_LOOKUP_RETRY_DELAY = 0.15
     MESSAGE_DEDUPE_WINDOW_SECONDS = 60.0 # 去重窗口60秒（避免重复但不过长）
     # 机器人昵称缓存的有效期：微信里改了昵称后不必重启程序——一旦遇到「有 @ 但
     # 没匹配上」的消息，就按这个间隔重读一次昵称（避免每条群消息都去查库）。
@@ -1612,6 +1847,16 @@ class WeChatBridge:
                 raw_content,
                 sender=sender,
             )
+            # 链接/文件/卡片消息在监听里只有类型占位符，正文（含 <url>）只在
+            # 数据库里。不回查的话，分享到微信的链接卡片会被当成「没有链接」，
+            # 引擎抽不出 URL，链接解析与下载都不会触发。
+            if content == self.CARD_CONTENT_PLACEHOLDER:
+                xml = self._lookup_raw_content(
+                    chat_id, getattr(msg, "local_id", None)
+                )
+                if xml:
+                    raw_content = xml
+                    content = self.normalize_message_content(xml, sender=sender)
             is_self = self._is_self_message(
                 msg,
                 chat_id=chat_id,
@@ -2926,6 +3171,37 @@ class WeChatBridge:
             gui._auto_recalibrated = False
         except Exception as exc:  # pragma: no cover - 属性只读时忽略
             logger.debug(f"复位布局重校准标志失败: {exc}")
+
+    def _lookup_raw_content(self, chat_id: str, local_id) -> str:
+        """按 ``local_id`` 回查数据库里的消息原文（卡片 XML 就在这里）。
+
+        UIA 监听对 type=49（文件/链接/卡片）只给类型占位符，正文——包括
+        ``<url>``——只落在数据库的 ``StrContent`` 里。不回查的话，用户在微信里
+        分享的链接卡片永远解析不出来，表现就是「发了链接没反应」。
+
+        数据库不可用、消息还没落库、或对不上 ``local_id`` 时返回空串，
+        调用方沿用原占位符，不影响主流程。
+        """
+        db = getattr(self._wx, "_db", None)
+        if db is None or local_id is None:
+            return ""
+        target = str(local_id)
+        for attempt in range(2):
+            try:
+                rows = db.get_messages(str(chat_id), limit=self.RAW_LOOKUP_LIMIT)
+            except Exception as exc:
+                logger.debug(f"回查消息原文失败: [{chat_id}] {exc}")
+                return ""
+            for row in rows:
+                if str(row.get("local_id")) != target:
+                    continue
+                content = row.get("content")
+                return content if isinstance(content, str) else ""
+            # 监听可能略早于落库：等一下再翻一次，别把卡片消息白白丢掉。
+            if attempt == 0:
+                time.sleep(self.RAW_LOOKUP_RETRY_DELAY)
+        logger.debug(f"未在数据库中找到消息原文: [{chat_id}] local_id={target}")
+        return ""
 
     def _resolve_db_user(self, room_name: str) -> str:
         """显示名 → 数据库里的会话 username；查不到就按原名试。"""

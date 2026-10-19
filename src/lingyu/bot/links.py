@@ -263,6 +263,57 @@ def _newest_new_file(directory: str, before: set[str]) -> str | None:
         return None
 
 
+@dataclass(frozen=True)
+class DownloadOutcome:
+    """一次下载尝试的结果。
+
+    ``path`` 非空即成功。``retryable`` 表示「过一会儿再试有没有意义」：
+    体积超限、图文作品、站点不支持这类**确定性失败**再怎么重试也一样，
+    标 ``False`` 让上层立刻收手，别白等两轮退避。
+    """
+
+    path: str | None = None
+    error: str = ""
+    retryable: bool = True
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.path)
+
+
+# 确定性失败：重试不会有不同结果，直接放弃并如实告知原因。
+_PERMANENT_FAILURE_RE = re.compile(
+    r"unsupported url|"
+    r"is not a valid url|"
+    r"no video formats found|"
+    r"requested format is not available|"
+    r"video unavailable|"
+    r"this video is unavailable|"
+    r"has been removed|"
+    r"private video|"
+    r"members-only|"
+    r"http error 40[134]|"
+    r"unable to extract (?:any )?(?:video )?data|"
+    r"not a valid|"
+    r"图文作品",
+    re.IGNORECASE,
+)
+
+# yt-dlp 主动跳过下载时的原话（体积超过 max_filesize）。
+_SIZE_SKIP_RE = re.compile(
+    r"larger than max-filesize|max[- ]filesize|skipping .*file", re.IGNORECASE
+)
+
+
+def _is_permanent_failure(detail: str) -> bool:
+    """失败原因是否属于「再试也没用」。
+
+    默认**可重试**——``Unable to extract initial state``（B 站偶发）、超时、
+    连接被重置、5xx 这些都是换个时机就可能好的，正是重试要救的场景。
+    """
+    return bool(detail) and bool(_PERMANENT_FAILURE_RE.search(detail))
+
+
 # --------------------------------------------------------------------------- #
 # 短链展开
 # --------------------------------------------------------------------------- #
@@ -452,7 +503,14 @@ def _html_description(markup: str) -> str:
 
 
 class _QuietLogger:
-    """吞掉 yt-dlp 的内部日志，避免污染助手日志。"""
+    """吞掉 yt-dlp 的内部日志，避免污染助手日志。
+
+    ``messages`` 留了一份被吞掉的告警/错误原文：yt-dlp 遇到「超过体积上限」
+    这类情况**不抛异常**，只是安静地跳过下载，只能从这里看出来。
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
 
     def debug(self, msg: str) -> None:  # noqa: D102
         pass
@@ -461,10 +519,10 @@ class _QuietLogger:
         pass
 
     def warning(self, msg: str) -> None:  # noqa: D102
-        pass
+        self.messages.append(str(msg))
 
     def error(self, msg: str) -> None:  # noqa: D102
-        pass
+        self.messages.append(str(msg))
 
 
 def _ffmpeg_exe() -> str | None:
@@ -764,17 +822,35 @@ class LinkResolver:
     async def download(
         self, url: str, outdir: str, max_mb: int = 0
     ) -> str | None:
+        """下载成功返回文件路径，失败返回 ``None``。"""
+        outcome = await self.download_detailed(url, outdir, max_mb)
+        return outcome.path
+
+    async def download_detailed(
+        self, url: str, outdir: str, max_mb: int = 0
+    ) -> DownloadOutcome:
+        """同 :meth:`download`，但连失败原因与「是否值得重试」一起返回。
+
+        引擎靠 ``retryable`` 决定要不要再试一轮——体积超限、图文作品这类
+        确定性失败重试只会白等，还会让用户多等一轮退避。
+        """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, self._download_sync, url, str(outdir), int(max_mb or 0)
+            None, self._attempt_download, url, str(outdir), int(max_mb or 0)
         )
 
     def _download_sync(self, url: str, outdir: str, max_mb: int) -> str | None:
+        """同步下载（只关心成败的旧接口，保留给自检与测试）。"""
+        return self._attempt_download(url, outdir, max_mb).path
+
+    def _attempt_download(
+        self, url: str, outdir: str, max_mb: int
+    ) -> DownloadOutcome:
         # 短链（如 b23.tv）yt-dlp 无法直接下载，先展开成真实地址。
         target, expand_error = self._expand_short_link(url)
         if expand_error:
             self._log("warning", f"下载链接内容失败 {url}：{expand_error}")
-            return None
+            return DownloadOutcome(error=expand_error)
         url = target or url
         if douyin.is_douyin_url(url):
             # 抖音不经过 yt-dlp（缺 a_bogus 签名），直接下 play_addr 直链。
@@ -782,12 +858,14 @@ class LinkResolver:
         module = load_yt_dlp()
         if module is None:
             self._log("error", "内置 yt-dlp 不可用，无法下载链接内容。")
-            return None
+            return DownloadOutcome(
+                error="内置 yt-dlp 不可用", retryable=False
+            )
         try:
             Path(outdir).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self._log("error", f"创建下载目录失败：{exc}")
-            return None
+            return DownloadOutcome(error=f"创建下载目录失败：{exc}", retryable=False)
 
         try:
             before = {p.name for p in Path(outdir).iterdir() if p.is_file()}
@@ -803,6 +881,8 @@ class LinkResolver:
         # 有 ffmpeg 才请求「最佳视频+最佳音频」合流；否则退化为单文件，
         # 避免因缺少 ffmpeg 直接失败。
         ffmpeg = _ffmpeg_exe()
+        # 留住 yt-dlp 被吞掉的告警：体积超限时它不抛异常，只是安静地跳过。
+        logger = _QuietLogger()
         options: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -815,7 +895,7 @@ class LinkResolver:
             "format": "bv*+ba/b" if ffmpeg else "b",
             "merge_output_format": "mp4",
             "progress_hooks": [_hook],
-            "logger": _QuietLogger(),
+            "logger": logger,
         }
         if ffmpeg:
             options["ffmpeg_location"] = ffmpeg
@@ -835,7 +915,9 @@ class LinkResolver:
             if hint:
                 detail += f"｜{hint}"
             self._log("warning", f"下载链接内容失败 {url}：{detail}")
-            return None
+            return DownloadOutcome(
+                error=detail, retryable=not _is_permanent_failure(detail)
+            )
 
         # 优先用 yt-dlp 给出的最终路径：多流合流时 progress hook 的 filename
         # 指向的是「分片」文件（合流后已被删除），不能直接拿来用。
@@ -852,15 +934,27 @@ class LinkResolver:
             candidates.append(state["path"])
         for candidate in candidates:
             if candidate and Path(candidate).is_file():
-                return candidate
-        return _newest_new_file(outdir, before)
+                return DownloadOutcome(path=candidate)
+        found = _newest_new_file(outdir, before)
+        if found:
+            return DownloadOutcome(path=found)
+        # 文件没落盘：最常见的原因是超过 max_filesize 被 yt-dlp 主动跳过，
+        # 这属于确定性失败，重试只会白等。
+        if any(_SIZE_SKIP_RE.search(msg) for msg in logger.messages):
+            return DownloadOutcome(
+                error=f"文件超过体积上限（{max_mb} MB），已跳过",
+                retryable=False,
+            )
+        return DownloadOutcome(error="下载完成但未找到文件")
 
-    def _download_douyin(self, url: str, outdir: str, max_mb: int) -> str | None:
+    def _download_douyin(
+        self, url: str, outdir: str, max_mb: int
+    ) -> DownloadOutcome:
         """下载抖音作品：拿 ``play_addr`` 直链直接下（不经过 yt-dlp）。"""
         aweme_id = douyin.extract_aweme_id(url)
         if not aweme_id:
             self._log("warning", f"下载抖音内容失败 {url}：未能识别作品 ID")
-            return None
+            return DownloadOutcome(error="未能识别抖音作品 ID", retryable=False)
         # 直链带时效：先用缓存里的，失败后强制重取一次再试。
         for force in (False, True):
             video = douyin.video_for(
@@ -868,13 +962,16 @@ class LinkResolver:
             )
             if not video.ok:
                 self._log("warning", f"下载抖音内容失败 {url}：{video.error}")
-                return None
+                return DownloadOutcome(error=video.error or "抖音作品解析失败")
             if not video.video_url:
                 self._log(
                     "info",
                     f"抖音图文作品暂不支持下载（{len(video.images)} 张图片）：{url}",
                 )
-                return None
+                return DownloadOutcome(
+                    error=f"图文作品暂不支持下载（{len(video.images)} 张图片）",
+                    retryable=False,
+                )
             path = douyin.download_video(
                 video.video_url,
                 outdir,
@@ -884,5 +981,5 @@ class LinkResolver:
                 logger=self._log,
             )
             if path:
-                return path
-        return None
+                return DownloadOutcome(path=path)
+        return DownloadOutcome(error="抖音直链下载失败")

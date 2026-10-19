@@ -308,6 +308,50 @@ MCP 客户端 / 桌面界面
 抖音的浏览器桥会临时起一个无头浏览器，用**独立的临时用户目录**，
 不碰既有的浏览器配置和登录态。
 
+### 卡片消息为什么要回查数据库
+
+微信里从 App 分享过来的链接、转发的公众号文章，消息类型是 `49`
+（`文件/链接/卡片`）。**UIA 监听通道对它只给类型占位符** `[文件/链接/卡片]`，
+正文——包含 `<url>` 的 appmsg XML——只存在于数据库的 `StrContent`。
+
+所以桥接层在收到这个占位符时会调 `_lookup_raw_content(chat_id, local_id)`
+回查数据库取原文，再走一遍 `normalize_message_content()` 把 `<url>` 提出来：
+
+```
+[文件/链接/卡片]  →  回查 DB  →  <?xml…<title>标题</title><url>https://…</url>
+                  →  归一化   →  "标题\nhttps://…"  →  extract_urls() 命中
+```
+
+- 监听可能略早于落库，查不到时等 `RAW_LOOKUP_RETRY_DELAY`（0.15 秒）再翻一次
+- 数据库不可用 / 对不上 `local_id` 时静默降级，沿用占位符，不影响其它消息
+- 纯文本链接（直接在输入框粘贴的 URL）本来就有正文，不需要回查
+
+### 下载与重试
+
+开启「下载并回发」后，链接内容由 `LinkResolver` 下载，引擎负责重试与反馈：
+
+| 层 | 职责 |
+|---|---|
+| `links.LinkResolver.download_detailed()` | 单次尝试，返回 `DownloadOutcome(path, error, retryable)` |
+| `engine._download_with_retry()` | 按 `link_download_attempts` 重试 + 退避 |
+| `engine._notify_download_failure()` | 用尽次数后往聊天里发一句提示 |
+
+- **次数**：`link_download_attempts`，默认 3（含首次），范围 1–10。
+- **退避**：`_RETRY_DELAYS = (1.5, 3.0, 6.0, 10.0)` 秒。yt-dlp 偶发的
+  `Unable to extract initial state`（B 站常见）往往要等对面接口缓过来，
+  立刻重试基本必挂，所以第一次也要等 1.5 秒。
+- **可重试性**：默认**可重试**，只有命中 `_PERMANENT_FAILURE_RE` 的确定性失败
+  （`Unsupported URL`、`HTTP 404`、视频已删除/私密、格式不存在）或体积超限才
+  立即收手——再试也是同一个结果，只会让用户多等两轮退避。
+- **体积超限**：yt-dlp 超 `max_filesize` 时**不抛异常**，只是安静地跳过。
+  判定方式是看它被吞掉的告警里有没有 `larger than max-filesize`
+  （`_QuietLogger.messages` 留了一份原文）。
+- **失败提示**：`link_download_fail_notice`（默认开）控制。文案保持**单行**
+  ——`_send_reply` 会按句号/换行分条，多行会让一次提示拆成两条消息。
+  提示里带失败原因（截断 80 字），方便直接看出是缺 Cookie、网络问题还是站点不支持。
+- **推文视频**：`Tweet.video_url` 直链先按同样次数重试，失败后才退回 yt-dlp；
+  这一路**不发**提示，由兜底的 yt-dlp 统一发，避免同一段视频连发两条坏消息。
+
 ### 诊断命令
 
 ```powershell
@@ -330,6 +374,11 @@ MCP 客户端 / 桌面界面
   - 路径填错、指向目录或文件为空时，程序**当成没填**处理，继续走匿名请求。
 - **下载音视频失败**：DASH 分离流必须靠 ffmpeg 合流，`--selfcheck` 里的 `ffmpeg`
   必须可用（打包版已内置）。
+- **聊天里收到「下载失败（重试 N 次仍不行）」**：说明自动重试已经用尽，看提示里的
+  原因对症处理——`fresh cookies ... are needed` / `HTTP 403` 去配 `cookies.txt`；
+  `HTTP 404`、视频已删除或私密、`Unsupported URL` 是链接本身的问题，重试也没用；
+  `超过体积上限` 调大「单文件上限」；其余（超时、连接被重置、`Unable to extract
+  initial state`）多为站点侧抖动，过一会儿重发链接即可。
 - **「下载并回发」默认关闭**：开启后下载目录会被自动纳入发送白名单，
   否则回发会被 `path_not_allowed` 拒绝。
 - **下载目录越来越大**：由「目录占用上限」（`link_download_quota_mb`，默认 1024 MB）

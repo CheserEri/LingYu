@@ -28,12 +28,22 @@ from ..adapters.wechat import WeChatAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
 from . import storage, tweet
-from .links import LinkResolver, extract_urls, format_link_block, usable_cookies_file
+from .links import (
+    DownloadOutcome,
+    LinkResolver,
+    extract_urls,
+    format_link_block,
+    usable_cookies_file,
+)
 from .llm import LLMClient, LLMError
 from .persona import get_persona
 
 # 每个会话在引擎内保留的历史条数上限（上下文窗口之外的环形缓冲）。
 PER_CHAT_HISTORY = 200
+
+# 下载失败重试之间的退避（秒）。首次立刻重试意义不大——yt-dlp 偶发的
+# 「Unable to extract initial state」往往要等对面接口缓过来，隔一两秒再撞。
+_RETRY_DELAYS = (1.5, 3.0, 6.0, 10.0)
 
 # 分条发送时的句子边界：中英文句末标点之后，或换行处（保留标点，不丢内容）。
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;…])|\n+")
@@ -855,8 +865,25 @@ class BotEngine:
         X 提取器可靠（后者默认 GraphQL，未登录易 403）；拿不到直链或直链下载失败
         时再退回 yt-dlp 通用下载。
         """
-        loop = asyncio.get_running_loop()
         if info.video_url:
+            path = await self._retry_tweet_video(info, url, outdir)
+            if path and await self._send_file(record.chat, path, "推文视频"):
+                return
+            self._log("warning", f"推文视频直链下载失败，改用 yt-dlp 兜底：{url}")
+        # 兜底这一路负责发失败提示：直链挂了还有 yt-dlp，等它也没辙再提示一次，
+        # 免得同一段视频往聊天里连发两条坏消息。
+        await self._download_and_send_one(record, url, outdir)
+
+    async def _retry_tweet_video(
+        self, info: "tweet.Tweet", url: str, outdir: Path
+    ) -> str | None:
+        """直链下载推文视频，失败按 ``link_download_attempts`` 重试。
+
+        这里**不发**失败提示，由兜底的 yt-dlp 那一路统一发（见上）。
+        """
+        loop = asyncio.get_running_loop()
+        attempts = max(1, int(self._config.link_download_attempts))
+        for index in range(1, attempts + 1):
             path = await loop.run_in_executor(
                 None,
                 lambda: tweet.download_video(
@@ -867,20 +894,100 @@ class BotEngine:
                     max_mb=self._config.link_download_max_mb,
                 ),
             )
-            if path and await self._send_file(record.chat, path, "推文视频"):
-                return
-            self._log("warning", f"推文视频直链下载失败，改用 yt-dlp 兜底：{url}")
-        await self._download_and_send_one(record, url, outdir)
+            if path:
+                if index > 1:
+                    self._log("info", f"推文视频第 {index} 次尝试下载成功：{url}")
+                return path
+            self._log(
+                "warning", f"推文视频直链下载失败（第 {index}/{attempts} 次）：{url}"
+            )
+            if index < attempts:
+                await asyncio.sleep(
+                    _RETRY_DELAYS[min(index - 1, len(_RETRY_DELAYS) - 1)]
+                )
+        return None
+
+    async def _download_with_retry(
+        self,
+        record: MessageRecord,
+        url: str,
+        outdir: Path,
+        label: str = "链接内容",
+        notify: bool = True,
+    ) -> str | None:
+        """下载链接内容，失败自动重试；最终仍失败时往聊天里发一句提示。
+
+        次数取 ``link_download_attempts``（默认 3，含首次）。两次之间按
+        ``_RETRY_DELAYS`` 退避——yt-dlp 偶发的「Unable to extract initial
+        state」往往要等对面接口缓过来，立刻重试基本必挂。
+
+        **确定性失败**（体积超限、图文作品、站点不支持）不重试：再试也一样，
+        只会让用户多等几轮退避。
+        """
+        config = self._config
+        attempts = max(1, int(config.link_download_attempts))
+        outcome = DownloadOutcome(error="未尝试")
+        used = 0
+        for index in range(1, attempts + 1):
+            used = index
+            outcome = await self._links.download_detailed(
+                url, str(outdir), max_mb=config.link_download_max_mb
+            )
+            if outcome.path:
+                if index > 1:
+                    self._log("info", f"{label}第 {index} 次尝试下载成功：{url}")
+                return outcome.path
+            detail = f"｜{outcome.error}" if outcome.error else ""
+            self._log(
+                "warning", f"{label}第 {index}/{attempts} 次下载失败：{url}{detail}"
+            )
+            if not outcome.retryable:
+                self._log("info", f"{label}属于确定性失败，不再重试：{url}")
+                break
+            if index < attempts:
+                await asyncio.sleep(
+                    _RETRY_DELAYS[min(index - 1, len(_RETRY_DELAYS) - 1)]
+                )
+        if notify:
+            await self._notify_download_failure(record, label, outcome, used)
+        return None
+
+    async def _notify_download_failure(
+        self,
+        record: MessageRecord,
+        label: str,
+        outcome: DownloadOutcome,
+        used: int,
+    ) -> None:
+        """下载最终失败时告诉用户一声，免得链接发出去像石沉大海。
+
+        文案保持**单行**：``_send_reply`` 会按句号/换行分条，多行会让一次
+        失败提示拆成两条消息发出去。
+        """
+        if not self._config.link_download_fail_notice:
+            return
+        reason = (outcome.error or "").strip()[:80]
+        head = f"{label}下载失败"
+        if used > 1:
+            head += f"（重试 {used - 1} 次仍不行）"
+        text = f"{head}：{reason}，先不发了。" if reason else f"{head}，先不发了。"
+        if await self._send_reply(record.chat, text):
+            self._log("info", f"已发送{label}下载失败提示 [{record.chat}]：{text}")
+        else:
+            self._log("warning", f"{label}下载失败提示发送失败 [{record.chat}]。")
 
     async def _download_and_send_one(
-        self, record: MessageRecord, url: str, outdir: Path
+        self,
+        record: MessageRecord,
+        url: str,
+        outdir: Path,
+        notify: bool = True,
     ) -> None:
         self._log("info", f"开始下载链接内容：{url}")
-        path = await self._links.download(
-            url, str(outdir), max_mb=self._config.link_download_max_mb
+        path = await self._download_with_retry(
+            record, url, outdir, notify=notify
         )
         if not path:
-            self._log("warning", f"下载失败或超出体积上限，已跳过：{url}")
             return
         await self._send_file(record.chat, path, "链接内容")
 

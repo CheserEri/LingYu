@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import shutil
@@ -58,6 +59,41 @@ def check_bridge() -> None:
             f"未找到 {BRIDGE}\n该文件应随仓库一同提供。"
         )
     print(f"[build] 将内置 wechat_bridge.py <- {BRIDGE}")
+
+
+#: OCR 是「UIA 失效时唯一的会话定位手段」。这几个模块缺任何一个，冻结包都会在
+#: 「UIA 打不开会话」时彻底发不出消息，而日志只有一句
+#: ``发送消息失败: No module named 'winsdk'``——0.8.0 与 0.8.13 都踩过。
+_OCR_REQUIRED_MODULES = (
+    "winrt",
+    "winrt.windows.media.ocr",
+    "winrt.windows.graphics.imaging",
+    "winrt.windows.storage",
+    "winrt.windows.storage.streams",
+)
+
+
+def check_ocr_deps() -> None:
+    """确认 OCR 依赖已装进当前解释器，缺了就中止构建。
+
+    ``lingyu.spec`` 里对 winrt 用了 ``collect_all``，但**包没装时它会静默
+    收集 0 个文件**，产出一个看起来正常、实际 OCR 全废的包。这里在打包前
+    直接导入一遍，把「静默残缺」变成「明确失败」。
+    """
+    missing: list[str] = []
+    for name in _OCR_REQUIRED_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - 任何导入失败都要报出来
+            missing.append(f"{name}（{type(exc).__name__}: {exc}）")
+    if missing:
+        raise SystemExit(
+            "[build] OCR 依赖缺失，拒绝打包：\n  - "
+            + "\n  - ".join(missing)
+            + "\n缺 OCR 时 UIA 一旦失效就彻底发不出消息。"
+            '\n请先执行：pip install -e ".[wechat]"'
+        )
+    print(f"[build] OCR 依赖就绪：{len(_OCR_REQUIRED_MODULES)} 个模块可导入")
 
 
 def read_version() -> str:
@@ -146,6 +182,7 @@ def build_installer() -> None:
 def main() -> None:
     want_installer = "--no-installer" not in sys.argv
     check_bridge()
+    check_ocr_deps()
     out = run_pyinstaller()
     raw_size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
     print(f"[build] onedir 原始体积 {raw_size / 1024 / 1024:.1f} MB")

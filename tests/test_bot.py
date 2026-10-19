@@ -23,6 +23,7 @@ from lingyu.adapters.wechat import (
 from lingyu.bot import BotConfig, BotEngine, get_persona, reset_persona
 from lingyu.bot import browser as browser_mod
 from lingyu.bot import douyin as douyin_mod
+from lingyu.bot import engine as engine_mod
 from lingyu.bot import links as links_mod
 from lingyu.bot.links import LinkInfo, extract_urls, format_link_block
 from lingyu.bot.llm import LLMClient, LLMError
@@ -1169,6 +1170,74 @@ class BridgeNormalizeTests(unittest.TestCase):
         self.assertEqual(normalize(raw), "只有标题")
 
 
+class BridgeCardLookupTests(unittest.TestCase):
+    """卡片消息正文回查。
+
+    背景：UIA 监听对「文件/链接/卡片」只给类型占位符，`<url>` 只落在数据库的
+    `StrContent` 里。不回查的话，分享到微信的链接卡片永远解析不出来——用户看到
+    的就是「发了链接没反应」。
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_card", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _bridge(self, rows):
+        module = self._module()
+        bridge = module.WeChatBridge(target_groups=[], on_message=None)
+
+        class _DB:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def get_messages(self, user, limit=20):
+                return list(self.rows)
+
+        bridge._wx = SimpleNamespace(_db=_DB(rows))
+        return bridge
+
+    def test_returns_card_xml_by_local_id(self):
+        xml = (
+            '<?xml version="1.0"?><msg><appmsg><title>标题</title>'
+            "<url>https://example.com/v</url></appmsg></msg>"
+        )
+        bridge = self._bridge([{"local_id": 7, "content": xml}])
+        self.assertEqual(bridge._lookup_raw_content("123@chatroom", 7), xml)
+
+    def test_missing_local_id_returns_empty(self):
+        bridge = self._bridge([{"local_id": 7, "content": "x"}])
+        self.assertEqual(bridge._lookup_raw_content("123@chatroom", None), "")
+
+    def test_no_database_returns_empty(self):
+        module = self._module()
+        bridge = module.WeChatBridge(target_groups=[], on_message=None)
+        self.assertEqual(bridge._lookup_raw_content("x", 1), "")
+
+    def test_unknown_local_id_returns_empty(self):
+        bridge = self._bridge([{"local_id": 7, "content": "x"}])
+        with mock.patch.object(bridge.__class__, "RAW_LOOKUP_RETRY_DELAY", 0.0):
+            self.assertEqual(bridge._lookup_raw_content("x", 99), "")
+
+    def test_card_xml_yields_url_after_normalize(self):
+        """回查到的 XML 归一化后必须带 URL，引擎才抽得出链接。"""
+        xml = (
+            '<?xml version="1.0"?>\n<msg>\n<appmsg>\n<title>某视频</title>\n'
+            "<url>https://example.com/v</url>\n</appmsg>\n</msg>"
+        )
+        bridge = self._bridge([])
+        out = bridge.normalize_message_content(xml)
+        self.assertIn("https://example.com/v", out)
+
+
 class BridgeAtDetectionTests(unittest.TestCase):
     """入库 wechat_bridge.py 的「@ 机器人」识别与昵称自动刷新。
 
@@ -1527,8 +1596,16 @@ class StubResolver:
         return {url: self._infos[url] for url in urls if url in self._infos}
 
     async def download(self, url, outdir, max_mb=0):
+        outcome = await self.download_detailed(url, outdir, max_mb)
+        return outcome.path
+
+    async def download_detailed(self, url, outdir, max_mb=0):
         self.downloads.append((url, outdir, max_mb))
-        return self.download_path
+        if not self.download_path:
+            # 测试替身默认「确定性失败」：不触发引擎的重试退避，免得拖慢用例。
+            return links_mod.DownloadOutcome(error="测试替身未配置下载结果",
+                                             retryable=False)
+        return links_mod.DownloadOutcome(path=self.download_path)
 
 
 class LinkExtractTests(unittest.TestCase):
@@ -3408,9 +3485,9 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
             tweet_mod.render_card = lambda *a, **k: card
 
             async def _fake_download(u, outdir, max_mb=0):
-                return str(video)
+                return links_mod.DownloadOutcome(path=str(video))
 
-            engine._links.download = _fake_download
+            engine._links.download_detailed = _fake_download
             try:
                 record = make_record(
                     is_at_me=True, message_id="m1", content=f"看看这个 {url}"
@@ -3445,9 +3522,9 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
             video.write_bytes(b"v")
 
             async def _fake_download(u, outdir, max_mb=0):
-                return str(video)
+                return links_mod.DownloadOutcome(path=str(video))
 
-            engine._links.download = _fake_download
+            engine._links.download_detailed = _fake_download
             try:
                 await engine._download_and_send(
                     make_record(is_at_me=True, message_id="m1", content=f"看 {url}")
@@ -3474,14 +3551,14 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_ytdlp(u, outdir, max_mb=0):
             called.append("ytdlp")
-            return None
+            return links_mod.DownloadOutcome()
 
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "tweet-123.mp4"
             video.write_bytes(b"v")
             tweet_mod.fetch_tweet_cached = lambda *a, **k: info
             tweet_mod.download_video = lambda *a, **k: video
-            engine._links.download = _fake_ytdlp
+            engine._links.download_detailed = _fake_ytdlp
             try:
                 await engine._download_and_send(
                     make_record(is_at_me=True, message_id="m1", content=f"看 {url}")
@@ -3509,11 +3586,11 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
             video.write_bytes(b"v")
 
             async def _fake_ytdlp(u, outdir, max_mb=0):
-                return str(video)
+                return links_mod.DownloadOutcome(path=str(video))
 
             tweet_mod.fetch_tweet_cached = lambda *a, **k: info
             tweet_mod.download_video = lambda *a, **k: None
-            engine._links.download = _fake_ytdlp
+            engine._links.download_detailed = _fake_ytdlp
             try:
                 await engine._download_and_send(
                     make_record(is_at_me=True, message_id="m1", content=f"看 {url}")
@@ -3635,9 +3712,9 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
             video.write_bytes(b"v")
 
             async def _fake_download(u, outdir, max_mb=0):
-                return str(video)
+                return links_mod.DownloadOutcome(path=str(video))
 
-            engine._links.download = _fake_download
+            engine._links.download_detailed = _fake_download
             await engine._handle(
                 make_record(is_group=True, content="https://example.com/v")
             )
@@ -3652,9 +3729,10 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_download(u, outdir, max_mb=0):
             started.append(u)
-            return None
+            # 返回成功，避免引擎按失败重试而多调几次，干扰「只调度一次」的判定。
+            return links_mod.DownloadOutcome(path="C:/tmp/once.mp4")
 
-        engine._links.download = _fake_download
+        engine._links.download_detailed = _fake_download
         await engine._handle(
             make_record(is_group=False, content="https://example.com/v")
         )
@@ -3685,6 +3763,22 @@ class LinkConfigTests(unittest.TestCase):
         self.assertTrue(cfg.link_llm_followup)
         # 附件没发成功时默认再试 2 次。
         self.assertEqual(cfg.link_send_attempts, 2)
+        # 下载失败默认重试 3 次（含首次），最终失败要往聊天里提示。
+        self.assertEqual(cfg.link_download_attempts, 3)
+        self.assertTrue(cfg.link_download_fail_notice)
+
+    def test_download_attempts_clamped(self):
+        self.assertEqual(
+            BotConfig.from_dict({"link_download_attempts": 0}).link_download_attempts, 1
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"link_download_attempts": -5}).link_download_attempts,
+            1,
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"link_download_attempts": 99}).link_download_attempts,
+            10,
+        )
 
     def test_ack_text_is_trimmed_and_newlines_collapsed(self):
         cfg = BotConfig.from_dict({"link_ack_text": "  正在\n解析  链接  "})
@@ -4176,6 +4270,84 @@ class LinkDownloadTests(unittest.TestCase):
         finally:
             links_mod.load_yt_dlp = original
 
+    def _run_raising(self, message, max_mb=0):
+        """让 yt-dlp 抛指定异常，返回结构化的下载结果。"""
+
+        class _Boom:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                raise RuntimeError(message)
+
+        class FakeModule:
+            YoutubeDL = staticmethod(_Boom)
+
+        original = links_mod.load_yt_dlp
+        links_mod.load_yt_dlp = lambda: FakeModule
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                return links_mod.LinkResolver()._attempt_download(
+                    "https://x", tmp, max_mb
+                )
+        finally:
+            links_mod.load_yt_dlp = original
+
+    def test_transient_extract_error_is_retryable(self):
+        """B 站偶发的 Unable to extract initial state 必须允许重试。"""
+        outcome = self._run_raising("Unable to extract initial state")
+        self.assertFalse(outcome.ok)
+        self.assertTrue(outcome.retryable)
+        self.assertIn("initial state", outcome.error)
+
+    def test_unsupported_url_is_permanent(self):
+        outcome = self._run_raising("Unsupported URL: https://x")
+        self.assertFalse(outcome.retryable)
+
+    def test_http_5xx_is_retryable_but_404_is_not(self):
+        self.assertTrue(self._run_raising("HTTP Error 503").retryable)
+        self.assertFalse(self._run_raising("HTTP Error 404").retryable)
+
+    def test_size_skip_is_permanent(self):
+        """超过 max_filesize 时 yt-dlp 不抛异常，只能从它吞掉的告警里认出来。"""
+
+        class _Skipper:
+            def __init__(self, options):
+                self._options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                logger = self._options.get("logger")
+                logger.warning("[download] File is larger than max-filesize")
+                return {}
+
+        class FakeModule:
+            YoutubeDL = staticmethod(_Skipper)
+
+        original = links_mod.load_yt_dlp
+        links_mod.load_yt_dlp = lambda: FakeModule
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                outcome = links_mod.LinkResolver()._attempt_download(
+                    "https://x", tmp, 1
+                )
+        finally:
+            links_mod.load_yt_dlp = original
+        self.assertFalse(outcome.ok)
+        self.assertFalse(outcome.retryable, "体积超限重试没有意义")
+        self.assertIn("体积上限", outcome.error)
+
 
 class StorageQuotaTests(unittest.TestCase):
     """下载目录占用统计与「最旧优先」自动清理。"""
@@ -4267,9 +4439,9 @@ class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
             async def _fake_download(url, outdir, max_mb=0):
                 fresh = Path(outdir) / "new.mp4"
                 fresh.write_bytes(b"y" * 1024)
-                return str(fresh)
+                return links_mod.DownloadOutcome(path=str(fresh))
 
-            engine._links.download = _fake_download
+            engine._links.download_detailed = _fake_download
             await engine._download_and_send(
                 make_record(content="https://example.com/video")
             )
@@ -4292,13 +4464,105 @@ class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
             async def _fake_download(url, outdir, max_mb=0):
                 fresh = Path(outdir) / "new.mp4"
                 fresh.write_bytes(b"y")
-                return str(fresh)
+                return links_mod.DownloadOutcome(path=str(fresh))
 
-            engine._links.download = _fake_download
+            engine._links.download_detailed = _fake_download
             await engine._download_and_send(
                 make_record(content="https://example.com/video")
             )
             self.assertTrue(old.exists(), "配额为 0 表示不限制，不应删除任何文件")
+
+
+class DownloadRetryEngineTests(unittest.IsolatedAsyncioTestCase):
+    """引擎：下载失败自动重试，用尽次数后往聊天里发提示。"""
+
+    def setUp(self):
+        self.adapter = FakeAdapter()
+
+    def _engine(self, **cfg_kwargs):
+        cfg = BotConfig(
+            enabled=True,
+            cooldown_seconds=0.0,
+            reply_probability=1.0,
+            link_download_enabled=True,
+            **cfg_kwargs,
+        )
+        return BotEngine(self.adapter, cfg, llm_factory=lambda c: FakeLLM(c))
+
+    async def _run(self, engine, outcomes, url="https://example.com/v"):
+        """按顺序返回 outcomes（用完后重复最后一项），返回实际尝试次数。"""
+        calls = []
+
+        async def _fake(url_, outdir, max_mb=0):
+            calls.append(url_)
+            return outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+
+        engine._links.download_detailed = _fake
+        with tempfile.TemporaryDirectory() as tmp:
+            engine._config.link_download_dir = tmp
+            await engine._download_and_send(make_record(content=url))
+        return calls
+
+    async def test_retries_until_success(self):
+        engine = self._engine()
+        with mock.patch.object(engine_mod, "_RETRY_DELAYS", (0.0, 0.0, 0.0, 0.0)):
+            calls = await self._run(
+                engine,
+                [
+                    links_mod.DownloadOutcome(error="Unable to extract initial state"),
+                    links_mod.DownloadOutcome(path="C:/tmp/v.mp4"),
+                ],
+            )
+        self.assertEqual(len(calls), 2, "第一次失败后应再试一次")
+        self.assertEqual(self.adapter.files, [("测试群", "C:/tmp/v.mp4")])
+        self.assertEqual(self.adapter.sent, [], "重试成功不该发失败提示")
+
+    async def test_gives_up_after_three_attempts_and_notifies(self):
+        engine = self._engine()
+        with mock.patch.object(engine_mod, "_RETRY_DELAYS", (0.0, 0.0, 0.0, 0.0)):
+            calls = await self._run(
+                engine,
+                [links_mod.DownloadOutcome(error="Unable to extract initial state")],
+            )
+        self.assertEqual(len(calls), 3, "默认最多尝试 3 次")
+        self.assertEqual(self.adapter.files, [])
+        self.assertEqual(len(self.adapter.sent), 1, "最终失败要发一条提示")
+        text = self.adapter.sent[0][1]
+        self.assertIn("下载失败", text)
+        self.assertIn("重试 2 次", text)
+        self.assertIn("initial state", text, "提示里要带失败原因，方便排查")
+
+    async def test_permanent_failure_is_not_retried(self):
+        engine = self._engine()
+        calls = await self._run(
+            engine,
+            [
+                links_mod.DownloadOutcome(
+                    error="文件超过体积上限（100 MB），已跳过", retryable=False
+                )
+            ],
+        )
+        self.assertEqual(len(calls), 1, "确定性失败不该白重试")
+        self.assertIn("体积上限", self.adapter.sent[0][1])
+
+    async def test_attempts_config_is_respected(self):
+        engine = self._engine(link_download_attempts=1)
+        with mock.patch.object(engine_mod, "_RETRY_DELAYS", (0.0,)):
+            calls = await self._run(
+                engine, [links_mod.DownloadOutcome(error="网络不通")]
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("下载失败", self.adapter.sent[0][1])
+        self.assertNotIn("重试", self.adapter.sent[0][1])
+
+    async def test_failure_notice_can_be_disabled(self):
+        engine = self._engine(link_download_fail_notice=False)
+        with mock.patch.object(engine_mod, "_RETRY_DELAYS", (0.0, 0.0, 0.0, 0.0)):
+            calls = await self._run(
+                engine, [links_mod.DownloadOutcome(error="网络不通")]
+            )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.adapter.sent, [], "关掉开关后只写日志")
 
 
 if __name__ == "__main__":

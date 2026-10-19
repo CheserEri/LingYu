@@ -1,6 +1,6 @@
 [project]
 name = "lingyu"
-version = "0.8.13"
+version = "0.8.14"
 description = "灵语（LingYu）- 面向通用 AI Agent 的微信桌面自动化工具服务"
 requires-python = ">=3.10"
 dependencies = ["mcp>=2"]
@@ -17,6 +17,26 @@ wechat = [
     "wechatauto-replica==1.2.2.6",
     "wxauto4==41.1.7",
     "uiautomation==2.0.29",
+    # 微信 4.x 的部分消息正文是 zstd 压缩帧，缺这个库只能拿到「[类型]」占位符
+    # （长文本、部分卡片消息会因此读不出内容）。
+    "zstandard>=0.22",
+    # 微信 4.1.15 等版本上 UIA 树不可用，此时 wechatauto 的 WinRT OCR 是
+    # **唯一**的会话定位手段（find_session / _search_chat 全靠它）。缺它时
+    # UIA 一旦失效就彻底发不出消息，日志只有一句
+    # `发送消息失败: No module named 'winsdk'`。
+    #
+    # 为什么不是 winsdk：它已停止维护，wheel 只到 cp311，Python 3.13 装不上。
+    # winrt 是它的继任者，API 一致、模块名从 `winsdk.windows.*` 变成
+    # `winrt.windows.*`；桥接层的 _install_wechatauto_ocr_compat() 会注册
+    # winsdk 别名，所以 wechatauto 里写死的 import 不用改。
+    "winrt-runtime>=3.2",
+    "winrt-Windows.Foundation>=3.2",
+    "winrt-Windows.Foundation.Collections>=3.2",
+    "winrt-Windows.Globalization>=3.2",
+    "winrt-Windows.Graphics.Imaging>=3.2",
+    "winrt-Windows.Media.Ocr>=3.2",
+    "winrt-Windows.Storage>=3.2",
+    "winrt-Windows.Storage.Streams>=3.2",
 ]
 
 [build-system]

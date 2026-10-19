@@ -127,6 +127,14 @@ class BotConfig:
     # 下载目录**总占用**上限（MB）：超出后自动删除最旧的文件，直到降到上限以内。
     # 0 = 不限制。默认 1 GB——长期运行不至于把磁盘吃满，正常使用也很少触发。
     link_download_quota_mb: int = 1024
+    # 下载失败后最多尝试几次（含首次，默认 3）。
+    # 只对**值得重试**的失败生效：B 站偶发的「Unable to extract initial state」、
+    # 超时、连接被重置、5xx 这些换个时机可能就好了；体积超限、图文作品、
+    # 站点不支持属于确定性失败，不会白重试，直接放弃。
+    link_download_attempts: int = 3
+    # 下载最终失败时往聊天里发一句提示（含失败原因），免得链接发出去像石沉大海。
+    # 关闭后只写日志。
+    link_download_fail_notice: bool = True
     # 附件**没发成功**时最多再试几次（0 = 不重试，默认 2）。
     # 每次重试都会回查数据库确认，两个方向都会用上这个次数：
     #   1) 微信明确拒绝（附件压根没粘上去）→ 整条重来；
@@ -220,6 +228,11 @@ class BotConfig:
         config.link_download_dir = str(config.link_download_dir or "").strip()
         config.link_download_max_mb = max(0, int(config.link_download_max_mb))
         config.link_download_quota_mb = max(0, int(config.link_download_quota_mb))
+        # 至少 1 次（0 会让「下载」这件事直接不执行，语义上说不通）。
+        config.link_download_attempts = min(
+            10, max(1, int(config.link_download_attempts))
+        )
+        config.link_download_fail_notice = bool(config.link_download_fail_notice)
         # 重试次数上限给到 10：再多也只是让发送闸门被占更久，收益递减。
         config.link_send_attempts = min(10, max(0, int(config.link_send_attempts)))
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)

@@ -8,8 +8,9 @@
 体积说明：``wechatauto`` / ``wxauto4`` / ``uiautomation`` 会带进较多依赖；
 ``cv2`` / ``numpy`` 等仅在朋友圈等本适配层未启用的路径中被惰性导入，故剔除。
 ``imageio_ffmpeg``（自带 ffmpeg 二进制，约 84 MB）为「链接下载」合流 DASH
-分离流所必需，``winsdk``（约 43 MB）为 wechatauto 的 UIA 发送路径所必需，
-二者均保留内置，会使产物体积明显增大。
+分离流所必需，``winrt``（winsdk 的继任者，约 40 MB）为 wechatauto 的 **OCR
+路径**所必需——微信 4.1.15 等版本上 UIA 树不可用，此时 OCR 是唯一的会话定位
+手段。二者均保留内置，会使产物体积明显增大。
 
 内置 yt-dlp（``vendor/yt_dlp``，链接解析用）通过 ``pathex`` + ``hiddenimports``
 交给 PyInstaller 做**静态分析**，并启用其自带的官方 hook（``vendor/yt_dlp/
@@ -73,7 +74,37 @@ hiddenimports = [
     # 抖音解析的浏览器桥：douyin.py 里是函数内惰性导入，静态分析未必扫到，
     # 漏掉会在冻结包里报 ModuleNotFoundError（只依赖标准库，不增加体积）。
     "lingyu.bot.browser",
+    # WinRT OCR（wechatauto 里写死 `from winsdk...`，桥接层会注册别名）。
+    # 这些子模块是命名空间包，静态分析扫不到，必须显式声明。
+    "winrt",
+    "winrt.windows",
+    "winrt.windows.foundation",
+    "winrt.windows.foundation.collections",
+    "winrt.windows.globalization",
+    "winrt.windows.graphics",
+    "winrt.windows.graphics.imaging",
+    "winrt.windows.media",
+    "winrt.windows.media.ocr",
+    "winrt.windows.storage",
+    "winrt.windows.storage.streams",
 ]
+
+# collect_all 对「当前解释器里没装」的包会**静默返回空**，产出一个看起来正常、
+# 实际 OCR 全废的包——0.8.0 和 0.8.13 都踩过这个坑（运行时日志
+# `发送消息失败: No module named 'winsdk'`）。这里先直接导入校验，缺了就中止，
+# 别让残缺包流出去。
+try:
+    import winrt  # noqa: F401
+    import winrt.windows.media.ocr  # noqa: F401
+    import winrt.windows.storage  # noqa: F401
+except ImportError as _ocr_exc:
+    raise SystemExit(
+        "OCR 依赖 winrt 缺失，拒绝构建："
+        f"{_ocr_exc}\n"
+        "缺它时 UIA 一旦失效就彻底发不出消息（日志只有一句 "
+        "`No module named 'winsdk'`）。\n"
+        '请先执行：pip install -e ".[wechat]"'
+    ) from _ocr_exc
 
 for _pkg in (
     "wechatauto",
@@ -86,15 +117,31 @@ for _pkg in (
     # 链接下载：DASH 分离流（Bilibili/YouTube）必须靠 ffmpeg 合流，
     # imageio_ffmpeg 自带 ffmpeg 二进制（约 84 MB），故一并内置。
     "imageio_ffmpeg",
-    # wechatauto 的 UIA 发送/OCR 路径依赖 winsdk（约 43 MB）。**不能排除**：
-    # 缺它时 `SendMsg` 会抛 ModuleNotFoundError，首次发送必然失败、退化成
-    # OCR 兼容路径并重试（日志 `发送消息失败: No module named 'winsdk'`）。
-    "winsdk",
+    # wechatauto 的 OCR 路径依赖 WinRT。**不能排除**：缺它时 OCR 会抛
+    # ModuleNotFoundError，UIA 一旦失效就再也发不出消息（日志
+    # `发送消息失败: No module named 'winsdk'`）。收集 winrt 而非 winsdk：
+    # 后者已停更（wheel 只到 cp311），桥接层会把 winrt 注册成 winsdk 别名。
+    "winrt",
 ):
     _datas, _binaries, _hidden = collect_all(_pkg)
     datas += _datas
     binaries += _binaries
     hiddenimports += _hidden
+
+# 二次校验：确认 winrt 的文件真的进了产物清单。上面虽然导入过，
+# 但 collect_all 在某些环境（如 site-packages 只读、hook 冲突）下仍可能
+# 收不到文件，那时冻结包会在运行时才炸。
+# 注意：pyd 会被 PyInstaller 归到 datas 而非 binaries，两边都要数。
+_winrt_items = [
+    item for item in (binaries + datas) if "winrt" in str(item[0]).lower()
+]
+if not _winrt_items:
+    raise SystemExit(
+        "winrt 收集到 0 个文件：OCR 在冻结包里不可用，"
+        "UIA 失效时将彻底发不出消息。请检查 PyInstaller 版本与 "
+        "site-packages 权限后重试。"
+    )
+print(f"[spec] winrt 相关文件已收集 {len(_winrt_items)} 个")
 
 a = Analysis(
     [str(SPEC_DIR / "entry.py")],
