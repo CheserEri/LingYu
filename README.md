@@ -57,7 +57,7 @@
 ```json
 {
   "mcpServers": {
-    "wechat": {
+    "lingyu": {
       "command": "D:\\path\\to\\lingyu\\lingyu.exe",
       "args": []
     }
@@ -165,7 +165,7 @@ python -m venv .venv
 ```json
 {
   "mcpServers": {
-    "wechat": {
+    "lingyu": {
       "command": "F:\\Code\\lingyu\\.venv\\Scripts\\python.exe",
       "args": ["-m", "lingyu.server"],
       "env": { "WECHAT_SEND_DIRS": "F:\\Code\\shared" }

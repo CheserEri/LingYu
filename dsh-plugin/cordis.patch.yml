@@ -9,10 +9,10 @@
 # 两者都不可用时桥接会报 ENOENT。此时请从 GitHub Release 下载
 # lingyu-win32-x64.zip 解压，并把 LINGYU_EXE 指向其中的 lingyu.exe。
 - insert:
-    - id: mcp-wechat
+    - id: mcp-lingyu
       name: '@deepseek-ai/dsh-mcp-client'
       config:
-        serverName: wechat
+        serverName: lingyu
         transport: stdio
         command: !!js (process.env.LINGYU_EXE || ((ctx.baseUrl || '') + '/node_modules/dsh-lingyu/bin/lingyu/lingyu.exe'))
         args: []

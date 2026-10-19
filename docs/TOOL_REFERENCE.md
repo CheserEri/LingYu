@@ -191,7 +191,7 @@
 ```json
 {
   "mcpServers": {
-    "wechat": {
+    "lingyu": {
       "command": "F:\\Code\\lingyu\\.venv\\Scripts\\python.exe",
       "args": ["-m", "lingyu.server"]
     }
