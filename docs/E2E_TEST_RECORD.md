@@ -63,7 +63,7 @@
 ## 复现命令
 
 ```powershell
-cd F:\Code\wechat-mcp
+cd F:\Code\lingyu
 .\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 34 项单测
 .\.venv\Scripts\python.exe scripts\phase3_e2e.py                # 端到端（含错误路径）
 .\.venv\Scripts\python.exe scripts\phase3_e2e.py --wait-inbound 90  # 含场景2/3入站等待
@@ -110,7 +110,7 @@ cd F:\Code\wechat-mcp
 ## 复现命令
 
 ```powershell
-cd F:\Code\wechat-mcp
+cd F:\Code\lingyu
 .\.venv\Scripts\python.exe -m unittest discover -s tests -t .   # 65 项单测
 .\.venv\Scripts\python.exe scripts\phase4_live_check.py         # P1 真实联调
 ```

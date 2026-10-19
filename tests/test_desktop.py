@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from wechat_mcp import desktop
+from lingyu import desktop
 
 
 class FileLoggingTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class FileLoggingTests(unittest.TestCase):
     def setUp(self):
         from loguru import logger
 
-        self.tmp = Path(tempfile.mkdtemp(prefix="wechat-mcp-logtest-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="lingyu-logtest-"))
         self._before = set(logger._core.handlers)  # noqa: SLF001
 
     def tearDown(self):
@@ -78,7 +78,7 @@ class EngineLogForwardingTests(unittest.TestCase):
     def setUp(self):
         from loguru import logger
 
-        self.tmp = Path(tempfile.mkdtemp(prefix="wechat-mcp-englog-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="lingyu-englog-"))
         self._before = set(logger._core.handlers)  # noqa: SLF001
 
     def tearDown(self):
@@ -205,7 +205,7 @@ class EngineLogForwardingTests(unittest.TestCase):
         """桌面壳启动时必须真的把 ``on_log`` 接上（这就是当初漏掉的那一步）。"""
         import asyncio
 
-        from wechat_mcp.bot import BotConfig
+        from lingyu.bot import BotConfig
 
         fake_engine = SimpleNamespace(start=mock.AsyncMock())
         fake_adapter = SimpleNamespace(connect=mock.AsyncMock())

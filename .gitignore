@@ -34,6 +34,6 @@ Desktop.ini
 _cardtest/
 
 # DSH 插件：随包分发的独立运行时（由 packaging/build.py + stage-runtime.mjs 生成）
-dsh-plugin/bin/wechat-mcp/
+dsh-plugin/bin/lingyu/
 dsh-plugin/node_modules/
 dsh-plugin/*.tgz

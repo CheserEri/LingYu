@@ -2,6 +2,31 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
+## [Unreleased] - 2026-10-19
+
+**项目改名为「灵语 / LingYu」，功能与 0.8.13 完全一致。**
+
+### 改名
+
+- Python 包 `wechat_mcp` → `lingyu`，`import` 路径、入口点同步改名
+  （`lingyu` / `lingyu-desktop`）
+- 可执行文件、PyInstaller spec、图标、安装包与 zip 全部改为 `lingyu`
+  （`lingyu.exe` / `lingyu.spec` / `lingyu.ico` / `lingyu-setup-x64.exe` /
+  `lingyu-win32-x64.zip`）
+- MCP 工具前缀 `mcp__wechat__*` → `mcp__lingyu__*`；DSH 插件包名 `dsh-lingyu`
+- 用户数据目录 `%APPDATA%\wechat-mcp` → `%APPDATA%\lingyu`
+  （bot 配置、下载目录、运行日志、审计日志随之迁移）
+- 安装器换用新 `AppId`、安装目录改为 `%LOCALAPPDATA%\Programs\lingyu`，
+  与旧版 `wechat-mcp` 互不覆盖，可并存
+
+### 注意
+
+- **升级需要重新配置**：数据目录变了，旧目录下的 `bot.json`、下载记录与日志
+  不会被自动读取。若要沿用，把 `%APPDATA%\wechat-mcp` 整个复制到
+  `%APPDATA%\lingyu` 即可。
+- 环境变量前缀保持 `WECHAT_*` 不变（`WECHAT_BACKEND`、`WECHAT_SEND_DIRS` 等）：
+  它们描述的是「微信后端」而非项目名，改名不动它们可避免已有配置失效。
+
 ## [0.8.13] - 2026-10-07
 
 **链接解析的浏览器桥：失败能看见原因，偶发秒退自动重试一次。**
@@ -30,7 +55,7 @@
 
 ### 修复 · 浏览器启动诊断
 
-- 浏览器 `stderr` 落盘到临时 profile 目录里的 `_wechat-mcp-stderr.log`，
+- 浏览器 `stderr` 落盘到临时 profile 目录里的 `_lingyu-stderr.log`，
   随目录一起被清掉，不额外留文件。
 - 提前退出时把**退出码 + stderr 尾部**（最多 600 字符，折叠成一行）带进异常信息，
   直接出现在「下载抖音内容失败 …」那条日志里。
@@ -290,7 +315,7 @@
 
 ### 新增 · 运行日志落盘
 
-- **运行日志写入 `%APPDATA%\wechat-mcp\logs\app-YYYY-MM-DD.log`**。
+- **运行日志写入 `%APPDATA%\lingyu\logs\app-YYYY-MM-DD.log`**。
   界面上的「运行日志」只在内存里，进程一退出就没了，出问题时完全没有线索。
   现在同一份日志（INFO 及以上）按天写入文件，保留最近 7 天，带毫秒时间戳与级别。
 
@@ -553,7 +578,7 @@
 - **下载目录占用上限**（`link_download_quota_mb`，默认 **1024 MB**，0 = 不限制）：
   在「链接解析 → 下载并回发」页可设定下载目录的**总占用**上限。每次下载完成后
   统计目录大小，超出上限就**按修改时间从旧到新**删除文件，直到降到上限以内。
-  新增 `src/wechat_mcp/bot/storage.py`（`dir_usage` / `total_size` / `enforce_quota`）：
+  新增 `src/lingyu/bot/storage.py`（`dir_usage` / `total_size` / `enforce_quota`）：
   只删下载目录内的普通文件、跳过符号链接，`protect` 里的路径（正在下载/发送的文件）
   永不删除；删除失败只记日志，不影响已完成的回发。
 
@@ -599,9 +624,9 @@
 ### 新增
 
 - **Windows 安装包**（`packaging/installer.iss` + `build.py`）：在 onedir 与 zip 之后自动用
-  **Inno Setup 6** 编译出 `dist\wechat-mcp-setup-x64.exe`（约 60.8 MB，lzma2 固实压缩，
+  **Inno Setup 6** 编译出 `dist\lingyu-setup-x64.exe`（约 60.8 MB，lzma2 固实压缩，
   比 zip 更小）。中文/英文向导、开始菜单项与可选桌面快捷方式、控制面板卸载项。
-  按用户安装（`{localappdata}\Programs\wechat-mcp`，不弹 UAC，安装目录可写以便写 `logs\`）；
+  按用户安装（`{localappdata}\Programs\lingyu`，不弹 UAC，安装目录可写以便写 `logs\`）；
   未安装 Inno Setup 时自动跳过，可用环境变量 `ISCC` 指定编译器，或 `--no-installer` 显式跳过。
 
 ### 修复
@@ -615,7 +640,7 @@
 ### 变更
 
 - 桌面端显示名统一为「**灵语**」（窗口标题、侧栏品牌、安装包与快捷方式）；技术标识
-  （`wechat-mcp` 包名/exe 名、AppId、npm 包名、MCP 工具前缀）保持不变，以便后续适配
+  （`lingyu` 包名/exe 名、AppId、npm 包名、MCP 工具前缀）保持不变，以便后续适配
   QQ 等其他聊天软件。
 - 应用图标改用项目所用的鲸鱼标志（由 `packaging/make_icon.py` 渲染，16~256 px 多尺寸 `.ico`），
   无需外部素材。
@@ -652,9 +677,9 @@
   默认保持原有行为不变；设为关闭则「带链接的消息只回固定提示 + 回发解析结果」。
 - 链接内容的「下载并回发」改由 `_handle_links` **统一调度**，不再在模型回复成功后
   二次调度——否则下载很快完成时同一条链接可能被下载两遍、发两次文件。
-- **链接解析诊断命令** `wechat-mcp --resolve <url> [--download] [--outdir <目录>]`：
+- **链接解析诊断命令** `lingyu --resolve <url> [--download] [--outdir <目录>]`：
   不依赖微信环境，直接跑一遍解析（可选下载）并打印结果，便于验证打包后链路可用。
-- **推文卡片诊断命令** `wechat-mcp --tweet <推文链接> [--outdir <目录>]`：
+- **推文卡片诊断命令** `lingyu --tweet <推文链接> [--outdir <目录>]`：
   抓取一条推文并渲染成卡片图，打印作者/时间/是否含视频/点赞/正文与产物路径。
 - **短链展开**：yt-dlp **完全不认识** `b23.tv` / `v.douyin.com` / `xhslink.com`
   / `t.cn` 等短链（会落到 Generic 提取器，只把短码当标题，例如
@@ -700,20 +725,20 @@
 
 ### 变更
 
-- 新增 `src/wechat_mcp/bot/links.py`：URL 提取（RFC 3986 字符集，不吞中文、
+- 新增 `src/lingyu/bot/links.py`：URL 提取（RFC 3986 字符集，不吞中文、
   保留成对括号）、`LinkResolver`（线程池执行 yt-dlp，超时/缓存/下载）。
 - `BotConfig` 新增 `link_parse_enabled` / `link_parse_max` / `link_parse_timeout`
   / `link_download_enabled` / `link_download_max` / `link_download_dir` /
   `link_download_max_mb` / `link_tweet_card_enabled` 字段，`from_dict` 做范围钳制，
-  并新增 `download_dir()`（默认 `%APPDATA%\wechat-mcp\downloads`）。
-- 新增 `src/wechat_mcp/bot/tweet.py`：推文 URL 识别、syndication token、
+  并新增 `download_dir()`（默认 `%APPDATA%\lingyu\downloads`）。
+- 新增 `src/lingyu/bot/tweet.py`：推文 URL 识别、syndication token、
   抓取与解析（`Tweet` / `fetch_tweet` / `fetch_tweet_cached`）、PIL 卡片渲染
   （`render_card`：圆形头像、认证徽标、中英 emoji 混排折行、配图网格）。
 - `BotEngine`：构建上下文前预解析链接（`_prefetch_links`），渲染时注入
   `[链接] …`（`_link_block`）；触发回复成功后按需下载回发
   （`_download_and_send`）。下载目录会被自动纳入适配层的发送白名单
   （`_ensure_download_dir_allowed`）——否则「未配置允许目录即拒发」会让回发必然失败。
-- 新增 `src/wechat_mcp/bot/tweet.py`：推文 URL 识别、syndication 抓取与解析、
+- 新增 `src/lingyu/bot/tweet.py`：推文 URL 识别、syndication 抓取与解析、
   内存缓存、以及 `render_card`（PIL 本地渲染推文卡片）。
 - `BotConfig` 新增 `link_tweet_card_enabled` 字段（默认 `True`）。
 - `BotEngine` 的回发改由分发器 `_download_and_send` 处理：推文走 `_send_tweet`
@@ -857,7 +882,7 @@
 ### 新增
 
 - 新增桌面应用（pywebview + WebView2，DSH 风格界面）：
-  - `.venv\Scripts\python.exe -m wechat_mcp.desktop`，或独立 exe 加 `--gui`。
+  - `.venv\Scripts\python.exe -m lingyu.desktop`，或独立 exe 加 `--gui`。
   - 页面：运行状态、群聊设置、模型设置、人设、运行日志。
 - 新增实时触发：消息到达即处理，无需 Agent 轮询。
   - 群聊：@我 或 引用/回复我的消息；私聊：每条入站消息（开关可配）。
@@ -869,7 +894,7 @@
 - 同一发送者冷却（默认 3 秒）与消息去重，避免刷屏与重复回复。
 - 新增会话延续：刚被回复过的人在该窗口内（默认 120 秒，可配 0 关闭）继续
   发言也会接着回复，支持连续对话。
-- 配置持久化在 `%APPDATA%\wechat-mcp\bot.json`（可用 `WECHAT_BOT_CONFIG` 覆盖）。
+- 配置持久化在 `%APPDATA%\lingyu\bot.json`（可用 `WECHAT_BOT_CONFIG` 覆盖）。
 
 ### 修复
 
@@ -902,11 +927,11 @@
 ### 新增
 
 - 新增 `packaging/`：PyInstaller 打包脚本与 spec，产出 Windows onedir 独立运行时
-  （约 71 MB 原始 / 32.7 MB zip），并自动打包为 `wechat-mcp-win32-x64.zip`。
-- 新增 `dsh-plugin/`：DeepSeek Harness（DSH）插件 npm 包 `dsh-wechat-mcp`，通过官方
+  （约 71 MB 原始 / 32.7 MB zip），并自动打包为 `lingyu-win32-x64.zip`。
+- 新增 `dsh-plugin/`：DeepSeek Harness（DSH）插件 npm 包 `dsh-lingyu`，通过官方
   MCP 客户端桥接（`@deepseek-ai/dsh-mcp-client`）以 stdio 启动随包内置的运行时，
-  微信工具以 `mcp__wechat__*` 暴露给模型；安装命令为
-  `dsh plugin --profile web add dsh-wechat-mcp`。
+  微信工具以 `mcp__lingyu__*` 暴露给模型；安装命令为
+  `dsh plugin --profile web add dsh-lingyu`。
 
 ### 变更
 
@@ -935,9 +960,9 @@
   - `send_file`：发送本地文件，含目录白名单、可配置确认策略与结构化结果。
   - `get_recent_messages`：基于 `next_seq` 游标的增量消息读取。
   - `set_monitored_chats`：白名单/黑名单过滤读取结果，支持运行时增删与配置预设。
-- 新增操作审计（`wechat_mcp.audit`）：以 JSONL 记录工具名、目标、时间、结果与
+- 新增操作审计（`lingyu.audit`）：以 JSONL 记录工具名、目标、时间、结果与
   错误码，默认不记录聊天正文，可通过环境变量开关与指定路径。
-- 新增会话关注列表模块（`wechat_mcp.monitoring`）：`allow`（空=关注全部）与
+- 新增会话关注列表模块（`lingyu.monitoring`）：`allow`（空=关注全部）与
   `block`（优先级更高）两种模式，仅过滤本服务读取结果。
 - 新增文件路径白名单校验与 `..` 路径穿越防护。
 - 新增发送确认机制：`WECHAT_REQUIRE_CONFIRM=1` 时需显式 `confirm=true`。

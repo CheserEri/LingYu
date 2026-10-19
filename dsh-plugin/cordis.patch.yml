@@ -1,20 +1,20 @@
-# DSH bundle 补丁层：安装本包后自动挂载微信 MCP 服务。
+# DSH bundle 补丁层：安装本包后自动挂载灵语 MCP 服务。
 #
 # 通过官方 MCP 客户端桥接（@deepseek-ai/dsh-mcp-client）以 stdio 方式启动随包内置的
-# 独立运行时；微信工具会以 mcp__wechat__* 暴露给模型。
+# 独立运行时；微信工具会以 mcp__lingyu__* 暴露给模型。
 #
 # 运行时路径解析优先级：
-#   1. 环境变量 WECHAT_MCP_EXE 指定的 wechat-mcp.exe（最可靠，任何安装布局都适用）
-#   2. 本插件包内 bin/wechat-mcp/wechat-mcp.exe（从 npm 安装时位于 profile 的 node_modules 下）
+#   1. 环境变量 LINGYU_EXE 指定的 lingyu.exe（最可靠，任何安装布局都适用）
+#   2. 本插件包内 bin/lingyu/lingyu.exe（从 npm 安装时位于 profile 的 node_modules 下）
 # 两者都不可用时桥接会报 ENOENT。此时请从 GitHub Release 下载
-# wechat-mcp-win32-x64.zip 解压，并把 WECHAT_MCP_EXE 指向其中的 wechat-mcp.exe。
+# lingyu-win32-x64.zip 解压，并把 LINGYU_EXE 指向其中的 lingyu.exe。
 - insert:
     - id: mcp-wechat
       name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: wechat
         transport: stdio
-        command: !!js (process.env.WECHAT_MCP_EXE || ((ctx.baseUrl || '') + '/node_modules/dsh-wechat-mcp/bin/wechat-mcp/wechat-mcp.exe'))
+        command: !!js (process.env.LINGYU_EXE || ((ctx.baseUrl || '') + '/node_modules/dsh-lingyu/bin/lingyu/lingyu.exe'))
         args: []
-    - id: dsh-wechat-mcp
-      name: dsh-wechat-mcp
+    - id: dsh-lingyu
+      name: dsh-lingyu

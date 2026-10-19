@@ -4,7 +4,7 @@
 --------
 - **媒体站点**（YouTube / Bilibili 等）走 yt-dlp 的 ``extract_info``
   （``skip_download=True``，只取元数据）。
-- **抖音**单独走浏览器桥（见 :mod:`wechat_mcp.bot.douyin`）：它的接口要求
+- **抖音**单独走浏览器桥（见 :mod:`lingyu.bot.douyin`）：它的接口要求
   ``a_bogus`` 签名，内置 yt-dlp 没实现，网页兜底也只能拿到空壳。
 - **普通网页**回退到直接抓取 ``<title>`` 与 ``meta description``。
 - 结果按 URL **缓存**（成功永久、失败带 TTL 允许重试），重复出现不再请求。
@@ -101,11 +101,11 @@ def _vendor_dir() -> Path | None:
     """返回内置 ``yt_dlp`` 所在目录（该目录需加入 ``sys.path``）。"""
     if getattr(sys, "frozen", False):
         base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-        for candidate in (base, base / "wechat_mcp" / "_vendor"):
+        for candidate in (base, base / "lingyu" / "_vendor"):
             if (candidate / "yt_dlp" / "__init__.py").is_file():
                 return candidate
         return None
-    # src/wechat_mcp/bot/links.py -> 仓库根
+    # src/lingyu/bot/links.py -> 仓库根
     root = Path(__file__).resolve().parents[3]
     vendor = root / "vendor"
     return vendor if (vendor / "yt_dlp" / "__init__.py").is_file() else None
@@ -220,7 +220,7 @@ def _cookie_hint(detail: str) -> str:
     用户只看到「未能提取标题」，根本不知道该做什么。
 
     注意**抖音不在此列**：它另有 ``a_bogus`` 签名这道门槛，配 Cookie 也解不开，
-    已改走浏览器桥（见 :mod:`wechat_mcp.bot.douyin`）。
+    已改走浏览器桥（见 :mod:`lingyu.bot.douyin`）。
     """
     if _COOKIE_HINT_RE.search(detail or ""):
         return (
@@ -645,7 +645,7 @@ class LinkResolver:
         return _rekey(page_info, url, lookup)
 
     def _douyin_link_info(self, url: str) -> LinkInfo:
-        """抖音解析：交给浏览器桥（见 :mod:`wechat_mcp.bot.browser`）。"""
+        """抖音解析：交给浏览器桥（见 :mod:`lingyu.bot.browser`）。"""
         aweme_id = douyin.extract_aweme_id(url)
         if not aweme_id:
             return LinkInfo(url=url, ok=False, error="未能从抖音链接中识别作品 ID")

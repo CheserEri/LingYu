@@ -2,8 +2,8 @@
 
 用法::
 
-    wechat-mcp --selfcheck
-    wechat-mcp --resolve <url> [--download] [--outdir <目录>]
+    lingyu --selfcheck
+    lingyu --resolve <url> [--download] [--outdir <目录>]
 
 ``--selfcheck`` 会检查：版本、是否冻结运行、内置 yt-dlp 能否导入、ffmpeg 是否可用、
 内置桥接层与 webui 是否存在。任何一项显示 ``(不可用)`` / ``(缺失)`` 都
@@ -96,7 +96,7 @@ def resolve(url: str, *, download: bool = False, outdir: str | None = None) -> i
 
     _utf8_console()
     if not url:
-        print("用法：wechat-mcp --resolve <url> [--download] [--outdir <目录>]")
+        print("用法：lingyu --resolve <url> [--download] [--outdir <目录>]")
         return 2
 
     resolver = LinkResolver(timeout=30.0)
@@ -115,7 +115,7 @@ def resolve(url: str, *, download: bool = False, outdir: str | None = None) -> i
     print(f"summary: {info.summary()}")
 
     if download:
-        target = outdir or tempfile.mkdtemp(prefix="wechat-mcp-resolve-")
+        target = outdir or tempfile.mkdtemp(prefix="lingyu-resolve-")
         path = asyncio.run(resolver.download(url, target, max_mb=0))
         print(f"download: {path or '(失败)'}")
         if path:
@@ -135,7 +135,7 @@ def tweet_card(url: str, outdir: str | None = None) -> int:
 
     _utf8_console()
     if not url:
-        print("用法：wechat-mcp --tweet <推文链接> [--outdir <目录>]")
+        print("用法：lingyu --tweet <推文链接> [--outdir <目录>]")
         return 2
     if not tweet_mod.is_tweet_url(url):
         print(f"不是 X/Twitter 推文链接：{url}")
@@ -156,7 +156,7 @@ def tweet_card(url: str, outdir: str | None = None) -> int:
     print(f"likes: {info.likes} | replies: {info.replies}")
     print(f"text: {info.text}")
 
-    target = outdir or tempfile.mkdtemp(prefix="wechat-mcp-tweet-")
+    target = outdir or tempfile.mkdtemp(prefix="lingyu-tweet-")
     path = tweet_mod.render_card(info, target, timeout=30.0)
     print(f"card: {path or '(渲染失败)'}")
     return 0 if path else 1

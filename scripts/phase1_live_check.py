@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wechat_mcp.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
-from wechat_mcp.config import AdapterConfig  # noqa: E402
+from lingyu.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
+from lingyu.config import AdapterConfig  # noqa: E402
 
 
 def _dump(label: str, payload: dict) -> None:
@@ -28,10 +28,10 @@ def _dump(label: str, payload: dict) -> None:
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="wechat-mcp 阶段1 联调检查")
+    parser = argparse.ArgumentParser(description="lingyu 阶段1 联调检查")
     parser.add_argument("--listen", type=float, default=0.0, help="连接后保持监听的秒数")
     parser.add_argument("--send", default="", help="要发送的目标名称（留空则不发送）")
-    parser.add_argument("--text", default="[wechat-mcp 联调测试] 这是一条自动化测试消息，可忽略。")
+    parser.add_argument("--text", default="[lingyu 联调测试] 这是一条自动化测试消息，可忽略。")
     parser.add_argument("--history", default="", help="要读取历史的会话名")
     parser.add_argument("--limit", type=int, default=10, help="历史消息条数上限")
     args = parser.parse_args()

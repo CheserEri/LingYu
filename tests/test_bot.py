@@ -16,17 +16,17 @@ from unittest import mock
 
 import httpx
 
-from wechat_mcp.adapters.deepseekgirl import (
+from lingyu.adapters.deepseekgirl import (
     DeepSeekGirlAdapter,
     _looks_like_chat_id,
 )
-from wechat_mcp.bot import BotConfig, BotEngine, get_persona, reset_persona
-from wechat_mcp.bot import browser as browser_mod
-from wechat_mcp.bot import douyin as douyin_mod
-from wechat_mcp.bot import links as links_mod
-from wechat_mcp.bot.links import LinkInfo, extract_urls, format_link_block
-from wechat_mcp.bot.llm import LLMClient, LLMError
-from wechat_mcp.schemas import (
+from lingyu.bot import BotConfig, BotEngine, get_persona, reset_persona
+from lingyu.bot import browser as browser_mod
+from lingyu.bot import douyin as douyin_mod
+from lingyu.bot import links as links_mod
+from lingyu.bot.links import LinkInfo, extract_urls, format_link_block
+from lingyu.bot.llm import LLMClient, LLMError
+from lingyu.schemas import (
     ConnectionState,
     MessageRecord,
     SendResult,
@@ -2370,7 +2370,7 @@ class WeChatWindowVisibilityTests(unittest.TestCase):
         module = self._module()
         try:
             hwnd = win32gui.CreateWindow(
-                "STATIC", "wechat-mcp-hidden-test", 0, 0, 0, 10, 10, 0, 0, 0, None
+                "STATIC", "lingyu-hidden-test", 0, 0, 0, 10, 10, 0, 0, 0, None
             )
         except Exception as exc:  # pragma: no cover - 桌面会话受限时跳过
             self.skipTest(f"无法创建测试窗口: {exc}")
@@ -2423,7 +2423,7 @@ class BrowserBridgeTests(unittest.TestCase):
     def test_sweep_removes_stale_and_keeps_fresh(self):
         stale = self._make("unittest-stale", browser_mod._PROFILE_STALE_SECONDS + 60)
         fresh = self._make("unittest-fresh", 5)
-        other = Path(tempfile.gettempdir()) / "wechat-mcp-unrelated"
+        other = Path(tempfile.gettempdir()) / "lingyu-unrelated"
         other.mkdir(exist_ok=True)
         try:
             browser_mod._sweep_stale_profiles()
@@ -3068,7 +3068,7 @@ class TweetTests(unittest.TestCase):
     """X 推文：URL 识别、token、JSON 解析、卡片渲染。"""
 
     def test_is_tweet_url(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         for url in (
             "https://x.com/Interior/status/507185938620219395",
@@ -3084,20 +3084,20 @@ class TweetTests(unittest.TestCase):
             self.assertFalse(tweet_mod.is_tweet_url(url), url)
 
     def test_tweet_id(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         self.assertEqual(tweet_mod.tweet_id("https://x.com/a/status/123"), "123")
         self.assertIsNone(tweet_mod.tweet_id("https://x.com/a"))
 
     def test_token_matches_react_tweet_algorithm(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         self.assertEqual(
             tweet_mod._token("507185938620219395"), "189ddm8u5hzych3nyqhvvx6r"
         )
 
     def test_parse_tweet(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         payload = {
             "id_str": "123",
@@ -3125,7 +3125,7 @@ class TweetTests(unittest.TestCase):
         self.assertIn("含视频", info.summary())
 
     def test_parse_tweet_without_media_is_not_video(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.parse_tweet(
             {"id_str": "1", "text": "纯文字", "user": {"screen_name": "a"}},
@@ -3135,13 +3135,13 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(info.photos, [])
 
     def test_parse_tweet_rejects_payload_without_id(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         self.assertIsNone(tweet_mod.parse_tweet({}, "https://x.com/a/status/1"))
 
     def test_parse_tweet_picks_best_video_variant(self):
         """有多个 mp4 变体时取码率最高的那条；非 mp4 一律忽略。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         payload = {
             "id_str": "9",
@@ -3165,7 +3165,7 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(info.video_url, "https://high.mp4")
 
     def test_parse_tweet_without_variants_has_no_video_url(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.parse_tweet(
             {"id_str": "9", "mediaDetails": [{"type": "video"}]}, "https://x.com/a/status/9"
@@ -3175,7 +3175,7 @@ class TweetTests(unittest.TestCase):
 
     def test_parse_tweet_uses_video_poster_as_thumbnail(self):
         """视频/动图没有 photos 条目，须用封面帧当卡片缩略图。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         payload = {
             "id_str": "9",
@@ -3201,7 +3201,7 @@ class TweetTests(unittest.TestCase):
         self.assertNotIn("张图", info.summary())
 
     def test_parse_tweet_without_poster_has_no_video_poster(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.parse_tweet(
             {"id_str": "9", "mediaDetails": [{"type": "video"}]}, "https://x.com/a/status/9"
@@ -3210,7 +3210,7 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(info.photos, [])
 
     def test_download_video_streams_to_file(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         class _Resp:
             headers = {"Content-Length": "6"}
@@ -3239,7 +3239,7 @@ class TweetTests(unittest.TestCase):
             self.assertEqual(Path(path).read_bytes(), b"abcdef")
 
     def test_download_video_respects_size_limit(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         class _Resp:
             headers = {"Content-Length": str(10 * 1024 * 1024)}
@@ -3266,7 +3266,7 @@ class TweetTests(unittest.TestCase):
 
     def test_render_card_writes_png(self):
         """不触网渲染（无头像/无配图）也要能出图，且中英 emoji 混排不报错。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         info = tweet_mod.Tweet(
             id="1",
@@ -3300,7 +3300,7 @@ class TweetTests(unittest.TestCase):
 
     def test_fit_cover_crops_instead_of_stretching(self):
         """等比覆盖裁切：300×100 塞进 100×100 应只剩中间那一条，而不是压扁三色。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         out = tweet_mod._fit_cover(self._striped(300, 100), 100, 100)
         self.assertEqual(out.size, (100, 100))
@@ -3312,7 +3312,7 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(squeezed.getpixel((95, 50)), (0, 0, 255))
 
     def test_media_boxes_single_keeps_aspect_ratio(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
         inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
@@ -3327,7 +3327,7 @@ class TweetTests(unittest.TestCase):
         self.assertAlmostEqual(box[2] / box[3], 0.5, places=2)
 
     def test_media_boxes_multi_grid_is_uniform_and_inside_card(self):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
         inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
@@ -3347,7 +3347,7 @@ class TweetTests(unittest.TestCase):
 
     def test_render_card_with_multiple_photos(self):
         """多图推文：横竖混排也要出图且不报错（回归「多图变形」）。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
         info = tweet_mod.Tweet(
@@ -3385,7 +3385,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
         return BotEngine(adapter, cfg, llm_factory=lambda c: llm)
 
     async def _run(self, has_video: bool):
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         engine = self._engine(adapter, link_download_enabled=True)
@@ -3430,7 +3430,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tweet_card_can_be_disabled(self):
         """关掉卡片开关后，含视频的推文只发视频。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         engine = self._engine(
@@ -3458,7 +3458,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tweet_video_prefers_direct_link(self):
         """有 mp4 直链时直接下载，不该再走 yt-dlp。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         # 本用例只关心视频下载路径，关掉卡片开关以免多出一张卡片图。
@@ -3493,7 +3493,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tweet_video_falls_back_to_ytdlp(self):
         """直链下载失败时退回 yt-dlp。"""
-        from wechat_mcp.bot import tweet as tweet_mod
+        from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
         engine = self._engine(
@@ -4189,7 +4189,7 @@ class StorageQuotaTests(unittest.TestCase):
         return path
 
     def test_dir_usage_and_total_size(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(storage.dir_usage(tmp), 0)
@@ -4201,7 +4201,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.total_size([Path(tmp) / "缺.bin"]), 0)
 
     def test_enforce_quota_removes_oldest_first(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             oldest = self._touch(tmp, "old.bin", 400, 1000)
@@ -4215,7 +4215,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.dir_usage(tmp), 800)
 
     def test_enforce_quota_noop_when_within_limit_or_disabled(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             keep = self._touch(tmp, "a.bin", 100, 1000)
@@ -4225,7 +4225,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertTrue(keep.exists())
 
     def test_enforce_quota_never_deletes_protected_files(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             old = self._touch(tmp, "old.bin", 400, 1000)
@@ -4237,7 +4237,7 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.dir_usage(tmp), 400)
 
     def test_enforce_quota_handles_missing_directory(self):
-        from wechat_mcp.bot import storage
+        from lingyu.bot import storage
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(storage.enforce_quota(Path(tmp) / "缺", 10), [])

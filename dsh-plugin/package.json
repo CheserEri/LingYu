@@ -1,5 +1,5 @@
 {
-  "name": "dsh-wechat-mcp",
+  "name": "dsh-lingyu",
   "version": "0.4.0",
   "description": "DeepSeek Harness (DSH) 插件：通过官方 MCP 客户端桥接本机微信桌面自动化服务（Windows）。",
   "type": "module",
@@ -43,12 +43,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/CheserEri/wechat-mcp.git",
+    "url": "https://github.com/CheserEri/lingyu.git",
     "directory": "dsh-plugin"
   },
-  "homepage": "https://github.com/CheserEri/wechat-mcp",
+  "homepage": "https://github.com/CheserEri/lingyu",
   "bugs": {
-    "url": "https://github.com/CheserEri/wechat-mcp/issues"
+    "url": "https://github.com/CheserEri/lingyu/issues"
   },
   "os": [
     "win32"

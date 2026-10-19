@@ -1,4 +1,4 @@
-"""WeChat MCP Server 启动与工具注册。
+"""灵语（LingYu）启动与工具注册。
 
 通过 stdio 传输向本地 Agent 客户端暴露微信工具（P0 + P1）。
 """
@@ -12,7 +12,7 @@ from mcp.server.mcpserver import MCPServer
 from .logging_config import configure_logging
 from .service import WeChatService
 
-SERVER_NAME = "wechat-mcp"
+SERVER_NAME = "lingyu"
 SERVER_VERSION = "0.8.13"
 
 

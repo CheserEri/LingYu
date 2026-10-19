@@ -31,7 +31,7 @@ from ..errors import (
     ConfirmationRequiredError,
     NotConnectedError,
     TargetAmbiguousError,
-    WeChatMCPError,
+    LingyuError,
 )
 from ..monitoring import MonitoredChats
 from ..schemas import (
@@ -273,7 +273,7 @@ class DeepSeekGirlAdapter:
 
         try:
             self._bridge = self._create_bridge()
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             self._last_error = exc.to_dict()
             return self._status_result(ConnectionState.ERROR, error=exc.to_dict())
 
@@ -380,7 +380,7 @@ class DeepSeekGirlAdapter:
         try:
             recipient = validate_recipient(recipient)
             message = validate_message(message)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return SendResult(
                 ok=False,
                 status=SendStatus.FAILED,
@@ -527,7 +527,7 @@ class DeepSeekGirlAdapter:
         """返回指定会话在缓冲区内的最近消息（非微信完整历史）。"""
         try:
             chat_name = validate_recipient(chat_name)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return ChatHistoryResult(
                 ok=False,
                 chat=str(chat_name or ""),
@@ -574,7 +574,7 @@ class DeepSeekGirlAdapter:
         if chat_name:
             try:
                 chat_name = validate_recipient(chat_name)
-            except WeChatMCPError as exc:
+            except LingyuError as exc:
                 return RecentMessagesResult(
                     ok=False, next_seq=cursor, error=exc.to_dict()
                 )
@@ -611,7 +611,7 @@ class DeepSeekGirlAdapter:
         """返回已确认可获取的会话信息（名称、类型、观察到的消息数等）。"""
         try:
             chat_name = validate_recipient(chat_name)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return ChatInfoResult(
                 ok=False, name=str(chat_name or ""), error=exc.to_dict()
             )
@@ -751,7 +751,7 @@ class DeepSeekGirlAdapter:
             resolved_path = validate_send_path(
                 file_path, self._config.allow_send_dirs
             )
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             return FileSendResult(
                 ok=False,
                 status=SendStatus.FAILED,
@@ -869,7 +869,7 @@ class DeepSeekGirlAdapter:
         """运行时增删关注/忽略会话，或切换 allow/block 模式。"""
         try:
             self._monitor.apply(add=add, remove=remove, mode=mode)
-        except WeChatMCPError as exc:
+        except LingyuError as exc:
             snapshot = self._monitor.snapshot()
             return MonitoredChatsResult(
                 ok=False,

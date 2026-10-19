@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 配置：把 wechat-mcp 打成 Windows onedir 独立 exe。
+"""PyInstaller 配置：把 lingyu 打成 Windows onedir 独立 exe。
 
 请通过 ``packaging/build.py`` 调用。它会把本仓库内的
 ``packaging/wechat_bridge.py``（从上游 deepseekgirl 收录，来源见文件头注释与
@@ -26,17 +26,17 @@ from PyInstaller.utils.hooks import collect_all
 SPEC_DIR = Path(SPECPATH).resolve()
 ROOT = SPEC_DIR.parent
 BRIDGE = SPEC_DIR / "wechat_bridge.py"
-WEBUI = ROOT / "src" / "wechat_mcp" / "webui"
+WEBUI = ROOT / "src" / "lingyu" / "webui"
 VENDOR = ROOT / "vendor"
 # 应用图标（由 packaging/make_icon.py 生成），同时供 exe 与安装包使用。
-ICON = SPEC_DIR / "wechat-mcp.ico"
+ICON = SPEC_DIR / "lingyu.ico"
 
 if not BRIDGE.is_file():
     raise SystemExit(
         "缺少 packaging/wechat_bridge.py；该文件应随仓库一同提供。"
     )
 if not WEBUI.is_dir():
-    raise SystemExit("缺少 src/wechat_mcp/webui 前端目录。")
+    raise SystemExit("缺少 src/lingyu/webui 前端目录。")
 if not (VENDOR / "yt_dlp" / "__init__.py").is_file():
     raise SystemExit(
         "缺少 vendor/yt_dlp；内置的 yt-dlp 源码应随仓库一同提供。"
@@ -73,7 +73,7 @@ hiddenimports = [
     "yt_dlp",
     # 抖音解析的浏览器桥：douyin.py 里是函数内惰性导入，静态分析未必扫到，
     # 漏掉会在冻结包里报 ModuleNotFoundError（只依赖标准库，不增加体积）。
-    "wechat_mcp.bot.browser",
+    "lingyu.bot.browser",
 ]
 
 for _pkg in (
@@ -127,7 +127,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="wechat-mcp",
+    name="lingyu",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -143,5 +143,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="wechat-mcp",
+    name="lingyu",
 )

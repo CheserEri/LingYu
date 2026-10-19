@@ -15,9 +15,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wechat_mcp.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
-from wechat_mcp.config import AdapterConfig  # noqa: E402
-from wechat_mcp.schemas import ConnectionState, SendStatus  # noqa: E402
+from lingyu.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
+from lingyu.config import AdapterConfig  # noqa: E402
+from lingyu.schemas import ConnectionState, SendStatus  # noqa: E402
 
 
 class FakeContactDb:
@@ -146,7 +146,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.state, ConnectionState.DISCONNECTED)
 
     async def test_backend_unavailable_error_is_surfaced(self):
-        from wechat_mcp.errors import BackendUnavailableError
+        from lingyu.errors import BackendUnavailableError
 
         def boom():
             raise BackendUnavailableError("未找到桥接模块")

@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "wechat": {
-      "command": "F:\\Code\\wechat-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "wechat_mcp.server"],
+    "lingyu": {
+      "command": "F:\\Code\\lingyu\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "lingyu.server"],
       "env": {
         "DEEPSEEKGIRL_PATH": "F:\\Code\\deepseekgirl-main",
         "WECHAT_BACKEND": "auto",

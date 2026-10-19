@@ -1,10 +1,10 @@
-; 灵语（wechat-mcp）Windows 安装脚本 —— Inno Setup 6。
+; 灵语（lingyu）Windows 安装脚本 —— Inno Setup 6。
 ;
 ; 编译（仓库根目录，或用 packaging/build.py --installer 自动调用）：
 ;
 ;     "F:\SoftWare\Inno Setup 6\ISCC.exe" packaging\installer.iss
 ;
-; 产物：dist\wechat-mcp-setup-x64.exe
+; 产物：dist\lingyu-setup-x64.exe
 ;
 ; 设计取舍：
 ; * **按用户安装**（PrivilegesRequired=lowest + {localappdata}）：不弹 UAC，
@@ -17,23 +17,24 @@
 #endif
 
 #define AppName "灵语"
-#define AppExe "wechat-mcp.exe"
-#define SourceDir "..\dist\wechat-mcp"
+#define AppExe "lingyu.exe"
+#define SourceDir "..\dist\lingyu"
 
 [Setup]
 ; 应用唯一标识（升级/卸载靠它匹配，不要随意改）。
-AppId={{7F3A9C2E-4B18-4D6A-9E5F-1C8B0A6D3E72}
+; 改名时换过新 GUID，与旧版 wechat-mcp 的安装互不覆盖。
+AppId={{348CE62C-8A98-4AED-869B-F3B2E8463CB8}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=wechat-mcp
-DefaultDirName={localappdata}\Programs\wechat-mcp
+AppPublisher=lingyu
+DefaultDirName={localappdata}\Programs\lingyu
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=wechat-mcp-setup-x64
-SetupIconFile=wechat-mcp.ico
+OutputBaseFilename=lingyu-setup-x64
+SetupIconFile=lingyu.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 LicenseFile=..\LICENSE

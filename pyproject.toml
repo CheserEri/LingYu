@@ -1,13 +1,13 @@
 [project]
-name = "wechat-mcp"
+name = "lingyu"
 version = "0.8.13"
-description = "WeChat MCP Server - 面向通用 AI Agent 的微信桌面自动化工具服务"
+description = "灵语（LingYu）- 面向通用 AI Agent 的微信桌面自动化工具服务"
 requires-python = ">=3.10"
 dependencies = ["mcp>=2"]
 
 [project.scripts]
-wechat-mcp = "wechat_mcp.server:main"
-wechat-mcp-desktop = "wechat_mcp.desktop:run"
+lingyu = "lingyu.server:main"
+lingyu-desktop = "lingyu.desktop:run"
 
 [project.optional-dependencies]
 # 微信桌面自动化所需的运行时依赖（仅在目标 Windows 环境安装）。

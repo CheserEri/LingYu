@@ -1,4 +1,4 @@
-"""生成安装包与快捷方式用的应用图标（``packaging/wechat-mcp.ico``）。
+"""生成安装包与快捷方式用的应用图标（``packaging/lingyu.ico``）。
 
 图标采用项目在界面（侧栏品牌）与人设中使用的鲸鱼标识（🐋）：直接用系统
 彩色 emoji 字体渲染，再按 16~256 px 重新取样，小尺寸下仍然可辨。用法：
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-OUT = Path(__file__).resolve().parent / "wechat-mcp.ico"
+OUT = Path(__file__).resolve().parent / "lingyu.ico"
 
 # 先按大尺寸绘制再降采样，等效于抗锯齿。
 S = 1024

@@ -46,7 +46,7 @@ def server_params(env_overrides: dict[str, str] | None = None) -> StdioServerPar
         env.update(env_overrides)
     return StdioServerParameters(
         command=sys.executable,
-        args=["-m", "wechat_mcp.server"],
+        args=["-m", "lingyu.server"],
         env=env,
     )
 
@@ -211,7 +211,7 @@ async def run_error_path_scenario() -> bool:
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="wechat-mcp 阶段3 端到端测试")
+    parser = argparse.ArgumentParser(description="lingyu 阶段3 端到端测试")
     parser.add_argument(
         "--wait-inbound",
         type=float,

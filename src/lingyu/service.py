@@ -17,7 +17,7 @@ from typing import Any
 from .adapters.deepseekgirl import DeepSeekGirlAdapter
 from .audit import AuditLogger
 from .config import AdapterConfig
-from .errors import WeChatMCPError
+from .errors import LingyuError
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class WeChatService:
                 return None
             try:
                 status = await self._adapter.connect()
-            except WeChatMCPError as exc:
+            except LingyuError as exc:
                 return exc.to_dict()
             except Exception as exc:  # 兜底，避免异常穿透到协议层
                 logger.exception("连接微信失败")

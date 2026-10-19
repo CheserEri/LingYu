@@ -15,11 +15,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tests.test_adapter import FakeBridge, make_message  # noqa: E402
-from wechat_mcp.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
-from wechat_mcp.audit import AuditLogger  # noqa: E402
-from wechat_mcp.config import AdapterConfig  # noqa: E402
-from wechat_mcp.server import build_server  # noqa: E402
-from wechat_mcp.service import WeChatService  # noqa: E402
+from lingyu.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
+from lingyu.audit import AuditLogger  # noqa: E402
+from lingyu.config import AdapterConfig  # noqa: E402
+from lingyu.server import build_server  # noqa: E402
+from lingyu.service import WeChatService  # noqa: E402
 
 EXPECTED_TOOLS = {
     "get_wechat_status",

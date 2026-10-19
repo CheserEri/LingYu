@@ -1,6 +1,6 @@
 # 工具接口文档（P0 + P1）
 
-WeChat MCP Server 通过 stdio 传输暴露以下工具。所有工具返回结构化 JSON，
+灵语（LingYu）通过 stdio 传输暴露以下工具。所有工具返回结构化 JSON，
 失败时返回 `{"ok": false, "code": "...", "message": "..."}`，不会虚报成功。
 
 - P0：`get_wechat_status`、`get_chat_list`、`get_chat_history`、`send_message`
@@ -192,8 +192,8 @@ WeChat MCP Server 通过 stdio 传输暴露以下工具。所有工具返回结�
 {
   "mcpServers": {
     "wechat": {
-      "command": "F:\\Code\\wechat-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "wechat_mcp.server"]
+      "command": "F:\\Code\\lingyu\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "lingyu.server"]
     }
   }
 }

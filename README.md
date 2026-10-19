@@ -1,4 +1,4 @@
-# WeChat MCP Server
+# 灵语（LingYu）
 
 把 Windows 微信桌面客户端的自动化能力封装为 **MCP Server**，供通用 AI Agent
 （Codex、Claude Code 等支持 MCP 的客户端）通过标准工具调用。
@@ -36,19 +36,19 @@
 
 ### 方式零：Windows 安装包（最省事，推荐给普通用户）
 
-从 [GitHub Releases](https://github.com/CheserEri/wechat-mcp/releases) 下载
-`wechat-mcp-setup-x64.exe` 双击安装即可。向导支持中文/英文，会创建开始菜单
+从 [GitHub Releases](https://github.com/CheserEri/lingyu/releases) 下载
+`lingyu-setup-x64.exe` 双击安装即可。向导支持中文/英文，会创建开始菜单
 （以及可选桌面）快捷方式，并在控制面板「应用」里登记卸载项。
 
-- **按用户安装**到 `%LOCALAPPDATA%\Programs\wechat-mcp`，**不弹 UAC**；
+- **按用户安装**到 `%LOCALAPPDATA%\Programs\lingyu`，**不弹 UAC**；
   安装目录可写（程序会在 exe 同级写 `logs\`）。
 - 安装程序自己写文件，**不会**带「Internet 区域」标记，因此不会遇到解压 zip
   才有的「打开黑屏」问题。
 
 ### 方式一：预编译独立包（无需 Python）
 
-从 [GitHub Releases](https://github.com/CheserEri/wechat-mcp/releases) 下载
-`wechat-mcp-win32-x64.zip`，解压后直接把 `wechat-mcp.exe` 配到 MCP 客户端即可：
+从 [GitHub Releases](https://github.com/CheserEri/lingyu/releases) 下载
+`lingyu-win32-x64.zip`，解压后直接把 `lingyu.exe` 配到 MCP 客户端即可：
 
 > 解压前请先对压缩包**右键 → 属性 → 勾选「解除锁定」**，否则解压出来的程序集
 > 会被标记为「来自 Internet」，.NET 拒绝加载，界面会黑屏（新版启动时会自动修复，
@@ -58,7 +58,7 @@
 {
   "mcpServers": {
     "wechat": {
-      "command": "D:\\path\\to\\wechat-mcp\\wechat-mcp.exe",
+      "command": "D:\\path\\to\\lingyu\\lingyu.exe",
       "args": []
     }
   }
@@ -92,7 +92,7 @@
 「模型设置」页的「图像识别」开启后（需模型支持视觉），图片会随上下文一起送给模型。
 
 ```powershell
-.\wechat-mcp.exe --gui
+.\lingyu.exe --gui
 ```
 
 > 若窗口出来是**一片黑**：多为解压时文件被标记为「来自 Internet」，.NET 拒绝加载
@@ -103,9 +103,9 @@
 **自检与链接解析诊断**：不确定打包版是否正常时，可跑这几条命令（都不启动微信）：
 
 ```powershell
-.\wechat-mcp.exe --selfcheck                                  # 版本 / 内置 yt-dlp / ffmpeg / webui
-.\wechat-mcp.exe --resolve <url> [--download] [--outdir <目录>]  # 直接解析（可选下载）一个链接
-.\wechat-mcp.exe --tweet <推文链接> [--outdir <目录>]            # 抓取推文并渲染出卡片图
+.\lingyu.exe --selfcheck                                  # 版本 / 内置 yt-dlp / ffmpeg / webui
+.\lingyu.exe --resolve <url> [--download] [--outdir <目录>]  # 直接解析（可选下载）一个链接
+.\lingyu.exe --tweet <推文链接> [--outdir <目录>]            # 抓取推文并渲染出卡片图
 ```
 
 `--selfcheck` 里 `yt_dlp_version` 与 `ffmpeg` 应显示具体版本/路径；`--resolve` 会打印
@@ -115,18 +115,18 @@
 ### 方式二：DeepSeek Harness 插件（输入名称即安装）
 
 ```sh
-dsh plugin --profile web add dsh-wechat-mcp
+dsh plugin --profile web add dsh-lingyu
 ```
 
 插件包见 [dsh-plugin/](dsh-plugin/)，运行时随 npm 包分发，微信工具以
-`mcp__wechat__*` 暴露给模型。详见 [dsh-plugin/README.md](dsh-plugin/README.md)。
+`mcp__lingyu__*` 暴露给模型。详见 [dsh-plugin/README.md](dsh-plugin/README.md)。
 
 ### 方式三：源码运行（开发用）
 
 环境要求：Windows 10/11 x64、Python 3.10+。
 
 ```powershell
-cd F:\Code\wechat-mcp
+cd F:\Code\lingyu
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[wechat]"
 ```
@@ -138,7 +138,7 @@ python -m venv .venv
 桌面窗口（界面 API Key 在界面中填写，无需环境变量）：
 
 ```powershell
-.venv\Scripts\python.exe -m wechat_mcp.desktop
+.venv\Scripts\python.exe -m lingyu.desktop
 ```
 
 ## 配置
@@ -166,8 +166,8 @@ python -m venv .venv
 {
   "mcpServers": {
     "wechat": {
-      "command": "F:\\Code\\wechat-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "wechat_mcp.server"],
+      "command": "F:\\Code\\lingyu\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "lingyu.server"],
       "env": { "WECHAT_SEND_DIRS": "F:\\Code\\shared" }
     }
   }
@@ -224,7 +224,7 @@ python -m venv .venv
 node dsh-plugin\scripts\stage-runtime.mjs
 
 # 3. 发布 GitHub Release（需已登录 gh）
-gh release create v0.8.0 dist\wechat-mcp-win32-x64.zip dist\wechat-mcp-setup-x64.exe --title "v0.8.0" --notes "…"
+gh release create v0.8.0 dist\lingyu-win32-x64.zip dist\lingyu-setup-x64.exe --title "v0.8.0" --notes "…"
 
 # 4. 发布 npm 插件（prepack 会自动执行第 2 步）
 cd dsh-plugin

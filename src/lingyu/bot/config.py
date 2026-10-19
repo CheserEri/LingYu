@@ -1,6 +1,6 @@
 """常驻自动回复 bot 的配置与本地持久化。
 
-配置以 JSON 存在用户私有目录（默认 ``%APPDATA%\\wechat-mcp\\bot.json``），
+配置以 JSON 存在用户私有目录（默认 ``%APPDATA%\\lingyu\\bot.json``），
 可用环境变量 ``WECHAT_BOT_CONFIG`` 指定其他路径。``api_key`` 仅落盘在该
 本地私有文件中，不进入仓库、不随包分发。
 """
@@ -14,13 +14,13 @@ from pathlib import Path
 
 
 def default_config_path() -> Path:
-    """返回 bot 配置文件路径：WECHAT_BOT_CONFIG 优先，否则 %APPDATA%\\wechat-mcp。"""
+    """返回 bot 配置文件路径：WECHAT_BOT_CONFIG 优先，否则 %APPDATA%\\lingyu。"""
     raw = os.environ.get("WECHAT_BOT_CONFIG", "").strip()
     if raw:
         return Path(raw)
     appdata = os.environ.get("APPDATA", "").strip()
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    return base / "wechat-mcp" / "bot.json"
+    return base / "lingyu" / "bot.json"
 
 
 @dataclass
@@ -120,7 +120,7 @@ class BotConfig:
     link_download_enabled: bool = False
     # 单次触发最多下载几个链接。
     link_download_max: int = 1
-    # 下载目录；空串表示使用默认目录（%APPDATA%\wechat-mcp\downloads）。
+    # 下载目录；空串表示使用默认目录（%APPDATA%\lingyu\downloads）。
     link_download_dir: str = ""
     # 单文件体积上限（MB），超过则跳过下载（0 = 不限制）。
     link_download_max_mb: int = 100
@@ -230,7 +230,7 @@ class BotConfig:
         return config
 
     def download_dir(self) -> Path:
-        """链接下载目录：显式配置优先，否则用 %APPDATA%\\wechat-mcp\\downloads。"""
+        """链接下载目录：显式配置优先，否则用 %APPDATA%\\lingyu\\downloads。"""
         raw = self.link_download_dir.strip()
         if raw:
             return Path(raw).expanduser()

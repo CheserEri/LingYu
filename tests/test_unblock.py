@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from wechat_mcp.unblock import (
+from lingyu.unblock import (
     bundled_root,
     has_zone_identifier,
     unblock_bundled_assemblies,

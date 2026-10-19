@@ -17,7 +17,7 @@ from mcp import ClientSession, StdioServerParameters, stdio_client
 async def main() -> int:
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "wechat_mcp.server"],
+        args=["-m", "lingyu.server"],
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:

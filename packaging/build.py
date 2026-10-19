@@ -7,9 +7,9 @@
 
 产物：
 
-    dist\\wechat-mcp\\                     PyInstaller onedir 目录
-    dist\\wechat-mcp-win32-x64.zip         供 GitHub Release 与 npm 插件分发的压缩包
-    dist\\wechat-mcp-setup-x64.exe         Windows 安装包（需本机装有 Inno Setup 6）
+    dist\\lingyu\\                     PyInstaller onedir 目录
+    dist\\lingyu-win32-x64.zip         供 GitHub Release 与 npm 插件分发的压缩包
+    dist\\lingyu-setup-x64.exe         Windows 安装包（需本机装有 Inno Setup 6）
 
 前置：
 
@@ -39,8 +39,8 @@ SPEC_DIR = Path(__file__).resolve().parent
 ROOT = SPEC_DIR.parent
 BRIDGE = SPEC_DIR / "wechat_bridge.py"
 ISS = SPEC_DIR / "installer.iss"
-ZIP_NAME = "wechat-mcp-win32-x64.zip"
-SETUP_NAME = "wechat-mcp-setup-x64.exe"
+ZIP_NAME = "lingyu-win32-x64.zip"
+SETUP_NAME = "lingyu-setup-x64.exe"
 
 # ISCC.exe 的常见位置（PATH 之外）。Inno Setup 允许装到任意目录，
 # 所以这里只覆盖常见几种，其余情况请设环境变量 ISCC。
@@ -75,7 +75,7 @@ def run_pyinstaller() -> Path:
         sys.executable,
         "-m",
         "PyInstaller",
-        str(SPEC_DIR / "wechat-mcp.spec"),
+        str(SPEC_DIR / "lingyu.spec"),
         "--noconfirm",
         "--clean",
         "--distpath",
@@ -85,7 +85,7 @@ def run_pyinstaller() -> Path:
     ]
     print("[build] " + " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(ROOT))
-    out = dist / "wechat-mcp"
+    out = dist / "lingyu"
     if not out.is_dir():
         raise SystemExit(f"打包失败，未生成目录: {out}")
     return out

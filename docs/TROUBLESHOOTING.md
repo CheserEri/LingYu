@@ -102,8 +102,8 @@
 先用诊断命令确认打包版链路本身是否可用（不启动微信）：
 
 ```powershell
-.\wechat-mcp.exe --selfcheck                                  # 看 yt_dlp_version / ffmpeg 是否正常
-.\wechat-mcp.exe --resolve <url> [--download] [--outdir <目录>]  # 直接跑一遍解析
+.\lingyu.exe --selfcheck                                  # 看 yt_dlp_version / ffmpeg 是否正常
+.\lingyu.exe --resolve <url> [--download] [--outdir <目录>]  # 直接跑一遍解析
 ```
 
 - `--selfcheck` 里 `yt_dlp_version` 显示 `(不可用)`：内置 yt-dlp 导入失败，
@@ -134,7 +134,7 @@
 
 ## 桌面端（`--gui`）启动后黑屏
 
-现象：双击 `wechat-mcp.exe`，窗口出来了但一片黑（或闪一下就没了），
+现象：双击 `lingyu.exe`，窗口出来了但一片黑（或闪一下就没了），
 `logs/` 里什么都没有。
 
 原因：从 zip 解压出来的文件会被 Windows 打上「Internet 区域」标记
@@ -158,7 +158,7 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
    Get-ChildItem -Path <安装目录> -Recurse -File | Unblock-File
    ```
 
-3. 自检确认：`wechat-mcp.exe --selfcheck` 不依赖 GUI，能跑通说明解释器与内置
+3. 自检确认：`lingyu.exe --selfcheck` 不依赖 GUI，能跑通说明解释器与内置
    依赖没问题，黑屏就属于窗口/标记层面。
 
 ## 日志与审计
@@ -172,7 +172,7 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
 
 - 发送操作（文本/文件）通过互斥锁串行化，多个 Agent 调用会排队而非同时操作窗口。
 - 期间请不要手动操作微信窗口，以免与自动化抢焦点导致失败。
-- **不要同时开两个程序实例**（双击两次就会有两个 `wechat-mcp.exe`，目前没有单实例保护）。
+- **不要同时开两个程序实例**（双击两次就会有两个 `lingyu.exe`，目前没有单实例保护）。
   两个实例会抢同一个微信窗口，表现为日志里反复出现
   `未检测到输入框 / 输入框探测连续失败，自动重新校准布局`、`发送消息超时`、
   `回复发送失败：底层发送未成功`，而且自动化还会把另一个窗口「自动最小化」藏起来，
