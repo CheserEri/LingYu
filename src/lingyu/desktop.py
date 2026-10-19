@@ -24,7 +24,7 @@ from typing import Any
 
 import webview
 
-from .adapters.deepseekgirl import DeepSeekGirlAdapter
+from .adapters.wechat import WeChatAdapter
 from .bot import BotConfig, BotEngine, default_config_path
 from .bot.llm import LLMClient, LLMError
 from .config import AdapterConfig
@@ -340,7 +340,7 @@ class DesktopApi:
 
     def __init__(self, hub: _AsyncHub) -> None:
         self._hub = hub
-        self.adapter: DeepSeekGirlAdapter | None = None
+        self.adapter: WeChatAdapter | None = None
         self.engine: BotEngine | None = None
         self.config: BotConfig | None = None
         self._ready = threading.Event()
@@ -352,7 +352,7 @@ class DesktopApi:
     # ------------------------------------------------------------------ 初始化
 
     async def _bootstrap_async(self) -> None:
-        self.adapter = DeepSeekGirlAdapter(AdapterConfig.from_env())
+        self.adapter = WeChatAdapter(AdapterConfig.from_env())
         self.config = BotConfig.load()
         self.engine = BotEngine(self.adapter, self.config)
         # 引擎就绪后接管控制台输出，连接微信期间的日志即可直接显示到界面。

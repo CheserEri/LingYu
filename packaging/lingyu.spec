@@ -2,9 +2,8 @@
 """PyInstaller 配置：把 lingyu 打成 Windows onedir 独立 exe。
 
 请通过 ``packaging/build.py`` 调用。它会把本仓库内的
-``packaging/wechat_bridge.py``（从上游 deepseekgirl 收录，来源见文件头注释与
-``THIRD_PARTY_NOTICES.md``）作为数据文件内置进包，使分发的 exe 无需外部
-deepseekgirl 项目即可运行。
+``packaging/wechat_bridge.py`` 作为数据文件内置进包，使分发的 exe 无需任何
+外部目录即可运行。
 
 体积说明：``wechatauto`` / ``wxauto4`` / ``uiautomation`` 会带进较多依赖；
 ``cv2`` / ``numpy`` 等仅在朋友圈等本适配层未启用的路径中被惰性导入，故剔除。

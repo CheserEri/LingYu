@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from lingyu.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
+from lingyu.adapters.wechat import WeChatAdapter  # noqa: E402
 from lingyu.config import AdapterConfig  # noqa: E402
 from lingyu.schemas import ConnectionState, SendStatus  # noqa: E402
 
@@ -40,7 +40,7 @@ class FakeContactDb:
 
 
 class FakeBridge:
-    """模拟 deepseekgirl 的 WeChatBridge，仅实现适配层用到的最小接口。"""
+    """模拟桥接层，仅实现适配层用到的最小接口。"""
 
     SEND_TIMEOUT_SECONDS = 5.0
     # 桥接层用类常量控制「附件发送失败后的重试」，适配层会按配置覆盖。
@@ -129,7 +129,7 @@ def make_message(chat: str, content: str, *, sender: str = "张三", is_group: b
 class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.bridge = FakeBridge()
-        self.adapter = DeepSeekGirlAdapter(
+        self.adapter = WeChatAdapter(
             config=AdapterConfig(listen_on_connect=True),
             bridge_factory=lambda: self.bridge,
         )
@@ -151,7 +151,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         def boom():
             raise BackendUnavailableError("未找到桥接模块")
 
-        adapter = DeepSeekGirlAdapter(bridge_factory=boom)
+        adapter = WeChatAdapter(bridge_factory=boom)
         status = await adapter.connect()
         self.assertFalse(status.ok)
         self.assertEqual(status.error["code"], "backend_unavailable")
@@ -309,7 +309,7 @@ class AdapterP1Tests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self.bridge = FakeBridge()
-        self.adapter = DeepSeekGirlAdapter(
+        self.adapter = WeChatAdapter(
             config=AdapterConfig(listen_on_connect=True),
             bridge_factory=lambda: self.bridge,
         )
@@ -450,8 +450,8 @@ class AdapterP1Tests(unittest.IsolatedAsyncioTestCase):
 
     # ---------------------------------------------------------------- 文件发送
 
-    def _adapter_with_dir(self, directory: str, **kwargs) -> DeepSeekGirlAdapter:
-        return DeepSeekGirlAdapter(
+    def _adapter_with_dir(self, directory: str, **kwargs) -> WeChatAdapter:
+        return WeChatAdapter(
             config=AdapterConfig(
                 listen_on_connect=True,
                 allow_send_dirs=(Path(directory),),
@@ -529,7 +529,7 @@ class AdapterP1Tests(unittest.IsolatedAsyncioTestCase):
     # ---------------------------------------------------------------- 发送确认
 
     async def test_confirmation_required_blocks_send(self):
-        adapter = DeepSeekGirlAdapter(
+        adapter = WeChatAdapter(
             config=AdapterConfig(
                 listen_on_connect=True, require_confirmation=True
             ),

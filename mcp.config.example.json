@@ -4,7 +4,6 @@
       "command": "F:\\Code\\lingyu\\.venv\\Scripts\\python.exe",
       "args": ["-m", "lingyu.server"],
       "env": {
-        "DEEPSEEKGIRL_PATH": "F:\\Code\\deepseekgirl-main",
         "WECHAT_BACKEND": "auto",
         "WECHAT_SEND_TIMEOUT": "20",
         "WECHAT_LISTEN_ON_CONNECT": "1",

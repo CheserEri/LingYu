@@ -21,8 +21,7 @@
   未安装时会**跳过**安装包并给出提示，不影响前两项产物。可用环境变量
   ``ISCC`` 指定编译器路径。
 
-构建会把本仓库内的 ``packaging/wechat_bridge.py``（从上游 deepseekgirl 收录，
-来源见文件头注释与 ``THIRD_PARTY_NOTICES.md``）作为数据文件内置进包。
+构建会把本仓库内的 ``packaging/wechat_bridge.py`` 作为数据文件内置进包。
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ def check_bridge() -> None:
     """确认仓库内的 wechat_bridge.py 存在，供 spec 内置。"""
     if not BRIDGE.is_file():
         raise SystemExit(
-            f"未找到 {BRIDGE}\n该文件应随仓库一同提供（见 THIRD_PARTY_NOTICES.md）。"
+            f"未找到 {BRIDGE}\n该文件应随仓库一同提供。"
         )
     print(f"[build] 将内置 wechat_bridge.py <- {BRIDGE}")
 

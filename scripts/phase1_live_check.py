@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from lingyu.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
+from lingyu.adapters.wechat import WeChatAdapter  # noqa: E402
 from lingyu.config import AdapterConfig  # noqa: E402
 
 
@@ -36,7 +36,7 @@ async def main() -> int:
     parser.add_argument("--limit", type=int, default=10, help="历史消息条数上限")
     args = parser.parse_args()
 
-    adapter = DeepSeekGirlAdapter(AdapterConfig.from_env())
+    adapter = WeChatAdapter(AdapterConfig.from_env())
     status = await adapter.connect()
     _dump("CONNECT", status.to_dict())
     if not status.ok:

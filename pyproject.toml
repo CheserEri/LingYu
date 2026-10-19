@@ -11,7 +11,7 @@ lingyu-desktop = "lingyu.desktop:run"
 
 [project.optional-dependencies]
 # 微信桌面自动化所需的运行时依赖（仅在目标 Windows 环境安装）。
-# 适配层默认从 deepseekgirl 复用 WeChatBridge，故需要其依赖可用。
+# 适配层通过内置的 wechat_bridge 调用这些库，故需其依赖可用。
 wechat = [
     "loguru>=0.7",
     "wechatauto-replica==1.2.2.6",

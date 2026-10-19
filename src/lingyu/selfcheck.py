@@ -44,15 +44,9 @@ def _webui_index() -> Path | None:
 
 def _bridge_path() -> Path | None:
     """桥接层来源：冻结时取内置副本，源码模式取仓库内的 packaging/wechat_bridge.py。"""
-    from .adapters.deepseekgirl import _bundled_bridge_file
+    from .adapters.wechat import bridge_file
 
-    bundled = _bundled_bridge_file()
-    if bundled:
-        return bundled
-    candidate = (
-        Path(__file__).resolve().parents[2] / "packaging" / "wechat_bridge.py"
-    )
-    return candidate if candidate.is_file() else None
+    return bridge_file()
 
 
 def collect() -> dict[str, object]:

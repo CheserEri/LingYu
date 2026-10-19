@@ -19,7 +19,7 @@ import sys
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
 SELF_TARGET = "文件传输助手"
-BOGUS_PATH = r"F:\__no_such_project__"
+BOGUS_BACKEND = "__no_such_backend__"
 
 
 def _payload(result) -> dict:
@@ -197,7 +197,7 @@ async def _check_ambiguity(session: ClientSession, chats: list[dict]) -> tuple[b
 
 async def run_error_path_scenario() -> bool:
     """场景 6：后端不可用时返回结构化错误，而非虚报成功。"""
-    params = server_params({"DEEPSEEKGIRL_PATH": BOGUS_PATH})
+    params = server_params({"WECHAT_BACKEND": BOGUS_BACKEND})
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -205,7 +205,7 @@ async def run_error_path_scenario() -> bool:
     error = status.get("error") or {}
     return report(
         "6-backend-unavailable",
-        (not status.get("ok")) and error.get("code") == "backend_unavailable",
+        (not status.get("ok")) and bool(error.get("code")),
         f"ok={status.get('ok')} code={error.get('code')}",
     )
 

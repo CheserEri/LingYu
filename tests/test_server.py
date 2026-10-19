@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tests.test_adapter import FakeBridge, make_message  # noqa: E402
-from lingyu.adapters.deepseekgirl import DeepSeekGirlAdapter  # noqa: E402
+from lingyu.adapters.wechat import WeChatAdapter  # noqa: E402
 from lingyu.audit import AuditLogger  # noqa: E402
 from lingyu.config import AdapterConfig  # noqa: E402
 from lingyu.server import build_server  # noqa: E402
@@ -51,7 +51,7 @@ def extract(result) -> dict:
 class ServerToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.bridge = FakeBridge()
-        adapter = DeepSeekGirlAdapter(
+        adapter = WeChatAdapter(
             config=AdapterConfig(listen_on_connect=True, audit_enabled=False),
             bridge_factory=lambda: self.bridge,
         )
@@ -186,7 +186,7 @@ class AuditTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "audit.jsonl"
             bridge = FakeBridge()
-            adapter = DeepSeekGirlAdapter(
+            adapter = WeChatAdapter(
                 config=AdapterConfig(listen_on_connect=True, audit_enabled=False),
                 bridge_factory=lambda: bridge,
             )

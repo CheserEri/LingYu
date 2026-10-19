@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ..adapters.deepseekgirl import DeepSeekGirlAdapter
+from ..adapters.wechat import WeChatAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
 from . import storage, tweet
@@ -129,7 +129,7 @@ class BotEngine:
 
     def __init__(
         self,
-        adapter: DeepSeekGirlAdapter,
+        adapter: WeChatAdapter,
         config: BotConfig | None = None,
         llm_factory: Callable[[BotConfig], Any] | None = None,
     ):

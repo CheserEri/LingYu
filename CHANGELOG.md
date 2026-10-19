@@ -460,7 +460,7 @@
 - 抖音的解析结果标签为 **`[抖音]`**，摘要里标注「类型：视频 / 图文（N 张）」。
 - **抖音图文作品**能正常解析（标题、作者、图片数），但**暂不支持下载**（日志里会说明）。
 - 更正文档里「抖音靠 cookies.txt 解析」的说法：README、界面提示、
-  `docs/TROUBLESHOOTING.md`、`config.py` 注释均已改为「抖音走浏览器桥，
+  技术文档、`config.py` 注释均已改为「抖音走浏览器桥，
   微博/小红书等仍需 cookies.txt」。
 - `bot/douyin.py` 里那份纯 Python `a_bogus` 实现（移植自 f2，曾逐字节验证正确）
   作为参考**保留但不再使用**——抖音已轮换 SDK，自定义字符表变为
@@ -549,7 +549,7 @@
 
 - **群消息没被触发时给出可读原因**（`BotEngine._explain_no_reply`）：群聊里没 @ 到
   机器人时打一行日志，并把机器人**当前识别到的昵称**一并打出来，例如
-  `群消息未 @ 机器人，已忽略 [某群] 张三：@某某 在吗｜机器人昵称：Viollete`。
+  `群消息未 @ 机器人，已忽略 [某群] 张三：@某某 在吗｜机器人昵称：小助手`。
   此前这条路径**一行日志都不打**，用户只看到入站消息、看不到任何解释，
   很容易误以为程序坏了。
 
@@ -653,7 +653,7 @@
 ### 新增
 
 - **内置 yt-dlp 源码**：完整收录上游 `yt_dlp` 包到 `vendor/yt_dlp/`
-  （版本 `2026.08.19`，Unlicense 公有领域，见 `THIRD_PARTY_NOTICES.md`）。
+  （版本 `2026.08.19`，Unlicense 公有领域）。
   打包时交给 PyInstaller 静态分析（`pathex` + `hiddenimports`）并启用其自带的
   官方 hook，源码模式与冻结模式均可导入。
 - **链接解析**（桌面端新增「链接解析」页面，默认**开启**）：
@@ -935,16 +935,14 @@
 
 ### 变更
 
-- 冻结打包时**内置**上游 `wechat_bridge.py`，独立运行时不依赖
-  `DEEPSEEKGIRL_PATH`；源码模式行为保持不变。
+- 冻结打包时**内置** `wechat_bridge.py`，独立运行时不依赖任何外部目录。
 - 打包会剔除 `cv2` / `numpy` / `imageio_ffmpeg` / `winsdk` 等仅用于朋友圈、媒体下载
   的惰性重依赖，避免体积膨胀到约 341 MB。
 
 ### 说明
 
-- 上游 `wechat_bridge.py` 已收录进仓库（`packaging/wechat_bridge.py`），并在文件头
-  与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 标注来源；上游项目未声明许可证，
-  再分发前请自行确认授权情况。构建不再依赖外部 `DEEPSEEKGIRL_PATH`，仓库 CI 可自动构建。
+- `wechat_bridge.py` 已收录进仓库（`packaging/wechat_bridge.py`）。
+  构建不依赖任何外部目录，仓库 CI 可自动构建。
 - 已通过官方规范校验 `dsh-plugin-standard`（0 FAIL）与真实微信联调
   （打包内运行时枚举 9 个工具并成功连接）。
 
@@ -966,7 +964,7 @@
   `block`（优先级更高）两种模式，仅过滤本服务读取结果。
 - 新增文件路径白名单校验与 `..` 路径穿越防护。
 - 新增发送确认机制：`WECHAT_REQUIRE_CONFIRM=1` 时需显式 `confirm=true`。
-- 新增文档：`README.md`、`docs/TROUBLESHOOTING.md`、本变更记录。
+- 新增文档：`README.md`、故障排查文档、本变更记录。
 
 ### 变更
 
@@ -988,8 +986,8 @@
 
 ### 新增
 
-- 抽离独立的微信自动化适配层（复用 `deepseekgirl` 的 `WeChatBridge`，不导入其
-  机器人业务逻辑），返回结构化 dataclass 结果。
+- 抽离独立的微信自动化适配层（复用 `WeChatBridge`，不导入任何机器人业务逻辑），
+  返回结构化 dataclass 结果。
 - 基于 Python MCP SDK 的 Server（stdio 传输），注册 P0 工具：
   `get_wechat_status`、`get_chat_list`、`get_chat_history`、`send_message`。
 - 目标校验、同名消歧、发送串行化与超时放宽（原硬编码 5 秒 → 可配置 20 秒）。

@@ -212,7 +212,7 @@ class EngineLogForwardingTests(unittest.TestCase):
         api = desktop.DesktopApi.__new__(desktop.DesktopApi)
 
         with mock.patch.object(
-            desktop, "DeepSeekGirlAdapter", lambda *a, **k: fake_adapter
+            desktop, "WeChatAdapter", lambda *a, **k: fake_adapter
         ), mock.patch.object(
             desktop, "BotEngine", lambda *a, **k: fake_engine
         ), mock.patch.object(desktop, "BotConfig") as cfg, mock.patch.object(

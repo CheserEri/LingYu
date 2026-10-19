@@ -1,9 +1,9 @@
-"""对 deepseekgirl 微信自动化能力的适配封装。
+"""微信桌面自动化的适配封装。
 
 设计原则：
 
-- 只复用其 ``WeChatBridge`` 的连接、状态、发送与消息监听回调能力；
-  不导入、不启动原项目的 ``ChatBot`` / ``MessageHandler`` / 人设 / 自动回复逻辑。
+- 只复用 ``wechat_bridge`` 的连接、状态、发送与消息监听回调能力；
+  不导入、不启动任何额外的业务逻辑（聊天机器人 / 人设 / 自动回复）。
 - 所有调用返回结构化结果；底层失败不伪装成成功。
 - 发送操作做目标校验、同名消歧与串行化，不依赖当前焦点窗口。
 
@@ -103,13 +103,23 @@ def _unresolved_target_error(recipient: str) -> dict[str, Any]:
 def _bundled_bridge_file() -> Path | None:
     """返回随包内置的 ``wechat_bridge.py`` 路径。
 
-    冻结打包（PyInstaller）时该文件被作为数据文件内置到解包目录，
-    使分发的 exe 无需外部 deepseekgirl 项目即可运行；源码模式下返回 ``None``。
+    冻结打包（PyInstaller）时该文件被作为数据文件内置到解包目录。
     """
     base = getattr(sys, "_MEIPASS", None)
     if not base:
         return None
     candidate = Path(base) / "wechat_bridge.py"
+    return candidate if candidate.is_file() else None
+
+
+def bridge_file() -> Path | None:
+    """桥接层文件位置：冻结时取内置副本，源码模式取仓库内的 ``packaging/``。"""
+    bundled = _bundled_bridge_file()
+    if bundled is not None:
+        return bundled
+    candidate = (
+        Path(__file__).resolve().parents[3] / "packaging" / "wechat_bridge.py"
+    )
     return candidate if candidate.is_file() else None
 
 
@@ -127,38 +137,21 @@ def _load_bridge_from_file(module_file: Path) -> Any:
     return module
 
 
-def load_wechat_bridge(project_path: Path) -> type:
+def load_wechat_bridge() -> type:
     """加载 ``WeChatBridge`` 类。
 
-    优先使用随包内置的副本（冻结打包时存在），使分发的 exe 无需外部项目；
-    否则回退到 ``DEEPSEEKGIRL_PATH`` 指定的源码项目。
+    源码模式与冻结包走同一条路径：源码取仓库内 ``packaging/wechat_bridge.py``，
+    冻结包取内置副本，不再依赖仓库外的任何目录。
 
-    仅加载 ``wechat_bridge`` 模块本身（它只依赖标准库与 loguru），
-    不会触发原项目的机器人业务模块导入。
+    仅加载 ``wechat_bridge`` 模块本身（它只依赖标准库与 loguru）。
     """
-    bundled = _bundled_bridge_file()
-    if bundled is not None:
-        return _load_bridge_from_file(bundled).WeChatBridge
-
-    src_dir = Path(project_path) / "src"
-    module_file = src_dir / "wechat_bridge.py"
-    if not module_file.is_file():
+    module_file = bridge_file()
+    if module_file is None:
         raise BackendUnavailableError(
-            f"未找到 deepseekgirl 微信桥接模块: {module_file}",
-            detail={"expected_file": str(module_file)},
+            "未找到微信桥接模块 wechat_bridge.py",
+            detail={},
         )
-
-    src_str = str(src_dir)
-    if src_str not in sys.path:
-        sys.path.insert(0, src_str)
-    try:
-        module = importlib.import_module("wechat_bridge")
-    except ImportError as exc:  # 依赖未安装
-        raise BackendUnavailableError(
-            f"加载 wechat_bridge 失败，请确认依赖已安装: {exc}",
-            detail={"project_path": str(project_path)},
-        ) from exc
-    return module.WeChatBridge
+    return _load_bridge_from_file(module_file).WeChatBridge
 
 
 def _apply_send_attempts(bridge: Any, attempts: int) -> None:
@@ -176,8 +169,8 @@ def _apply_send_attempts(bridge: Any, attempts: int) -> None:
         return
 
 
-class DeepSeekGirlAdapter:
-    """独立的微信适配层，可脱离原机器人直接调用。"""
+class WeChatAdapter:
+    """独立的微信适配层，可脱离任何业务逻辑直接调用。"""
 
     def __init__(
         self,
@@ -226,7 +219,7 @@ class DeepSeekGirlAdapter:
         if self._bridge_factory is not None:
             bridge = self._bridge_factory()
         else:
-            bridge_cls = load_wechat_bridge(self._config.deepseekgirl_path)
+            bridge_cls = load_wechat_bridge()
             bridge = bridge_cls(
                 target_groups=[],
                 on_message=self._on_message,

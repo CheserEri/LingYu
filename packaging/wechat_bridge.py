@@ -1,23 +1,3 @@
-# =============================================================================
-# 来源声明 / Source attribution
-#
-# 本文件是从上游项目 `deepseekgirl`（https://github.com/linxisama/deepseekgirl）
-# 原样复制的第三方源码：
-#   上游本地目录：F:\Code\deepseekgirl-main
-#   上游文件路径：src/wechat_bridge.py
-#   引入用途：lingyu 复用其 WeChatBridge（微信 UI 自动化桥接），
-#             供源码模式与 PyInstaller 冻结打包内置。
-#
-# 重要：上游项目**未声明任何开源许可证**（其仓库根目录不存在 LICENSE 文件）。
-# 本仓库（lingyu，MPL-2.0）以「如实标注来源」的方式收录该文件，
-# 但标注来源并不等同于获得授权；如进行再分发，请自行确认上游授权情况。
-# 详见仓库根目录 THIRD_PARTY_NOTICES.md。
-#
-# 除本声明注释块，以及为支持「引用/回复消息」检测而做的最小增量
-# （WeChatMessage.reply_to_name 字段、WeChatBridge._extract_reply_target 解析及
-# 构造处的一次调用，均为新增、不改变任何原有行为）外，本文件未做其他修改。
-# =============================================================================
-
 """微信桥接模块：通过 wxauto (UI Automation) 连接微信桌面客户端"""
 
 import asyncio

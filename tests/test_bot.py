@@ -16,8 +16,8 @@ from unittest import mock
 
 import httpx
 
-from lingyu.adapters.deepseekgirl import (
-    DeepSeekGirlAdapter,
+from lingyu.adapters.wechat import (
+    WeChatAdapter,
     _looks_like_chat_id,
 )
 from lingyu.bot import BotConfig, BotEngine, get_persona, reset_persona
@@ -243,12 +243,12 @@ class TriggerTests(unittest.TestCase):
 
     def test_explain_no_reply_prints_bot_nickname(self):
         """群里没 @ 到机器人时给一行可读原因，并打出机器人当前昵称。"""
-        engine = BotEngine(FakeAdapter(names={"Viollete"}), BotConfig())
+        engine = BotEngine(FakeAdapter(names={"小助手"}), BotConfig())
         engine._explain_no_reply(make_record(content="@群助手 在吗"))
         lines = [line["message"] for line in engine.get_logs(0)]
         self.assertEqual(len(lines), 1)
         self.assertIn("未 @ 机器人", lines[0])
-        self.assertIn("Viollete", lines[0])
+        self.assertIn("小助手", lines[0])
 
     def test_explain_no_reply_reports_unknown_nickname(self):
         engine = BotEngine(FakeAdapter(names=set()), BotConfig())
@@ -398,7 +398,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_untriggered_group_message_is_explained_in_log(self):
         """端到端：群里没 @ 到机器人 → 不回复，但日志里能看到原因与机器人昵称。"""
-        adapter = FakeAdapter(names={"Viollete"})
+        adapter = FakeAdapter(names={"小助手"})
         cfg = BotConfig(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
         engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
         await engine.start()
@@ -408,7 +408,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent, [])
         lines = [line["message"] for line in engine.get_logs(0)]
         self.assertTrue(
-            any("未 @ 机器人" in m and "Viollete" in m for m in lines), lines
+            any("未 @ 机器人" in m and "小助手" in m for m in lines), lines
         )
 
     async def test_continuation_replies_without_at(self):
@@ -878,17 +878,17 @@ class ChatIdentityTests(unittest.TestCase):
         self.assertFalse(_looks_like_chat_id("玩什么游戏？！都给劳资打米！！"))
 
     def test_non_id_passthrough(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         self.assertEqual(
             adapter.resolve_chat_identifier("玩什么游戏？"), "玩什么游戏？"
         )
 
     def test_id_without_db_unresolved(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         self.assertEqual(adapter.resolve_chat_identifier(ROOM_ID), "")
 
     def test_id_resolved_from_contact_db(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(
             db=_FakeDB(
                 [
@@ -906,7 +906,7 @@ class ChatIdentityTests(unittest.TestCase):
         )
 
     def test_id_not_found_unresolved(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         # 命中的是别的会话（模糊匹配），不是该 ID 本身 → 拒绝
         adapter._bridge = _FakeBridge(
             db=_FakeDB([{"username": "other@chatroom", "nick_name": "别的群"}])
@@ -915,7 +915,7 @@ class ChatIdentityTests(unittest.TestCase):
 
     def test_cached_name_used_when_db_unavailable(self):
         # DB 快照偶发不可用（锁/WAL），用曾成功解析过的名字兜底
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._chat_id_names[ROOM_ID] = "玩什么游戏？"
         self.assertEqual(adapter.resolve_chat_identifier(ROOM_ID), "玩什么游戏？")
 
@@ -926,7 +926,7 @@ class ChatIdentityTests(unittest.TestCase):
             sender_name="张三",
             content="你好",
         )
-        record = DeepSeekGirlAdapter._to_record(msg)
+        record = WeChatAdapter._to_record(msg)
         self.assertEqual(record.chat, "玩什么游戏？！都给劳资打米！！")
         self.assertEqual(record.chat_id, ROOM_ID)
 
@@ -938,7 +938,7 @@ class ChatIdentityTests(unittest.TestCase):
             sender_name="张三",
             content="你好",
         )
-        record = DeepSeekGirlAdapter._to_record(msg)
+        record = WeChatAdapter._to_record(msg)
         self.assertEqual(record.chat, ROOM_ID)
         self.assertEqual(record.chat_id, ROOM_ID)
 
@@ -947,7 +947,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
     """发送目标为会话 ID 时：能反查就发显示名，查不到就明确失败。"""
 
     async def test_unresolved_id_rejected(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(db=_FakeDB([]))
         result = await adapter.send_message(ROOM_ID, "hi")
         self.assertFalse(result.ok)
@@ -960,7 +960,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         无名群是最容易踩的坑：群里 @ 了机器人、模型也答了，但微信搜索框没有名字
         可用，回复就是发不出去。只报「无法解析会话名」用户根本猜不到原因。
         """
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(db=_FakeDB([]))
         result = await adapter.send_message(ROOM_ID, "hi")
         self.assertFalse(result.ok)
@@ -969,7 +969,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unresolved_private_error_has_no_group_hint(self):
         """私聊没有群名一说，不要给出误导性的提示。"""
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(db=_FakeDB([]))
         result = await adapter.send_message("wxid_abc123", "hi")
         self.assertFalse(result.ok)
@@ -977,7 +977,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("群名称", result.error["message"])
 
     async def test_id_resolved_before_send(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         adapter._bridge = _FakeBridge(
             db=_FakeDB(
                 [{"username": ROOM_ID, "nick_name": "玩什么游戏？", "remark": ""}]
@@ -988,7 +988,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._bridge.sent, [("玩什么游戏？", "hi")])
 
     async def test_on_message_caches_resolved_name(self):
-        adapter = DeepSeekGirlAdapter()
+        adapter = WeChatAdapter()
         msg = SimpleNamespace(
             room_id=ROOM_ID,
             room_name="玩什么游戏？",
@@ -1209,17 +1209,17 @@ class BridgeAtDetectionTests(unittest.TestCase):
         """没有 is_at / is_at_me 字段的消息对象（同 wechatauto 实际行为）。"""
 
     def test_matches_bot_name(self):
-        bridge = self._bridge(names={"Viollete"})
-        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete 在吗"))
-        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete？"))
-        self.assertTrue(bridge._is_at_me(self._Msg(), "在吗 @Viollete"))
+        bridge = self._bridge(names={"小助手"})
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@小助手 在吗"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@小助手？"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "在吗 @小助手"))
         # 零宽字符（微信 @ 后常带）也要认
-        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete\u200b在吗"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@小助手\u200b在吗"))
         self.assertFalse(bridge._is_at_me(self._Msg(), "@群助手 在吗"))
         self.assertFalse(bridge._is_at_me(self._Msg(), "随便聊聊"))
 
     def test_at_flag_on_message_object_is_respected(self):
-        bridge = self._bridge(names={"Viollete"})
+        bridge = self._bridge(names={"小助手"})
 
         class _Flagged:
             is_at = True
@@ -1228,7 +1228,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
 
     def test_rename_is_picked_up_without_restart(self):
         """改完昵称后，下一条 @ 消息就能自动跟上，不必重启程序。"""
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         def fake_load():
             bridge._bot_names = {"群助手"}
@@ -1239,7 +1239,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
         self.assertEqual(bridge._bot_names, {"群助手"})
 
     def test_refresh_is_throttled(self):
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
         calls = []
 
         def fake_load():
@@ -1253,7 +1253,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_no_refresh_without_at_sign(self):
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
         calls = []
 
         def fake_load():
@@ -1266,7 +1266,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
     def test_load_keeps_previous_names_when_nothing_readable(self):
         """读不到昵称时保留旧值——清空会让群里 @ 机器人彻底失效。"""
         module = self._module()
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         class _FakeWx:
             nickname = ""
@@ -1278,10 +1278,10 @@ class BridgeAtDetectionTests(unittest.TestCase):
 
         bridge._wx = _FakeWx()
         bridge._load_bot_identity()
-        self.assertEqual(bridge._bot_names, {"Viollete"})
+        self.assertEqual(bridge._bot_names, {"小助手"})
 
     def test_load_reads_nickname_and_wxid(self):
-        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         class _FakeWx:
             nickname = "群助手"

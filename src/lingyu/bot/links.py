@@ -9,7 +9,7 @@
 - **普通网页**回退到直接抓取 ``<title>`` 与 ``meta description``。
 - 结果按 URL **缓存**（成功永久、失败带 TTL 允许重试），重复出现不再请求。
 - yt-dlp 是阻塞调用，统一放到线程池执行，避免卡住事件循环。
-- yt-dlp 源码**内置在仓库** ``vendor/yt_dlp``（见 THIRD_PARTY_NOTICES.md），
+- yt-dlp 源码**内置在仓库** ``vendor/yt_dlp``（Unlicense 公有领域），
   源码模式与 PyInstaller 冻结模式都能导入。
 """
 
