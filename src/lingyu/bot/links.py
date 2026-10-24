@@ -422,7 +422,8 @@ def _tweet_link_info(
     info = tweet.fetch_tweet_cached(url, timeout=timeout, logger=logger)
     if info is None:
         return None
-    body = re.sub(r"\s+", " ", info.text).strip()
+    # 已经有译文（卡片流程翻过）就优先注入译文，模型读中文比读外文准。
+    body = re.sub(r"\s+", " ", info.translation or info.text).strip()
     author = " ".join(
         part
         for part in (

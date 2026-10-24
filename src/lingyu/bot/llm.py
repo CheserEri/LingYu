@@ -39,8 +39,18 @@ class LLMClient:
         # 可选 httpx 传输层（生产为 None；测试注入 MockTransport）。
         self._transport = transport
 
-    async def chat(self, messages: list[dict[str, str]]) -> str:
-        """发送消息列表，返回模型文本回复。"""
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """发送消息列表，返回模型文本回复。
+
+        ``max_tokens`` / ``temperature`` 可按调用临时覆盖配置——翻译推文这类
+        「输出长度由原文决定」的场景需要比闲聊更大的上限，否则译文会被截断。
+        """
         config = self._config
         if not config.api_key.strip():
             raise LLMError("api_key_missing", "未配置 API Key，请在「模型设置」中填写。")
@@ -51,8 +61,10 @@ class LLMClient:
         payload: dict[str, Any] = {
             "model": config.model.strip(),
             "messages": messages,
-            "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
+            "temperature": (
+                config.temperature if temperature is None else float(temperature)
+            ),
+            "max_tokens": config.max_tokens if max_tokens is None else int(max_tokens),
             "stream": False,
         }
         headers = {

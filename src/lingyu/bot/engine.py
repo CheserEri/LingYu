@@ -825,7 +825,11 @@ class BotEngine:
             )
 
     async def _send_tweet(self, record: MessageRecord, url: str, outdir: Path) -> None:
-        """X 推文：发卡片图（可选）；含视频则再下载视频回发。"""
+        """X 推文：发卡片图（可选）；含视频则再下载视频回发。
+
+        **多图合成一张长图**：几张配图按原比例竖排摞在卡片里，整条卡片就是
+        一条长图——不裁切、也不拆成多条消息发。只有视频另发。
+        """
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(
             None,
@@ -840,6 +844,8 @@ class BotEngine:
             return
 
         if self._config.link_tweet_card_enabled:
+            # 先翻译（外文推文），再渲染：卡片正文用译文，原文缩成灰色小字。
+            await self._translate_tweet(info, url)
             card = await loop.run_in_executor(
                 None,
                 lambda: tweet.render_card(
@@ -855,6 +861,48 @@ class BotEngine:
             await self._send_tweet_video(record, info, url, outdir)
         else:
             self._log("info", f"推文无视频，仅发卡片：{url}")
+
+    async def _translate_tweet(self, info: "tweet.Tweet", url: str) -> None:
+        """把外文推文正文翻成中文，写进 ``info.translation``。
+
+        失败一律**不抛异常**：翻译只是卡片上的增益，翻不出来就照原样渲染，
+        不能因为模型不可用而把整张卡片也丢了。译好之后 ``Tweet`` 对象留在
+        ``tweet._CACHE`` 里，同一条推文再次出现时不会重复翻译。
+        """
+        config = self._config
+        if not config.link_tweet_translate:
+            return
+        if info.translation or not tweet.needs_translation(info.text):
+            return
+        target = (config.link_tweet_translate_target or "简体中文").strip()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"你是专业翻译。把用户给的推文正文翻译成{target}。"
+                    "要求：只输出译文本身，不要加引号或任何解释，不要保留原文；"
+                    "@用户名、#话题、链接、emoji 原样保留；语气自然、口语化。"
+                ),
+            },
+            {"role": "user", "content": info.text.strip()},
+        ]
+        try:
+            client = self._llm_factory(config)
+            translated = await client.chat(
+                messages, max_tokens=max(600, int(config.max_tokens)), temperature=0.3
+            )
+        except LLMError as exc:
+            self._log("warning", f"推文翻译失败（沿用原文）：{exc.message}")
+            return
+        except Exception as exc:  # 翻译不该成为卡片的单点故障
+            self._log("warning", f"推文翻译异常（沿用原文）：{exc}")
+            return
+        cleaned = str(translated or "").strip().strip("\"'“”").strip()
+        if not cleaned:
+            self._log("warning", f"推文翻译结果为空（沿用原文）：{url}")
+            return
+        info.translation = cleaned
+        self._log("info", f"已翻译推文（{len(info.text)}→{len(cleaned)} 字）：{url}")
 
     async def _send_tweet_video(
         self, record: MessageRecord, info: "tweet.Tweet", url: str, outdir: Path

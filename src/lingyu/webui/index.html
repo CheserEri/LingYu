@@ -325,6 +325,14 @@
           <label class="switch-row"><span>推文链接额外发一张卡片图（本地渲染）</span>
             <input type="checkbox" class="switch" data-key="link_tweet_card_enabled"/></label>
           <p class="hint">检测到 X / Twitter 推文链接时，本地把推文渲染成一张图片（头像、昵称、认证、正文、配图）发回聊天；推文<b>含视频</b>时还会把视频下载下来一并回发。需先开启上面的「下载并回发」。</p>
+          <p class="hint">推文有<b>多张配图</b>时，按原比例<b>竖排合成一张长图</b>（一条消息发完）——不拼裁切网格，也不拆成多条消息，画面一张都不切。单图同样按原比例铺满。</p>
+          <label class="switch-row"><span>外文推文自动翻译成中文</span>
+            <input type="checkbox" class="switch" data-key="link_tweet_translate"/></label>
+          <div class="field">
+            <label>译文目标语言</label>
+            <input type="text" data-key="link_tweet_translate_target" placeholder="简体中文"/>
+          </div>
+          <p class="hint">中文推文不翻译（省 token）；英、日、韩、俄、阿、泰等外文会先翻成目标语言，卡片<b>正文用译文</b>、原文缩成灰色小字附在下面。翻译走上面「模型设置」里的接口，<b>未配 API Key 或调用失败时自动跳过</b>，卡片仍按原文渲染。</p>
         </div>
         <div class="actions"><button class="btn primary" id="save-links">保存设置</button></div>
       </section>

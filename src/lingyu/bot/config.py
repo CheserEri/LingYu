@@ -146,6 +146,12 @@ class BotConfig:
     # X（Twitter）推文额外发一张本地渲染的卡片图（头像/昵称/正文/配图）。
     # 仅对 X 推文生效；推文含视频时还会下载视频一并回发。
     link_tweet_card_enabled: bool = True
+    # 推文正文**自动翻译**：外文推文先翻成中文再渲染卡片，译文当正文、
+    # 原文缩成灰色小字附在下面。走已配置的大模型；未配 Key 时自动跳过，
+    # 卡片仍按原文渲染（不会因为翻译失败而不发卡片）。
+    link_tweet_translate: bool = True
+    # 译文目标语言。
+    link_tweet_translate_target: str = "简体中文"
     # 识别到链接时先回一句**固定**提示（不经过大模型），让用户知道正在处理。
     # 私聊与群聊都生效（群聊里不必 @ 机器人）。
     link_ack_enabled: bool = True
@@ -236,6 +242,11 @@ class BotConfig:
         # 重试次数上限给到 10：再多也只是让发送闸门被占更久，收益递减。
         config.link_send_attempts = min(10, max(0, int(config.link_send_attempts)))
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)
+        config.link_tweet_translate = bool(config.link_tweet_translate)
+        # 目标语言留空即回到默认值——空串会让提示词变成「翻译成」这种半句话。
+        config.link_tweet_translate_target = (
+            str(config.link_tweet_translate_target or "").strip() or "简体中文"
+        )
         config.link_ack_enabled = bool(config.link_ack_enabled)
         # 文案留空即视为「不发提示」，故不做默认值回填（只去空白与换行）。
         config.link_ack_text = " ".join(str(config.link_ack_text or "").split())

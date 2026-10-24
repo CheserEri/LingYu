@@ -14,8 +14,19 @@ token 只要求**非空**（给错值也返回数据），但仍按正确算法�
 完全用 PIL 本地绘制（**不依赖浏览器**，离线可用），产出接近 X 推文卡片的图：
 头像、昵称、认证徽标、@handle、正文、配图、底部时间与互动数。
 
-字体：中文/西文用「微软雅黑」，emoji 用「Segoe UI Emoji」——**按字符选字体**，
-因为雅黑没有 emoji 字形、Segoe UI Emoji 没有中文字形，单用一种必然出豆腐块。
+排版的高度**全部由字号度量算出**（ascent/descent），不靠逐行墨迹高度累加：
+后者会让行距忽松忽紧，且遇到段落空行时低估总高，正文就压到配图上了。
+
+配图：**按原比例竖排成一条长图**，一条消息发完。不拼固定格子、不做覆盖裁切
+（裁切必然切掉画面），几张图就是几段；单张过高时限高并同步收窄、居中。
+
+字体：**按字符**沿候选链选字体（见 ``_REGULAR_CHAIN``）——雅黑覆盖中/英/俄/希
+和假名，韩文、泰文、阿拉伯文、印度诸语各由专门字体补，emoji 最后落到
+Segoe UI Emoji。是否「有这个字形」用位图与 ``.notdef`` 比对来判断，因为
+PIL 不暴露 cmap，而硬编码「哪个字体覆盖哪些语种」在不同 Windows 版本上并不可靠。
+
+翻译：卡片正文优先用 ``Tweet.translation``（由引擎调大模型翻好再传进来），
+原文缩成灰色小字附在「原文」引用块里。翻不翻由 :func:`needs_translation` 判定。
 
 视频：``parse_tweet`` 会顺带取回**最佳 mp4 直链**（``Tweet.video_url``），
 由 ``download_video`` 直接流式下载——不依赖 yt-dlp 的 X 提取器（其默认走
@@ -27,6 +38,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import re
 import threading
 import urllib.error
@@ -118,6 +130,9 @@ class Tweet:
     video_poster: str = ""  # 视频/动图的封面帧（卡片上用它 + 播放角标）
     likes: int = 0
     replies: int = 0
+    # 译文（通常是简体中文）。空串 = 未翻译，卡片直接画正文；
+    # 非空时卡片以译文为正文、原文缩成灰色小字附在下面。
+    translation: str = ""
 
     def summary(self) -> str:
         """压成一行注入模型上下文。"""
@@ -133,7 +148,7 @@ class Tweet:
             parts.append(f"含 {len(self.photos)} 张图")
         if self.likes:
             parts.append(f"点赞：{self.likes}")
-        body = re.sub(r"\s+", " ", self.text).strip()
+        body = re.sub(r"\s+", " ", self.translation or self.text).strip()
         head = f"[推文] {self.url}"
         if body:
             head += f"｜正文：{body[:200]}"
@@ -342,6 +357,73 @@ def download_video(
     return target
 
 
+# 推文配图地址里的尺寸参数（syndication 给的是小图，``name=small``）。
+_PHOTO_SIZE_RE = re.compile(r"([?&])name=[A-Za-z0-9_]+")
+
+
+def best_photo_url(url: str) -> str:
+    """把配图地址换成大图。
+
+    syndication 返回的多是 ``...?format=jpg&name=small``，直接发回聊天会糊。
+    统一改成 ``name=large``（约 1200px，体积可控）——``orig`` 动辄几 MB，
+    微信发图会先转码，没必要。
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "pbs.twimg.com" not in url:
+        return url
+    if _PHOTO_SIZE_RE.search(url):
+        return _PHOTO_SIZE_RE.sub(r"\1name=large", url)
+    return url + ("&" if "?" in url else "?") + "name=large"
+
+
+def photo_urls(info: Tweet, limit: int = 9) -> list[str]:
+    """要画进卡片的配图地址。
+
+    视频推文的 ``photos`` 里那张是封面帧，视频本身会另发，故排除；
+    其余按原顺序返回，最多 ``limit`` 张。
+    """
+    return [
+        url
+        for url in info.photos
+        if url and not (info.has_video and url == info.video_poster)
+    ][: max(0, int(limit))]
+
+
+# --------------------------------------------------------------------------- #
+# 翻译判定
+# --------------------------------------------------------------------------- #
+
+# 汉字 / 假名 / 谚文：用来判断「这段文字是不是已经不需要翻译」。
+_HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+_HANGUL_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+_URL_ONLY_RE = re.compile(r"https?://\S+")
+
+
+def needs_translation(text: str, han_ratio: float = 0.3) -> bool:
+    """这段正文是否需要翻成中文。
+
+    判定刻意保守——**只在明显是外文时**才翻，避免把中文推文翻成
+    「中文的中文」白烧 token：
+
+    - 含假名或谚文 → 日文/韩文，要翻
+    - 汉字占「字母类字符」比例 ≥ ``han_ratio`` → 视为中文原文，不翻
+    - 纯链接 / 纯数字 / 纯符号 → 不翻
+    - 其余（英、俄、阿、泰、印地…）→ 要翻
+    """
+    body = _URL_ONLY_RE.sub(" ", text or "")
+    if _KANA_RE.search(body) or _HANGUL_RE.search(body):
+        return True
+    letters = _LETTER_RE.findall(body)
+    if len(letters) < 2:
+        return False
+    han = len(_HAN_RE.findall(body))
+    return han / len(letters) < han_ratio
+
+
 # --------------------------------------------------------------------------- #
 # 渲染
 # --------------------------------------------------------------------------- #
@@ -352,107 +434,271 @@ _AVATAR = 76
 _NAME_SIZE = 27
 _HANDLE_SIZE = 21
 _BODY_SIZE = 25
+_QUOTE_SIZE = 21  # 「原文」块（有译文时）
 _FOOT_SIZE = 20
-_LINE_GAP = 10
+_LINE_GAP = 9  # 行内额外间距（行高 = ascent + descent + 该值）
+_HEAD_GAP = 16  # 头像块 → 正文
+_QUOTE_GAP = 16  # 正文 → 原文块
+_BLOCK_GAP = 20  # 文字 → 配图 / 配图 → 页脚
 _MEDIA_RADIUS = 14
-_MAX_MEDIA_HEIGHT = 460
+# 单张配图的最大高度：超过就等比收窄并居中，免得一张长截图把整条卡片
+# 撑到几千像素高。
+_MAX_MEDIA_HEIGHT = 900
+# 多图**竖排成长图**：每张铺满宽度、按原比例往下摞，图与图间距 8px。
+_MEDIA_GAP = 8
 
-# 中英混排用雅黑，emoji 用 Segoe UI Emoji（单色线条，但不会变豆腐块）。
-_TEXT_FONTS = (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\segoeui.ttf")
-_BOLD_FONTS = (r"C:\Windows\Fonts\msyhbd.ttc", r"C:\Windows\Fonts\segoeuib.ttf")
-_EMOJI_FONTS = (r"C:\Windows\Fonts\seguiemj.ttf",)
-
-
-@lru_cache(maxsize=32)
-def _font(paths: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont:
-    for path in paths:
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default(size)
-
-
-@lru_cache(maxsize=8)
-def _fonts(size_key: str) -> dict[str, ImageFont.FreeTypeFont]:
-    sizes = {
-        "name": _NAME_SIZE,
-        "handle": _HANDLE_SIZE,
-        "body": _BODY_SIZE,
-        "foot": _FOOT_SIZE,
-    }
-    size = sizes[size_key]
-    return {
-        "text": _font(_TEXT_FONTS, size),
-        "bold": _font(_BOLD_FONTS, size),
-        "emoji": _font(_EMOJI_FONTS, size),
-    }
-
-
-# emoji / 符号区段（这些用雅黑会变豆腐块）。
-_EMOJI_RANGES = (
-    (0x1F000, 0x1FAFF),  # 各类象形/表情/交通/补充符号
-    (0x1F1E6, 0x1F1FF),  # 区域指示符（国旗）
-    (0x2600, 0x27BF),    # 杂项符号、装饰符号（含 ✓ ✨ 等）
-    (0x2B00, 0x2BFF),    # 杂项符号与箭头
-    (0xFE00, 0xFE0F),    # 变体选择符
-    (0x1F900, 0x1F9FF),
+# 候选字体链，**按字符**取第一个真正含该字符字形的字体。
+# 单用雅黑必然出豆腐块：它没有韩文/阿拉伯文/泰文/天城文；
+# Segoe UI 反过来没有汉字。顺序即优先级：
+#   雅黑（中/英/俄/希/假名）→ 游ゴシック（日文补充）→ 韩文 →
+#   Segoe UI（阿拉伯/希伯来）→ Nirmala（印度诸语）→ 泰文 →
+#   符号 → emoji
+_REGULAR_CHAIN = (
+    "msyh.ttc",
+    "YuGothR.ttc",
+    "malgun.ttf",
+    "segoeui.ttf",
+    "Nirmala.ttf",
+    "LeelawUI.ttf",
+    "seguisym.ttf",
+    "seguiemj.ttf",
 )
+_BOLD_CHAIN = (
+    "msyhbd.ttc",
+    "YuGothB.ttc",
+    "malgunbd.ttf",
+    "segoeuib.ttf",
+    "NirmalaB.ttf",
+    "LeelaUIb.ttf",
+    "seguisym.ttf",
+    "seguiemj.ttf",
+)
+# 确定「字体里没有这个字」用的探针码位：Unicode 第 16 平面的未分配码位，
+# 任何字体都没有它的字形，画出来就是 .notdef（豆腐块）本身。
+_NOTDEF_PROBE = "\U0010FFFD"
+# 零宽字符直接丢掉，否则会多算宽度、把行撑开。
 _ZERO_WIDTH = {"\u200d", "\ufe0e", "\ufe0f", "\u200b"}
 
 
-def _is_emoji(ch: str) -> bool:
+def _font_dir() -> Path:
+    return Path(os.environ.get("WINDIR") or r"C:\Windows") / "Fonts"
+
+
+@lru_cache(maxsize=64)
+def _font_file(name: str, size: int) -> ImageFont.FreeTypeFont | None:
+    """按文件名加载系统字体；缺失时返回 ``None``（不抛异常）。"""
+    try:
+        return ImageFont.truetype(str(_font_dir() / name), size)
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=4096)
+def _glyph_mask(name: str, size: int, ch: str) -> bytes:
+    font = _font_file(name, size)
+    if font is None:
+        return b""
+    mask = font.getmask(ch)
+    try:  # Pillow 10+：getmask 直接返回可 tobytes 的对象
+        return mask.tobytes()
+    except AttributeError:  # 旧版本返回 ImagingCore，得先包成 Image
+        return Image.Image()._new(mask).tobytes()
+
+
+@lru_cache(maxsize=64)
+def _notdef_mask(name: str, size: int) -> bytes:
+    return _glyph_mask(name, size, _NOTDEF_PROBE)
+
+
+@lru_cache(maxsize=8192)
+def _has_glyph(name: str, size: int, ch: str) -> bool:
+    """字体里有没有 ``ch`` 的字形。
+
+    PIL 不暴露 cmap，所以用位图比对：缺字形时 FreeType 一律返回同一个
+    .notdef 方块，与「必然缺失」的探针码位画出来的位图完全一致。
+    这比硬编码「哪个字体覆盖哪些语种」可靠——Windows 各版本装的字体并不一致。
+    """
+    if ch.isspace():
+        return True
+    return _glyph_mask(name, size, ch) != _notdef_mask(name, size)
+
+
+@lru_cache(maxsize=8192)
+def _pick_font(ch: str, size: int, bold: bool) -> ImageFont.FreeTypeFont:
+    """按候选链取第一个含该字符的字体；全都没有则退回链首（画成豆腐块）。"""
+    chain = _BOLD_CHAIN if bold else _REGULAR_CHAIN
+    for name in chain:
+        if _has_glyph(name, size, ch):
+            font = _font_file(name, size)
+            if font is not None:
+                return font
+    fallback = _font_file(chain[0], size)
+    return fallback if fallback is not None else ImageFont.load_default(size)
+
+
+@lru_cache(maxsize=64)
+def _metrics(size: int, bold: bool = False) -> tuple[int, int]:
+    """同字号的 ``(ascent, descent)``。
+
+    行高必须**由字号决定、而不是由行内字符的墨迹高度决定**：早先按
+    ``getbbox()`` 逐行累加，同一段文字里「只有逗号的一行」和「有 g 的一行」
+    高度不同，行距忽松忽紧，整块正文还会比预估矮——于是压到下面的配图上。
+    """
+    font = _font_file(_BOLD_CHAIN[0] if bold else _REGULAR_CHAIN[0], size)
+    if font is None:
+        return int(size * 0.78), int(size * 0.26)
+    ascent, descent = font.getmetrics()
+    return ascent, descent
+
+
+def _line_advance(size: int, bold: bool = False) -> int:
+    ascent, descent = _metrics(size, bold)
+    return ascent + descent + _LINE_GAP
+
+
+# RTL 区段（希伯来 / 阿拉伯 / 叙利亚 / 它拿 / 阿拉伯呈现形式）。
+_RTL_RANGES = (
+    (0x0590, 0x05FF),
+    (0x0600, 0x06FF),
+    (0x0700, 0x074F),
+    (0x0750, 0x077F),
+    (0x0780, 0x07BF),
+    (0x07C0, 0x07FF),
+    (0x0800, 0x085F),
+    (0x08A0, 0x08FF),
+    (0xFB1D, 0xFB4F),
+    (0xFB50, 0xFDFF),
+    (0xFE70, 0xFEFF),
+)
+# RTL 段里允许跟着一起反转的中性字符（标点/空格）。
+_RTL_NEUTRAL = set(" \t.,!?:;-_/\\()[]{}<>\"'«»…،؛؟٬٫")
+# 折行时「可以断在后面」的字符：长 URL / 长英文串靠它们找到断点。
+_BREAK_AFTER = set(" /-&?=+_,;")
+
+
+def _is_rtl(ch: str) -> bool:
     code = ord(ch)
-    return any(low <= code <= high for low, high in _EMOJI_RANGES)
+    return any(low <= code <= high for low, high in _RTL_RANGES)
 
 
-def _glyphs(text: str) -> list[tuple[str, str]]:
-    """拆成 ``(字符, 字体键)``；零宽字符直接丢掉。"""
-    out: list[tuple[str, str]] = []
+def _visual_order(text: str) -> str:
+    """把 RTL 连续段整体反转，让阿拉伯/希伯来文按从右到左的视觉顺序落笔。
+
+    这只是**够用级别**的 bidi：不实现完整的 UBA，也不做阿拉伯文连写塑形
+    （那需要 arabic_reshaper + python-bidi，本项目坚持零外部依赖）。
+    效果是字母按孤立形呈现、但顺序正确——比整段左右颠倒好读得多。
+    数字与拉丁字母不参与反转，避免把「2026」画成「6202」。
+    """
+    if not any(_is_rtl(ch) for ch in text):
+        return text
+    out: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if run:
+            out.extend(reversed(run))
+            run.clear()
+
     for ch in text:
-        if ch in _ZERO_WIDTH:
-            continue
-        out.append((ch, "emoji" if _is_emoji(ch) else "text"))
-    return out
+        if _is_rtl(ch) or (_is_rtl_neutral(ch) and run):
+            run.append(ch)
+        else:
+            flush()
+            out.append(ch)
+    flush()
+    return "".join(out)
 
 
-def _width(glyphs: list[tuple[str, str]], fonts: dict) -> float:
-    return sum(fonts[key].getlength(ch) for ch, key in glyphs)
+def _is_rtl_neutral(ch: str) -> bool:
+    return ch in _RTL_NEUTRAL
 
 
-def _wrap(text: str, fonts: dict, max_width: float) -> list[list[tuple[str, str]]]:
-    """按宽度折行：西文尽量在空格处断，中日韩逐字断。"""
-    lines: list[list[tuple[str, str]]] = []
-    for raw_line in text.split("\n"):
-        glyphs = _glyphs(raw_line)
-        current: list[tuple[str, str]] = []
+def _glyphs(
+    text: str, size: int, bold: bool = False
+) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+    """拆成 ``(字符, 字体)``，零宽字符丢弃。"""
+    return [(ch, _pick_font(ch, size, bold)) for ch in text if ch not in _ZERO_WIDTH]
+
+
+def _width(glyphs: list[tuple[str, ImageFont.FreeTypeFont]]) -> float:
+    return sum(font.getlength(ch) for ch, font in glyphs)
+
+
+def _ellipsize(
+    glyphs: list[tuple[str, ImageFont.FreeTypeFont]], max_width: float, size: int
+) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+    """超宽就截断并补省略号（昵称/用户名过长时不再溢出到卡片外）。"""
+    if _width(glyphs) <= max_width:
+        return glyphs
+    dots = _glyphs("…", size)
+    budget = max_width - _width(dots)
+    out: list[tuple[str, ImageFont.FreeTypeFont]] = []
+    width = 0.0
+    for ch, font in glyphs:
+        char_width = font.getlength(ch)
+        if width + char_width > budget:
+            break
+        out.append((ch, font))
+        width += char_width
+    return out + dots
+
+
+def _wrap(
+    text: str, size: int, bold: bool, max_width: float
+) -> list[list[tuple[str, ImageFont.FreeTypeFont]]]:
+    """按宽度折行：西文尽量在空格处断，中日韩逐字断。
+
+    空行（``\\n\\n``）会保留成一个空列表——渲染时它同样占一行高度，
+    否则「正文里的段落空行」会让文字整块下移、压到配图上。
+    """
+    lines: list[list[tuple[str, ImageFont.FreeTypeFont]]] = []
+    for raw_line in (text or "").split("\n"):
+        glyphs = _glyphs(_visual_order(raw_line), size, bold)
+        current: list[tuple[str, ImageFont.FreeTypeFont]] = []
         width = 0.0
-        for ch, key in glyphs:
-            char_width = fonts[key].getlength(ch)
+        for ch, font in glyphs:
+            char_width = font.getlength(ch)
             if current and width + char_width > max_width:
-                # 行内最后一个空格处断开（避免把英文单词劈开）
-                cut = -1
+                # 断点优先级：空格 > 斜杠/连字符这类「天然可断」的位置；
+                # 都没有才逐字硬断（长 URL 不硬断就会溢出卡片）。
+                space_cut = -1
                 for index in range(len(current) - 1, -1, -1):
                     if current[index][0] == " ":
-                        cut = index
+                        space_cut = index
                         break
-                if cut > 0:
-                    lines.append(current[:cut])
-                    current = current[cut + 1 :]
+                if space_cut > 0:
+                    lines.append(current[:space_cut])
+                    current = current[space_cut + 1 :]
                 else:
-                    lines.append(current)
-                    current = []
-                width = _width(current, fonts)
-            current.append((ch, key))
+                    sym_cut = -1
+                    for index in range(len(current) - 1, -1, -1):
+                        if current[index][0] in _BREAK_AFTER:
+                            sym_cut = index + 1
+                            break
+                    if sym_cut > 0:
+                        lines.append(current[:sym_cut])
+                        current = current[sym_cut:]
+                    else:
+                        lines.append(current)
+                        current = []
+                width = _width(current)
+            current.append((ch, font))
             width += char_width
         lines.append(current)
     return lines
 
 
-def _draw_glyphs(draw: ImageDraw.ImageDraw, x: float, y: float, glyphs, fonts, fill):
-    for ch, key in glyphs:
-        draw.text((x, y), ch, font=fonts[key], fill=fill)
-        x += fonts[key].getlength(ch)
+def _draw_glyphs(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    baseline: float,
+    glyphs: list[tuple[str, ImageFont.FreeTypeFont]],
+    fill,
+) -> float:
+    """按基线绘制（``anchor="ls"``）：不同字体的字形都坐在同一条基线上。"""
+    for ch, font in glyphs:
+        draw.text((x, baseline), ch, font=font, fill=fill, anchor="ls")
+        x += font.getlength(ch)
     return x
 
 
@@ -471,72 +717,34 @@ def _circle(img: Image.Image, size: int) -> Image.Image:
     return out
 
 
-def _fit_cover(img: Image.Image, width: int, height: int) -> Image.Image:
-    """等比缩放到**完全覆盖** ``width×height``，再居中裁掉溢出部分。
-
-    多图网格里每格尺寸固定，若直接 ``resize`` 到格子大小，竖图会被横向拉宽、
-    横图会被压扁（这就是多图推文「变形」的原因）。这里先按较大的一边缩放
-    （``max`` 保证两个方向都不小于目标），再居中裁切，宽高比始终不变。
-    单图时若目标框与原图同比例，裁切量自然为 0。
-    """
-    width = max(1, int(width))
-    height = max(1, int(height))
-    src_w, src_h = max(1, img.width), max(1, img.height)
-    scale = max(width / src_w, height / src_h)
-    new_w = max(width, int(round(src_w * scale)))
-    new_h = max(height, int(round(src_h * scale)))
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - width) // 2
-    top = (new_h - height) // 2
-    return resized.crop((left, top, left + width, top + height))
-
-
-# 多图网格：两列，列间距 8px，每格高 = 格宽 × 0.62（接近 X 的 16:10 观感）。
-_MEDIA_GAP = 8
-_MEDIA_CELL_RATIO = 0.62
-
-
 def _media_boxes(
-    media: list[tuple[Image.Image, bool]], inner: int
+    media: list[tuple[Image.Image, bool]], inner: int, left: int = _PAD
 ) -> list[tuple[Image.Image, tuple[int, int, int, int], bool]]:
     """算每张配图的落位框 ``(图, (left, top, width, height), 是否视频封面)``。
 
-    单图：按原图比例铺满可用宽度；竖图过高时**限高并同步收窄**宽度——若只截高度
-    不缩宽度，图会被横向压扁。
-    多图：两列网格，每格尺寸一致；格内的比例由绘制时的 ``_fit_cover`` 覆盖裁切
-    保证，绝不拉伸原图。
+    ``left`` 是配图区的左边界——调用方传**正文左边界**（``text_x``），
+    让配图和文字左对齐。
+
+    **竖排成长图，不裁切**：多图不拼成固定格子的网格（那必然要切掉画面），
+    而是一张张按原始比例铺满宽度、从上往下摞，整张卡片就是一条长图——
+    用户在微信里看到的就是这一条。
+
+    单张过高（竖图/长截图）时按 ``_MAX_MEDIA_HEIGHT`` 限高，并**同步收窄
+    宽度、居中**——只截高度不缩宽度会把图横向压扁。
     """
     boxes: list[tuple[Image.Image, tuple[int, int, int, int], bool]] = []
-    if not media:
-        return boxes
-    if len(media) == 1:
-        img, play = media[0]
+    top = 0
+    for img, play in media:
         ratio = max(1, img.width) / max(1, img.height)
         width = inner
         height = int(round(width / ratio))
+        x = left
         if height > _MAX_MEDIA_HEIGHT:
             height = _MAX_MEDIA_HEIGHT
             width = max(1, int(round(height * ratio)))
-        boxes.append((img, (_PAD, 0, width, height), play))
-        return boxes
-
-    cols = 2
-    cell_w = (inner - _MEDIA_GAP) // 2
-    cell_h = int(cell_w * _MEDIA_CELL_RATIO)
-    for index, (img, play) in enumerate(media):
-        row, col = divmod(index, cols)
-        boxes.append(
-            (
-                img,
-                (
-                    _PAD + col * (cell_w + _MEDIA_GAP),
-                    row * (cell_h + _MEDIA_GAP),
-                    cell_w,
-                    cell_h,
-                ),
-                play,
-            )
-        )
+            x = left + (inner - width) // 2
+        boxes.append((img, (x, top, width, height), play))
+        top += height + _MEDIA_GAP
     return boxes
 
 
@@ -589,13 +797,28 @@ def _draw_play_badge(card: Image.Image, left: int, top: int, width: int, height:
     card.paste(merged, (0, 0))
 
 
+_TEXT_COLOR = (15, 20, 25)
+_MUTED_COLOR = (83, 100, 113)
+_RULE_COLOR = (207, 217, 222)
+
+
 def render_card(
     tweet: Tweet,
     outdir: str | Path,
     timeout: float = 20.0,
     logger: Callable[[str, str], None] | None = None,
+    include_media: bool = True,
 ) -> Path | None:
-    """把推文渲染成 PNG，返回文件路径；失败返回 ``None``。"""
+    """把推文渲染成 PNG，返回文件路径；失败返回 ``None``。
+
+    排版自上而下依次是：头像/昵称块 → 正文（有译文时用译文）→ 原文块
+    （仅在有译文时）→ 配图 → 页脚。每个块的高度都由**字号度量**算出，
+    块与块之间留固定间距，因此正文再长也不会压到配图上。
+
+    配图**竖排成一条长图**：几张图各自按原比例铺满宽度、从上往下摞，
+    不裁切也不拉伸，整张卡片就是一条长图，一条消息发完。
+    ``include_media=False`` 时只画文字（供只需要文字卡的场景）。
+    """
     log = logger or (lambda level, message: None)
     outdir = Path(outdir)
     try:
@@ -604,96 +827,170 @@ def render_card(
         log("warning", f"创建卡片目录失败：{exc}")
         return None
 
-    body_fonts = _fonts("body")
-    inner = CARD_WIDTH - _PAD * 2
     text_x = _PAD + _AVATAR + 20
     text_width = CARD_WIDTH - _PAD - text_x
 
-    lines = _wrap(tweet.text, body_fonts, text_width) if tweet.text else []
-    body_height = sum(
-        max(body_fonts[key].getbbox(ch)[3] for ch, key in line) + _LINE_GAP
-        for line in lines
-        if line
+    # 头像先取：有没有头像会影响「昵称块」到底占多高（没头像时不该空出 76px）。
+    avatar_img = _load_image(tweet.avatar_url, timeout) if tweet.avatar_url else None
+
+    # 正文：有译文就画译文，原文另起一块缩成灰色小字。
+    translation = (tweet.translation or "").strip()
+    original = (tweet.text or "").strip()
+    body_text = translation or original
+    body_lines = _wrap(body_text, _BODY_SIZE, False, text_width) if body_text else []
+    quote_lines = (
+        _wrap(original, _QUOTE_SIZE, False, text_width - 16)
+        if translation and original and original != translation
+        else []
     )
-    line_h = _BODY_SIZE + _LINE_GAP
 
-    # 媒体：单图按原比例（限高），多图走两列网格。视频封面额外画播放角标。
+    # 配图：与正文左对齐、同宽，多图**竖排**摞成一条长图（不裁切）。
+    # 取 `name=large` 而不是 syndication 默认的小图，长图放大后才不糊。
     media: list[tuple[Image.Image, bool]] = []
-    for url in tweet.photos[:4]:
-        img = _load_image(url, timeout)
-        if img is not None:
-            media.append((img, bool(tweet.video_poster) and url == tweet.video_poster))
-    media_boxes = _media_boxes(media, inner)
-    media_height = 0
+    if include_media:
+        for url in tweet.photos[:4]:
+            img = _load_image(best_photo_url(url), timeout)
+            if img is not None:
+                media.append((img, bool(tweet.video_poster) and url == tweet.video_poster))
+    media_boxes = _media_boxes(media, text_width, text_x)
+    media_height = max(
+        (top + height for _, (_, top, _, height), _ in media_boxes), default=0
+    )
+
+    name_ascent, name_descent = _metrics(_NAME_SIZE, True)
+    handle_ascent, handle_descent = _metrics(_HANDLE_SIZE)
+    body_ascent, _ = _metrics(_BODY_SIZE)
+    quote_ascent, _ = _metrics(_QUOTE_SIZE)
+    foot_ascent, foot_descent = _metrics(_FOOT_SIZE)
+
+    # ---- 竖向排版：先算好每块的顶边，再统一落笔 -------------------------- #
+    name_baseline = _PAD + 2 + name_ascent
+    handle_baseline = name_baseline + name_descent + 8 + handle_ascent
+    # 头像高度只在**真的取到头像**时才算进头部；没有 @用户名 时也不留那一行。
+    head_bottom = name_baseline + name_descent
+    if tweet.author_handle:
+        head_bottom = handle_baseline + handle_descent
+    if avatar_img is not None:
+        head_bottom = max(head_bottom, _PAD + _AVATAR)
+
+    adv_body = _line_advance(_BODY_SIZE)
+    adv_quote = _line_advance(_QUOTE_SIZE)
+
+    y = head_bottom
+    if body_lines:
+        body_top = y + _HEAD_GAP
+        y = body_top + len(body_lines) * adv_body - _LINE_GAP
+    else:
+        body_top = y
+
+    quote_top = 0
+    quote_label_baseline = 0
+    if quote_lines:
+        label_top = y + _QUOTE_GAP
+        quote_label_baseline = label_top + foot_ascent
+        quote_top = label_top + _line_advance(_FOOT_SIZE)
+        y = quote_top + len(quote_lines) * adv_quote - _LINE_GAP
+
+    media_top = y + (_BLOCK_GAP if media_boxes else 0)
     if media_boxes:
-        media_height = max(top + height for _, (_, top, _, height), _ in media_boxes)
+        y = media_top + media_height
 
-    name_fonts = _fonts("name")
-    handle_fonts = _fonts("handle")
-    foot_fonts = _fonts("foot")
-
-    head_bottom = _PAD + _AVATAR
-    body_top = head_bottom + 20
-    media_top = body_top + body_height + (16 if media_boxes else 0)
-    foot_top = media_top + media_height + (18 if media_boxes else 0)
-    footer = " · ".join(
-        part
-        for part in (
-            tweet.created_at,
+    # 页脚：多图走「原图单独发」时在这里标一句「N 张图」，让用户知道后面还有图。
+    footer_parts = [tweet.created_at]
+    if not include_media:
+        count = len(photo_urls(tweet))
+        if count:
+            footer_parts.append(f"{count} 张图")
+    footer_parts.extend(
+        [
             f"{tweet.likes} 喜欢" if tweet.likes else "",
             f"{tweet.replies} 回复" if tweet.replies else "",
-        )
-        if part
+        ]
     )
-    height = int(foot_top + _FOOT_SIZE + _PAD + 6)
+    footer = " · ".join(part for part in footer_parts if part)
+    foot_baseline = 0
+    if footer:
+        foot_baseline = y + (_BLOCK_GAP if y > head_bottom else _HEAD_GAP) + foot_ascent
+        y = foot_baseline + foot_descent
+    height = int(y + _PAD)
 
-    card = Image.new("RGB", (CARD_WIDTH, height), (255, 255, 255))
+    card = Image.new("RGB", (CARD_WIDTH, max(height, 160)), (255, 255, 255))
     draw = ImageDraw.Draw(card)
 
-    # 头像
-    if tweet.avatar_url:
-        avatar = _load_image(tweet.avatar_url, timeout)
-        if avatar is not None:
-            card.paste(_circle(avatar, _AVATAR), (_PAD, _PAD), _circle(avatar, _AVATAR))
+    # 头像（圆角裁切；同一张圆图既当蒙版又当内容，只算一次）
+    if avatar_img is not None:
+        circle = _circle(avatar_img, _AVATAR)
+        card.paste(circle, (_PAD, _PAD), circle)
 
-    # 昵称 + 认证
-    name_x = _draw_glyphs(
-        draw, text_x, _PAD + 2, _glyphs(tweet.author_name or "未知用户"), name_fonts, (15, 20, 25)
+    # 昵称 + 认证（昵称留 40px 给认证徽标，超长截断）
+    name_glyphs = _ellipsize(
+        _glyphs(tweet.author_name or "未知用户", _NAME_SIZE, True),
+        text_width - 40,
+        _NAME_SIZE,
     )
+    name_x = _draw_glyphs(draw, text_x, name_baseline, name_glyphs, _TEXT_COLOR)
     if tweet.verified:
-        _draw_badge(draw, name_x + 8, _PAD + 8, _NAME_SIZE - 4, tweet.verified)
+        badge_size = _NAME_SIZE - 7
+        _draw_badge(
+            draw,
+            name_x + 8,
+            name_baseline - name_ascent + max(0, (_NAME_SIZE - badge_size) / 2),
+            badge_size,
+            tweet.verified,
+        )
+
     # @handle
-    _draw_glyphs(
-        draw,
-        text_x,
-        _PAD + 2 + _NAME_SIZE + 8,
-        _glyphs(f"@{tweet.author_handle}" if tweet.author_handle else ""),
-        handle_fonts,
-        (83, 100, 113),
-    )
+    if tweet.author_handle:
+        _draw_glyphs(
+            draw,
+            text_x,
+            handle_baseline,
+            _ellipsize(
+                _glyphs(f"@{tweet.author_handle}", _HANDLE_SIZE),
+                text_width,
+                _HANDLE_SIZE,
+            ),
+            _MUTED_COLOR,
+        )
 
     # 正文
-    y = body_top
-    for line in lines:
-        if not line:
-            y += line_h
-            continue
-        _draw_glyphs(draw, text_x, y, line, body_fonts, (15, 20, 25))
-        y += max(body_fonts[key].getbbox(ch)[3] for ch, key in line) + _LINE_GAP
+    baseline = body_top + body_ascent
+    for line in body_lines:
+        if line:
+            _draw_glyphs(draw, text_x, baseline, line, _TEXT_COLOR)
+        baseline += adv_body
 
-    # 配图（等比覆盖裁切，绝不拉伸；圆角；视频封面加播放角标）
+    # 原文块（引用样式：左侧细线 + 灰色小字）
+    if quote_lines:
+        _draw_glyphs(
+            draw, text_x, quote_label_baseline, _glyphs("原文", _FOOT_SIZE), _MUTED_COLOR
+        )
+        draw.rounded_rectangle(
+            (
+                text_x,
+                quote_top - 6,
+                text_x + 3,
+                quote_top + len(quote_lines) * adv_quote - _LINE_GAP,
+            ),
+            radius=1,
+            fill=_RULE_COLOR,
+        )
+        baseline = quote_top + quote_ascent
+        for line in quote_lines:
+            if line:
+                _draw_glyphs(draw, text_x + 16, baseline, line, _MUTED_COLOR)
+            baseline += adv_quote
+
+    # 配图（竖排长图：按原比例缩放，不裁切不拉伸；圆角；视频封面加播放角标）
     for img, (left, top, width, height_), play in media_boxes:
-        box = _fit_cover(img, width, height_)
         mask = _rounded_mask((width, height_), _MEDIA_RADIUS)
-        card.paste(box, (left, int(media_top) + top), mask)
+        card.paste(img.resize((width, height_), Image.LANCZOS), (left, int(media_top) + top), mask)
         if play:
             _draw_play_badge(card, left, int(media_top) + top, width, height_)
 
     # 底部时间 / 互动
     if footer:
-        _draw_glyphs(
-            draw, text_x, foot_top, _glyphs(footer), foot_fonts, (83, 100, 113)
-        )
+        _draw_glyphs(draw, text_x, foot_baseline, _glyphs(footer, _FOOT_SIZE), _MUTED_COLOR)
 
     path = outdir / f"tweet-{tweet.id}.png"
     try:

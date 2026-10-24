@@ -117,7 +117,7 @@ class FakeLLM:
         self.reply = reply
         self.calls = 0
 
-    async def chat(self, messages):
+    async def chat(self, messages, **_kwargs):
         self.calls += 1
         self.last_messages = messages
         return self.reply
@@ -467,7 +467,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
         class BrokenLLM:
             def __init__(self, config): pass
 
-            async def chat(self, messages):
+            async def chat(self, messages, **_kwargs):
                 raise LLMError("unauthorized", "bad key")
 
         adapter = FakeAdapter()
@@ -3341,6 +3341,73 @@ class TweetTests(unittest.TestCase):
             self.assertIsNone(path)
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
+    def test_best_photo_url_upgrades_size(self):
+        """syndication 给的是小图，发回聊天前要换成大图。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        self.assertEqual(
+            tweet_mod.best_photo_url("https://pbs.twimg.com/media/A?format=jpg&name=small"),
+            "https://pbs.twimg.com/media/A?format=jpg&name=large",
+        )
+        self.assertEqual(
+            tweet_mod.best_photo_url("https://pbs.twimg.com/media/A?format=jpg"),
+            "https://pbs.twimg.com/media/A?format=jpg&name=large",
+        )
+        # 非 pbs 的地址原样返回（别给别人的 CDN 乱加参数）
+        self.assertEqual(
+            tweet_mod.best_photo_url("https://img.example.com/a.jpg"),
+            "https://img.example.com/a.jpg",
+        )
+        self.assertEqual(tweet_mod.best_photo_url(""), "")
+
+    def test_photo_urls_skips_video_poster(self):
+        """视频封面不是「配图」：视频会单独发，别把封面也当图发一遍。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        info = tweet_mod.Tweet(
+            id="v",
+            url="https://x.com/a/status/v",
+            has_video=True,
+            photos=["https://p/1.jpg", "https://p/poster.jpg"],
+            video_poster="https://p/poster.jpg",
+        )
+        self.assertEqual(tweet_mod.photo_urls(info), ["https://p/1.jpg"])
+        # 普通多图推文按原顺序全给
+        plain = tweet_mod.Tweet(
+            id="p", url="https://x.com/a/status/p", photos=[f"https://p/{i}.jpg" for i in range(4)]
+        )
+        self.assertEqual(len(tweet_mod.photo_urls(plain)), 4)
+        # 微信一次最多 9 张
+        many = tweet_mod.Tweet(
+            id="m", url="https://x.com/a/status/m", photos=[f"https://p/{i}.jpg" for i in range(20)]
+        )
+        self.assertEqual(len(tweet_mod.photo_urls(many)), 9)
+
+    def test_render_card_without_media(self):
+        """include_media=False 时不画配图，卡片更矮。"""
+        from lingyu.bot import tweet as tweet_mod
+        from PIL import Image
+
+        info = tweet_mod.Tweet(
+            id="nm",
+            url="https://x.com/a/status/nm",
+            text="只有文字的卡片",
+            author_name="某人",
+            photos=["https://p/1.jpg", "https://p/2.jpg"],
+        )
+        original = tweet_mod._load_image
+        tweet_mod._load_image = lambda url, timeout: Image.new("RGB", (800, 450), (20, 60, 120))
+        try:
+            with_media = self._card_height(info)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = tweet_mod.render_card(info, tmp, timeout=5, include_media=False)
+                with Image.open(path) as card:
+                    card.load()
+                    without = card.size[1]
+        finally:
+            tweet_mod._load_image = original
+        self.assertLess(without, with_media)
+
     def test_render_card_writes_png(self):
         """不触网渲染（无头像/无配图）也要能出图，且中英 emoji 混排不报错。"""
         from lingyu.bot import tweet as tweet_mod
@@ -3375,19 +3442,6 @@ class TweetTests(unittest.TestCase):
                 pixels[x, y] = color
         return img
 
-    def test_fit_cover_crops_instead_of_stretching(self):
-        """等比覆盖裁切：300×100 塞进 100×100 应只剩中间那一条，而不是压扁三色。"""
-        from lingyu.bot import tweet as tweet_mod
-
-        out = tweet_mod._fit_cover(self._striped(300, 100), 100, 100)
-        self.assertEqual(out.size, (100, 100))
-        for x in (0, 50, 99):
-            self.assertEqual(out.getpixel((x, 50)), (0, 255, 0))
-        # 对照：直接 resize（旧行为）会把三条都挤进来 —— 那正是「变形」。
-        squeezed = self._striped(300, 100).resize((100, 100))
-        self.assertEqual(squeezed.getpixel((5, 50)), (255, 0, 0))
-        self.assertEqual(squeezed.getpixel((95, 50)), (0, 0, 255))
-
     def test_media_boxes_single_keeps_aspect_ratio(self):
         from lingyu.bot import tweet as tweet_mod
         from PIL import Image
@@ -3403,24 +3457,47 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(box[3], tweet_mod._MAX_MEDIA_HEIGHT)
         self.assertAlmostEqual(box[2] / box[3], 0.5, places=2)
 
-    def test_media_boxes_multi_grid_is_uniform_and_inside_card(self):
+    def test_media_boxes_stacks_vertically(self):
+        """多图竖排成长图：每张铺满宽度、按原比例排下来，一张都不裁。"""
         from lingyu.bot import tweet as tweet_mod
         from PIL import Image
 
-        inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
-        media = [(Image.new("RGB", (w, h)), i == 2) for i, (w, h) in enumerate(
-            [(1600, 900), (600, 1200), (800, 800), (1200, 400)]
-        )]
-        boxes = tweet_mod._media_boxes(media, inner)
-        self.assertEqual(len(boxes), 4)
-        sizes = {box[2:] for _img, box, _play in boxes}
-        self.assertEqual(len(sizes), 1, "多图网格每格尺寸必须一致")
-        for _img, (left, top, width, height), _play in boxes:
-            self.assertGreater(width, 0)
-            self.assertGreater(height, 0)
-            self.assertLessEqual(left + width, tweet_mod.CARD_WIDTH)
-        # 播放角标只落在视频封面那一格上。
-        self.assertEqual([play for _img, _box, play in boxes], [False, False, True, False])
+        inner = 600
+        shapes = [(1600, 900), (900, 1600), (1000, 1000)]
+        media = [(Image.new("RGB", shape), False) for shape in shapes]
+        boxes = tweet_mod._media_boxes(media, inner, 100)
+
+        self.assertEqual(len(boxes), 3)
+        expected_top = 0
+        for (_img, (left, top, width, height), _play), (src_w, src_h) in zip(boxes, shapes):
+            ratio = src_w / src_h
+            self.assertEqual(top, expected_top)
+            # 宽高比与原图一致（= 没有拉伸、没有裁切）
+            self.assertAlmostEqual(width / height, ratio, places=2)
+            self.assertLessEqual(left + width, 100 + inner)
+            expected_top += height + tweet_mod._MEDIA_GAP
+
+    def test_media_boxes_tall_image_narrowed_and_centered(self):
+        """超高的图限高后要收窄并居中——只截高度不缩宽度就是横向压扁。"""
+        from lingyu.bot import tweet as tweet_mod
+        from PIL import Image
+
+        inner = 600
+        tall = Image.new("RGB", (400, 2000))  # 1:5，按宽度铺开会到 3000px 高
+        (_, (left, top, width, height), _) = tweet_mod._media_boxes(
+            [(tall, False)], inner, 100
+        )[0]
+        self.assertEqual(height, tweet_mod._MAX_MEDIA_HEIGHT)
+        self.assertAlmostEqual(width / height, 0.2, places=2)
+        self.assertEqual(left, 100 + (inner - width) // 2)
+
+    def test_media_boxes_keeps_every_image(self):
+        """张数不再截断到 4 张（竖排没有「格子」可填）。"""
+        from lingyu.bot import tweet as tweet_mod
+        from PIL import Image
+
+        media = [(Image.new("RGB", (400, 400)), False) for _ in range(4)]
+        self.assertEqual(len(tweet_mod._media_boxes(media, 600)), 4)
 
     def test_render_card_with_multiple_photos(self):
         """多图推文：横竖混排也要出图且不报错（回归「多图变形」）。"""
@@ -3449,6 +3526,221 @@ class TweetTests(unittest.TestCase):
                     self.assertEqual(card.size[0], tweet_mod.CARD_WIDTH)
         finally:
             tweet_mod._load_image = original
+
+    # ---- 排版：段落空行 / 配图对齐 / 长文本（回归「文字压图」） ---- #
+
+    def _card_height(self, info) -> int:
+        from lingyu.bot import tweet as tweet_mod
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = tweet_mod.render_card(info, tmp, timeout=5)
+            self.assertIsNotNone(path)
+            with Image.open(path) as card:
+                card.load()
+                return card.size[1]
+
+    def test_blank_lines_reserve_height(self):
+        """段落空行必须占一行高度。
+
+        早先 ``body_height`` 求和时用 ``if line`` 跳过了空行，但绘制时空行照样
+        下移一行——正文比预估矮，末尾几行就压到配图上了。
+        """
+        from lingyu.bot import tweet as tweet_mod
+
+        def height(text: str) -> int:
+            return self._card_height(
+                tweet_mod.Tweet(
+                    id="b", url="https://x.com/a/status/b", text=text, author_name="某人"
+                )
+            )
+
+        one = height("第一段\n第二段")
+        two = height("第一段\n\n第二段")
+        self.assertGreaterEqual(
+            two - one, tweet_mod._line_advance(tweet_mod._BODY_SIZE) - 2
+        )
+
+    def test_body_never_overlaps_media(self):
+        """正文底部必须落在配图上方（多段长文 + 单图，逐行算高度也不能越界）。
+
+        直接看像素：配图是纯红，找出第一行「大面积红」当作配图顶边，
+        再看它上方最后一行有墨迹的位置——两者之间必须留出间距。
+        """
+        from lingyu.bot import tweet as tweet_mod
+        from PIL import Image
+
+        text = "\n\n".join(["这是一段用来测试排版的正文。" * 3] * 4)
+        info = tweet_mod.Tweet(
+            id="c",
+            url="https://x.com/a/status/c",
+            text=text,
+            author_name="某人",
+            photos=["https://p/wide.jpg"],
+            created_at="2026-10-05 09:30",
+        )
+        original = tweet_mod._load_image
+        tweet_mod._load_image = lambda url, timeout: Image.new("RGB", (1200, 675), (255, 0, 0))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = tweet_mod.render_card(info, tmp, timeout=5)
+                self.assertIsNotNone(path)
+                with Image.open(path) as raw:
+                    card = raw.convert("RGB")
+                    width, height = card.size
+                    pixels = card.load()
+                    media_top = None
+                    for y in range(height):
+                        reds = sum(
+                            1
+                            for x in range(0, width, 4)
+                            if pixels[x, y][0] > 200 and pixels[x, y][1] < 60
+                        )
+                        if reds > width // 16:
+                            media_top = y
+                            break
+                    self.assertIsNotNone(media_top, "没找到配图")
+                    text_bottom = 0
+                    for y in range(media_top):
+                        if any(
+                            sum(pixels[x, y]) < 300 for x in range(0, width, 2)
+                        ):
+                            text_bottom = y
+                    self.assertGreaterEqual(
+                        media_top - text_bottom, 8, "正文压到配图上了"
+                    )
+        finally:
+            tweet_mod._load_image = original
+
+    @staticmethod
+    def _text_width() -> int:
+        from lingyu.bot import tweet as tweet_mod
+
+        return tweet_mod.CARD_WIDTH - tweet_mod._PAD - (
+            tweet_mod._PAD + tweet_mod._AVATAR + 20
+        )
+
+    def test_media_aligns_with_text_column(self):
+        """配图与正文左对齐（早先配图顶到卡片最左留白里，视觉上挤着头像）。"""
+        from lingyu.bot import tweet as tweet_mod
+        from PIL import Image
+
+        text_x = tweet_mod._PAD + tweet_mod._AVATAR + 20
+        inner = self._text_width()
+        box = tweet_mod._media_boxes(
+            [(Image.new("RGB", (1000, 500)), False)], inner, text_x
+        )[0][1]
+        self.assertEqual(box[0], text_x)
+        self.assertEqual(box[0] + box[2], tweet_mod.CARD_WIDTH - tweet_mod._PAD)
+
+    def test_long_name_is_truncated(self):
+        """超长昵称不能画到卡片外。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        glyphs = tweet_mod._glyphs("A" * 80, tweet_mod._NAME_SIZE, True)
+        clipped = tweet_mod._ellipsize(glyphs, self._text_width() - 40, tweet_mod._NAME_SIZE)
+        self.assertLess(len(clipped), len(glyphs))
+        self.assertEqual(clipped[-1][0], "…")
+        self.assertLessEqual(tweet_mod._width(clipped), self._text_width() - 40)
+
+    # ---- 字体回退（回归「部分语言乱码 / 豆腐块」） ---- #
+
+    def test_font_fallback_covers_other_scripts(self):
+        """韩文/泰文/天城文/阿拉伯文必须落到真正含字形的字体上。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        samples = {
+            "한": "malgun.ttf",   # 韩文
+            "ส": "LeelawUI.ttf",  # 泰文
+            "न": "Nirmala.ttf",   # 天城文
+            "م": "segoeui.ttf",   # 阿拉伯文
+        }
+        for ch, expected in samples.items():
+            if tweet_mod._font_file(expected, 25) is None:
+                self.skipTest(f"系统缺少 {expected}")
+            self.assertFalse(
+                tweet_mod._has_glyph("msyh.ttc", 25, ch), f"雅黑不该有 {ch} 的字形"
+            )
+            self.assertTrue(tweet_mod._has_glyph(expected, 25, ch))
+            self.assertEqual(
+                Path(tweet_mod._pick_font(ch, 25, False).path).name, expected
+            )
+
+    def test_chinese_and_latin_stay_on_yahei(self):
+        """常用字符仍然走雅黑（别为了回退把中文换成别的字体）。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        if tweet_mod._font_file("msyh.ttc", 25) is None:
+            self.skipTest("系统缺少 msyh.ttc")
+        for ch in ("中", "A", "П"):
+            self.assertEqual(
+                Path(tweet_mod._pick_font(ch, 25, False).path).name, "msyh.ttc"
+            )
+
+    def test_rtl_text_is_reordered(self):
+        """阿拉伯文按视觉顺序落笔（不做连写塑形，但顺序不能反）。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        logical = "مرحبا"
+        visual = tweet_mod._visual_order(logical)
+        self.assertEqual(visual, logical[::-1])
+        # 拉丁文/数字原样不动
+        self.assertEqual(tweet_mod._visual_order("2026 hello"), "2026 hello")
+
+    # ---- 翻译判定与译文排版 ---- #
+
+    def test_needs_translation(self):
+        from lingyu.bot import tweet as tweet_mod
+
+        for text in (
+            "Hello world, this is English.",
+            "한국어 테스트입니다.",
+            "日本語のツイートです。",
+            "Привет мир!",
+            "مرحبا بالعالم",
+        ):
+            self.assertTrue(tweet_mod.needs_translation(text), text)
+        for text in (
+            "今天天气不错，出门走走。",
+            "今天发布了新版本 v2.0，非常开心！",
+            "https://x.com/a/status/1",
+            "123456",
+            "",
+        ):
+            self.assertFalse(tweet_mod.needs_translation(text), text)
+
+    def test_translation_becomes_body_and_original_is_quoted(self):
+        """有译文时：正文用译文，原文另起一块，卡片更高。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        plain = tweet_mod.Tweet(
+            id="t1", url="https://x.com/a/status/t1", text="Hello world, a tweet.", author_name="A"
+        )
+        translated = tweet_mod.Tweet(
+            id="t2",
+            url="https://x.com/a/status/t2",
+            text="Hello world, a tweet.",
+            translation="你好世界，这是一条推文。",
+            author_name="A",
+        )
+        self.assertGreater(self._card_height(translated), self._card_height(plain))
+        self.assertIn("你好世界", translated.summary())
+
+    def test_translation_equal_to_text_is_not_duplicated(self):
+        """译文与原文相同（模型原样返回）时不要多画一个「原文」块。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        same = tweet_mod.Tweet(
+            id="t3",
+            url="https://x.com/a/status/t3",
+            text="一样的文字",
+            translation="一样的文字",
+            author_name="A",
+        )
+        plain = tweet_mod.Tweet(
+            id="t4", url="https://x.com/a/status/t4", text="一样的文字", author_name="A"
+        )
+        self.assertEqual(self._card_height(same), self._card_height(plain))
 
 
 class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -3598,6 +3890,136 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 tweet_mod.fetch_tweet_cached, tweet_mod.download_video = original
         self.assertEqual([Path(p).name for _, p in adapter.files], ["video.mp4"])
+
+    # ---- 推文翻译 ---- #
+
+    async def _run_translate(self, text, reply="你好，世界。", fail=False, **cfg_kwargs):
+        """跑一遍「发卡片」流程，返回 (渲染时看到的 Tweet, LLM 调用次数, 发出的文件)。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        adapter = FakeAdapter()
+        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options.update(cfg_kwargs)
+        cfg = BotConfig(**options)
+
+        class _LLM:
+            def __init__(self, config):
+                self.calls = 0
+
+            async def chat(self, messages, **_kwargs):
+                self.calls += 1
+                if fail:
+                    raise LLMError("timeout", "模型超时")
+                return reply
+
+        llm = _LLM(cfg)
+        engine = BotEngine(adapter, cfg, llm_factory=lambda c: llm)
+        url = "https://x.com/demo/status/9"
+        info = tweet_mod.Tweet(id="9", url=url, text=text, author_name="A")
+        seen: dict = {}
+        original = (tweet_mod.fetch_tweet_cached, tweet_mod.render_card)
+        with tempfile.TemporaryDirectory() as tmp:
+            card = Path(tmp) / "card.png"
+            card.write_bytes(b"card")
+
+            def _render(target, *a, **k):
+                seen["info"] = target
+                return card
+
+            tweet_mod.fetch_tweet_cached = lambda *a, **k: info
+            tweet_mod.render_card = _render
+            try:
+                await engine._download_and_send(
+                    make_record(is_at_me=True, message_id="m9", content=f"看 {url}")
+                )
+            finally:
+                tweet_mod.fetch_tweet_cached, tweet_mod.render_card = original
+        return seen.get("info"), llm.calls, [Path(p).name for _, p in adapter.files]
+
+    async def test_foreign_tweet_translated_before_render(self):
+        """外文推文先翻译，渲染时拿到的 Tweet 已带译文。"""
+        info, calls, files = await self._run_translate(
+            "Hello world, this is an English tweet.", reply="你好世界，这是一条英文推文。"
+        )
+        self.assertEqual(calls, 1)
+        self.assertEqual(info.translation, "你好世界，这是一条英文推文。")
+        self.assertEqual(files, ["card.png"])
+
+    async def test_chinese_tweet_is_not_translated(self):
+        """中文推文不翻译（省 token）。"""
+        info, calls, files = await self._run_translate("今天天气不错，出门走走。")
+        self.assertEqual(calls, 0)
+        self.assertEqual(info.translation, "")
+        self.assertEqual(files, ["card.png"])
+
+    async def test_translation_can_be_disabled(self):
+        info, calls, _files = await self._run_translate(
+            "Hello world, this is an English tweet.", link_tweet_translate=False
+        )
+        self.assertEqual(calls, 0)
+        self.assertEqual(info.translation, "")
+
+    async def test_translation_failure_still_sends_card(self):
+        """翻译失败不能连卡片一起丢：照原文渲染，卡片照发。"""
+        info, calls, files = await self._run_translate(
+            "Hello world, this is an English tweet.", fail=True
+        )
+        self.assertEqual(calls, 1)
+        self.assertEqual(info.translation, "")
+        self.assertEqual(files, ["card.png"])
+
+    async def test_translation_skipped_when_already_present(self):
+        """已带译文的 Tweet 不再重复调模型（同一条推文会被缓存复用）。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        adapter = FakeAdapter()
+        cfg = BotConfig(enabled=True, cooldown_seconds=0.0)
+        llm = FakeLLM(cfg, reply="你好世界。")
+        engine = BotEngine(adapter, cfg, llm_factory=lambda c: llm)
+        info = tweet_mod.Tweet(
+            id="9", url="https://x.com/a/status/9", text="Hello world.", translation="你好世界。"
+        )
+        await engine._translate_tweet(info, info.url)
+        self.assertEqual(llm.calls, 0)
+        self.assertEqual(info.translation, "你好世界。")
+
+
+    # ---- 多图：合成长图，一条消息发完 ---- #
+
+    async def test_multi_photo_sends_single_long_image(self):
+        """多图推文只发**一条**卡片（长图），不再拆成多条图片消息。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_download_enabled=True)
+        url = "https://x.com/demo/status/88"
+        info = tweet_mod.Tweet(
+            id="88",
+            url=url,
+            text="四张图",
+            author_name="A",
+            photos=[f"https://p/{i}.jpg" for i in range(4)],
+        )
+        seen: dict = {}
+        original = (tweet_mod.fetch_tweet_cached, tweet_mod.render_card)
+        with tempfile.TemporaryDirectory() as tmp:
+            card = Path(tmp) / "card.png"
+            card.write_bytes(b"card")
+
+            def _render(_target, *_a, **kwargs):
+                seen["include_media"] = kwargs.get("include_media", True)
+                return card
+
+            tweet_mod.fetch_tweet_cached = lambda *a, **k: info
+            tweet_mod.render_card = _render
+            try:
+                await engine._download_and_send(
+                    make_record(is_at_me=True, message_id="m88", content=f"看 {url}")
+                )
+            finally:
+                tweet_mod.fetch_tweet_cached, tweet_mod.render_card = original
+        self.assertTrue(seen["include_media"], "多图也要画进卡片（合成一张长图）")
+        self.assertEqual([Path(p).name for _, p in adapter.files], ["card.png"])
 
 
 class LinkAckTests(unittest.IsolatedAsyncioTestCase):
@@ -3757,6 +4179,9 @@ class LinkConfigTests(unittest.TestCase):
         self.assertEqual(cfg.link_download_quota_mb, 1024)
         self.assertEqual(cfg.download_quota_bytes(), 1024 * 1024 * 1024)
         self.assertTrue(cfg.link_tweet_card_enabled)
+        # 推文正文默认自动翻译成简体中文；目标语言留空时回落到默认值。
+        self.assertTrue(cfg.link_tweet_translate)
+        self.assertEqual(cfg.link_tweet_translate_target, "简体中文")
         # 识别到链接就回固定提示；默认不改变原有的模型回复行为。
         self.assertTrue(cfg.link_ack_enabled)
         self.assertEqual(cfg.link_ack_text, "正在解析链接")
@@ -3784,6 +4209,17 @@ class LinkConfigTests(unittest.TestCase):
         cfg = BotConfig.from_dict({"link_ack_text": "  正在\n解析  链接  "})
         self.assertEqual(cfg.link_ack_text, "正在 解析 链接")
         self.assertEqual(BotConfig.from_dict({"link_ack_text": "   "}).link_ack_text, "")
+
+    def test_translate_target_falls_back_when_blank(self):
+        """目标语言留空会让提示词变成半句话，必须回落到默认值。"""
+        self.assertEqual(
+            BotConfig.from_dict({"link_tweet_translate_target": "   "}).link_tweet_translate_target,
+            "简体中文",
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"link_tweet_translate_target": " 英文 "}).link_tweet_translate_target,
+            "英文",
+        )
 
     def test_clamps(self):
         cfg = BotConfig.from_dict(
