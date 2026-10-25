@@ -40,7 +40,7 @@ MCP 客户端 / 桌面界面
 | `src/lingyu/server.py` | MCP 服务入口，注册全部工具 |
 | `src/lingyu/service.py` | 业务层，工具与适配层之间的编排 |
 | `src/lingyu/adapters/wechat.py` | 微信适配层，桥接层加载与调用封装 |
-| `src/lingyu/bot/` | 常驻机器人：引擎、模型、人设、链接解析、存储 |
+| `src/lingyu/bot/` | 常驻机器人：引擎、模型、人设、链接解析、卡片渲染、存储 |
 | `src/lingyu/desktop.py` | 桌面端主程序与 JS API |
 | `src/lingyu/webui/` | 桌面端前端（HTML/CSS/JS） |
 | `packaging/wechat_bridge.py` | 微信 UI 自动化桥接层 |
@@ -281,6 +281,9 @@ MCP 客户端 / 桌面界面
 - **链接解析**：见第 6 节。
 - **图像识别**：开启后（需模型支持视觉）图片随上下文一起送给模型。
 
+**前置条件**：界面靠 Edge WebView2 渲染，系统缺这个运行时会启动失败并明确提示要装什么
+（见第 7 节「桌面端提示缺少 WebView2 运行时」）。**MCP 模式不需要 WebView2**。
+
 配置全部落在 `%APPDATA%\lingyu\bot.json`，运行日志在
 `%APPDATA%\lingyu\logs\`。
 
@@ -302,11 +305,89 @@ MCP 客户端 / 桌面界面
 |---|---|---|
 | B 站 / YouTube 等 | 内置 yt-dlp 取标题/作者/时长/简介，可选下载 | 网络 |
 | 抖音 | 借本机 Chrome/Edge 打开作品页，由页面完成 `a_bogus` 签名 | 系统装有 Edge 或 Chrome |
-| X（Twitter） | 本地渲染推文卡片图（头像/昵称/正文/配图/时间/点赞） | 网络；含视频时再下载视频 |
-| 微博 / 小红书 | yt-dlp 直接解析 | 需要 Netscape 格式的 `cookies.txt` |
+| X（Twitter） | 抓推文数据 → 本地渲染卡片图（头像/昵称/正文/配图/时间/点赞） | 网络；含视频时再下载视频 |
+| 小红书 | 读笔记页内嵌的 `window.__INITIAL_STATE__` → 渲染同一套版式的卡片图 | 网络；只有少数要求登录态的笔记才需要 `cookies.txt` |
+| 微博 / 其它 | yt-dlp 直接解析 | 需要 Netscape 格式的 `cookies.txt` |
 
 抖音的浏览器桥会临时起一个无头浏览器，用**独立的临时用户目录**，
 不碰既有的浏览器配置和登录态。
+
+### 小红书笔记解析
+
+**为什么单独写一个解析器**：小红书笔记页是**服务端渲染**的，首次 HTML 里就带一份
+`window.__INITIAL_STATE__`，笔记数据（标题/正文/作者/头像/图片/点赞/评论）全在里面。
+所以**不需要签名、也不需要调接口**，一次普通 GET 就能拿全。yt-dlp 没有小红书提取器，
+之前只能落到网页兜底——分享短链被当成标题、正文拿不到，等于解析失败。
+
+**移动端 UA 是免登录的前提**（实测）：
+
+| UA | 结果 |
+|---|---|
+| 桌面 UA（`Windows NT … Chrome/124`） | 302 到 `/login`，真地址被塞进 `redirectPath` |
+| iPhone / Android UA | 直接返回完整页面 |
+
+所以 `fetch_note()` 固定用移动 UA。两端页面结构不同，`note_from_state()` 两套都认：
+
+| 端 | 数据路径 | 图片字段 |
+|---|---|---|
+| 桌面版 | `note.noteDetailMap[<noteId>].note` | `WB_DFT` |
+| 移动 H5 | `noteData.data.noteData` | `H5_DTL`（1080 宽） |
+
+**`xsec_token` 不能丢**：从 App/网页「分享」出来的链接带 `?xsec_token=…`。手工拼
+`explore/<id>` 而不带 token 会被 302 到
+`/404?error_code=300031&error_msg=当前笔记暂时无法浏览`——**这不等于「笔记不存在」**，
+只是没有访问凭证，错误信息必须如实区分（`_error_from_url()` 把 `error_msg` 原样带回）。
+**短链展开时也要保留 query**，token 就在里面。
+
+**短链展开的时机很关键**：App 分享出来的是 `xhslink.cn/o/xxx`，本身不含笔记 ID。
+卡片这条路要先 `LinkResolver.expand_short_link()` 展开再解析，否则 `note_for()`
+直接报「未能从链接中识别笔记 ID」；而下载那一路是在 `_attempt_download()` 里
+自己展开的——**两条路时机不同**，别指望解析器自己会展开。
+
+**分享文案里的裸短链**：App 复制出来的文案常常不带 `http://`
+（`xhslink.com/a/xxx`、`xhslink.cn/o/xxx`），所以 `links.extract_urls()` 额外认
+几个已知短链主机的裸域名（`_BARE_HOSTS`）。
+
+**浏览器兜底**：HTML 里拿不到数据（被重定向到 `/404`、`/login`，或状态里是空壳）时，
+用浏览器桥再打开一次。注意 `--headless=new` 的 UA 带 `HeadlessChrome`，小红书一眼识破
+并甩「IP存在风险」风控页——所以这里**必须换正常 UA 并关掉 `AutomationControlled`**
+（走 `BrowserSession(extra_args=…)`）。
+
+**缓存**：`note_for()` 只缓存成功结果，同一条笔记再次出现不重复抓取；
+`forget_cached(note_id)` 清单条、`forget_cached()` 全清。
+
+### 卡片版式：推文与笔记共用一套
+
+`bot/card.py` 把「一张社交帖子卡片需要什么」定义成 `CardData`，两边各自转换：
+
+| 来源 | 转换函数 | 差异在哪、怎么抹平 |
+|---|---|---|
+| 推文 | `Tweet.to_card()` | 有 `@handle`、认证标记、可带译文 |
+| 小红书笔记 | `note_to_card()` | 没有 `@用户名` → 副标题改用「小红书 · 图文（5 张）」；正文分标题+描述两段；互动口径是「赞 / 评论」 |
+
+`tweet.render_card()` 只认 `CardData`（也兼容直接传 `Tweet`，内部自动转），
+所以两边**版式完全一致**：头像/昵称块 → 正文（有译文用译文）→ 原文块 → 配图 → 页脚。
+以后再加平台，只要写一个 `xxx_to_card()`，不用碰渲染器。
+
+几个渲染约定：
+
+- **配图竖排成一条长图**：几张图各按原比例铺满宽度、从上往下摞，不裁切也不拉伸，
+  整张卡片一条消息发完。
+- **最多画 4 张**（`card.photos[:4]`）：长图不能无限长。超出的在页脚标一句
+  「共 N 张图」，`photo_total` 是作品真实图数（不是画了几张）。X 单条最多 4 张图，
+  推文侧 `photo_total` 默认 0（= 不提示），所以这句实际只在小红书卡片上出现——
+  小红书图文常见 5～9 张，一定会触发截断。
+- **页脚**：时间 · 共 N 张图 · 赞 · 评论，空字段不占位。
+- **落盘文件名**：`f"{card.prefix or 'card'}-{card.id}.png"`，即 `tweet-<id>.png` /
+  `xhs-<id>.png`，在下载目录里一眼能看出是哪个站点来的。
+- **视频封面**：`video_poster` 命中的那张画播放角标。
+
+**小红书具体发什么**：由 `link_xhs_card_enabled`（界面「链接解析 → 小红书笔记卡片」）控制。
+
+- **图文笔记只发卡片**，不逐张发原图——原图常有 5～9 张，逐张发等于往聊天里刷 N 条消息，
+  与「一条链接回发一份内容」的语义不符。
+- **视频笔记**在卡片之后再下载视频回发。
+- 解析失败、或卡片渲染失败时**退回通用下载**，至少把失败原因发进聊天，而不是石沉大海。
 
 ### 卡片消息为什么要回查数据库
 
@@ -360,18 +441,33 @@ MCP 客户端 / 桌面界面
 .\lingyu.exe --tweet <推文链接> [--outdir <目录>]             # 抓推文并渲染卡片图
 ```
 
+`--resolve` 走通用解析链路，小红书、B 站、抖音、微博都适用；`--tweet` 只针对推文
+（它会真的渲染 PNG，是排查卡片版式最快的办法）。小红书**没有**单独的诊断开关，
+解析结果直接看 `--resolve` 的输出即可；需要看卡片成品就设
+`link_xhs_card_enabled` 打开后发一条笔记链接，或直接跑 `scripts/dev/xhs_card_demo.py`。
+
 ### 常见问题
 
 - **`yt_dlp_version` 显示「不可用」**：内置 yt-dlp 导入失败，其下方会给出
   `yt_dlp_error`（冻结包缺标准库子模块的典型症状）。
 - **媒体站点解析不出标题**：确认网络可达；普通网页会自动回退到抓取 `<title>`。
 - **抖音提示「未找到 Chrome/Edge」**：装 Edge 或 Chrome（Windows 10/11 自带 Edge）。
-- **微博/小红书报 `fresh cookies ... are needed` 或 `HTTP 403`**：这类站点网页是空壳、
-  接口要 Cookie，必须提供 `cookies.txt`。
-  - 在 Chrome/Edge 里登录对应网站，用扩展（如 *Get cookies.txt LOCALLY*）导出
+- **微博报 `fresh cookies ... are needed` 或 `HTTP 403`**：微博网页是空壳、接口要 Cookie，
+  必须提供 `cookies.txt`。
+  - 在 Chrome/Edge 里登录微博，用扩展（如 *Get cookies.txt LOCALLY*）导出
     **Netscape 格式**的 `cookies.txt`（文件以 `# Netscape HTTP Cookie File` 开头）。
   - 不必登录也能导出，但多数站点会持续校验，**登录后导出更稳**；文件会过期，失效重导。
   - 路径填错、指向目录或文件为空时，程序**当成没填**处理，继续走匿名请求。
+- **小红书提示「当前笔记暂时无法浏览」**：这是 `error_code=300031`，**不是笔记被删**，
+  而是链接里缺 `xsec_token`。用 App/网页的「分享 → 复制链接」重新发一次，别手打
+  `explore/<id>`；短链（`xhslink.cn/o/xxx`）本身就带着 token，直接发即可。
+- **小红书提示「要求登录后才能查看」**：少数笔记只对登录用户开放，在「链接解析」页配上
+  `cookies.txt` 再试（只会取 `.xiaohongshu.com` 域下的键，不会把别的站点 Cookie 带过去）。
+- **小红书报「IP存在风险」**：浏览器兜底被风控识别。程序内置的兜底已经换成正常 UA 并关掉
+  `AutomationControlled`；若仍频繁出现，多半是本机 IP 被临时限流，过一阵再试。
+- **小红书卡片发了但图不全**：卡片最多画 4 张，页脚会标「共 N 张图」——这是设计如此，
+  长图不能无限长。关掉「小红书笔记卡片」也不会逐张发原图，只会收到「图文笔记暂不支持下载」
+  的提示：N 张图等于 N 条消息，与「一条链接回发一份内容」的语义不符。
 - **下载音视频失败**：DASH 分离流必须靠 ffmpeg 合流，`--selfcheck` 里的 `ffmpeg`
   必须可用（打包版已内置）。
 - **聊天里收到「下载失败（重试 N 次仍不行）」**：说明自动重试已经用尽，看提示里的
@@ -470,6 +566,25 @@ MCP 客户端 / 桌面界面
 - 文件必须位于允许目录内；使用 `..` 尝试越界会被拒绝。
 - 确认文件存在、是普通文件且可读，否则返回 `file_invalid`。
 
+### 桌面端提示缺少 WebView2 运行时
+
+现象：双击 `lingyu.exe`，弹出「缺少 Microsoft Edge WebView2 运行时」并自动打开浏览器下载页。
+
+原因：桌面界面由 pywebview + Edge WebView2 渲染。Windows 10/11 通常自带，但**精简版系统、
+LTSC、部分企业镜像、或手动卸载过 Edge** 的机器上可能没有。
+
+处理：
+
+1. 在弹窗打开的官方下载页装 **Evergreen Bootstrapper（x64）**，装完重开程序。
+2. 想手动确认：注册表
+   `…\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}` 下的 `pv`
+   存在且不等于 `0.0.0.0` 即为已安装（HKLM/HKCU × WOW6432Node/native 四个位置都会查）。
+3. 装完仍提示：确认装的是 **WebView2 Runtime**，不是 Edge 浏览器本体——两者不通用。
+
+> 0.8.17 之前，缺 WebView2 会被兜底文案说成「Python.Runtime.dll 加载失败，请解除文件锁定」，
+> 把渲染器初始化失败误判成 .NET 程序集被锁定，用户照着做多少遍都没用。现在启动前先检查，
+> 缺了就直接说明要装什么。
+
 ### 桌面端启动后黑屏
 
 现象：双击 `lingyu.exe`，窗口出来一片黑（或闪一下就没），`logs\` 里什么都没有。
@@ -496,7 +611,8 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
    ```
 
 3. `lingyu.exe --selfcheck` 不依赖 GUI，能跑通说明解释器与依赖没问题，
-   黑屏就属于窗口/标记层面。
+   黑屏就属于窗口/标记层面（若连 WebView2 都没装，启动前的检查会先拦下并给出明确提示，
+   不会走到这一步）。
 
 ### 并发与窗口争抢
 
@@ -524,6 +640,13 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
 
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
+.venv\Scripts\python.exe -m ruff check src tests packaging scripts
+```
+
+单跑某一组（改了解析器时最常用）：
+
+```powershell
+.venv\Scripts\python.exe -m unittest tests.test_bot.XhsTests -v
 ```
 
 真实环境联调脚本位于 `scripts/live/`（需要已登录的微信）：
@@ -546,7 +669,14 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
 | `live/phase4_live_check.py` | 搜索、会话信息、文件发送、增量读取、关注列表 |
 
 一次性探针与卡片样张在 `scripts/dev/`（OCR/UIA/像素探针、推文与小红书卡片样张），
-它们依赖本机的微信版本与屏幕环境，**不进 CI**。
+它们依赖本机的微信版本与屏幕环境，**不进 CI**。跟小红书相关的几个：
+
+| 脚本 | 用途 |
+|---|---|
+| `dev/xhs_probe.py` | 走 HTTP 路线解析单条笔记，打印标题/作者/图片数/赞评 |
+| `dev/xhs_browser_probe.py` | 强制走浏览器兜底，验证风控与 UA 相关问题 |
+| `dev/xhs_card_demo.py` | 渲染笔记卡片 PNG（只调渲染器，不连微信） |
+| `dev/xhs_engine_demo.py` | 走完整引擎链路：解析 → 卡片 → 发送（需已登录微信） |
 
 单元测试不依赖真实微信：适配层通过注入 `FakeBridge` 验证参数校验与错误语义。
 
@@ -562,12 +692,33 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
 # 2. 把运行时内置进插件包
 node dsh-plugin\scripts\stage-runtime.mjs
 
-# 3. 发布 GitHub Release（需已登录 gh）
-gh release create v0.8.13 dist\lingyu-win32-x64.zip dist\lingyu-setup-x64.exe --title "v0.8.13" --notes "…"
+# 3. 打 tag 并推送（Release 指向这个 tag）
+git tag v0.8.17; git push origin v0.8.17
 
-# 4. 发布 npm 插件（prepack 会自动执行第 2 步）
+# 4. 发布 GitHub Release（需已登录 gh；没装 gh 见下面的 REST 方式）
+gh release create v0.8.17 dist\lingyu-win32-x64.zip dist\lingyu-setup-x64.exe --title "v0.8.17" --notes "…"
+
+# 5. 发布 npm 插件（prepack 会自动执行第 2 步）
 cd dsh-plugin
 npm publish --access public
+```
+
+没有 `gh` 时用 REST API 建 Release 再传资产。token 可以直接复用 git 已保存的凭据，
+不需要另外登录（Git Bash 下）：
+
+```bash
+TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p')
+
+# 建 Release，返回体里的 id / upload_url 后面要用
+curl -s -X POST -H "Authorization: token $TOKEN" \
+  https://api.github.com/repos/<owner>/<repo>/releases \
+  -d '{"tag_name":"v0.8.17","name":"v0.8.17","body":"…"}'
+
+# 上传资产：upload_url 去掉末尾的 {?name,label}，逐个文件传
+curl -s -X POST -H "Authorization: token $TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @dist/lingyu-setup-x64.exe \
+  "https://uploads.github.com/repos/<owner>/<repo>/releases/<id>/assets?name=lingyu-setup-x64.exe"
 ```
 
 产物：
