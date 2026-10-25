@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -221,6 +222,51 @@ class EngineLogForwardingTests(unittest.TestCase):
 
         self.assertIs(fake_engine.on_log, desktop.forward_engine_log)
         ui_log.attach.assert_called_once_with(fake_engine)
+
+
+class WebView2CheckTests(unittest.TestCase):
+    """缺 WebView2 时要在启动前给出可操作的提示。
+
+    pywebview 只认 EdgeChromium 后端；缺运行时 `webview.start()` 抛的异常会被
+    `_show_fatal` 说成「Python.Runtime.dll 加载失败」，用户照着做也解决不了。
+    """
+
+    @staticmethod
+    def _fake_winreg(version=None):
+        class _Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def _open(root, path):
+            if version is None:
+                raise OSError(2, "系统找不到指定的文件")
+            return _Key()
+
+        return SimpleNamespace(
+            HKEY_LOCAL_MACHINE=1,
+            HKEY_CURRENT_USER=2,
+            OpenKey=_open,
+            QueryValueEx=lambda key, name: (version, 1),
+        )
+
+    def test_missing_runtime_is_detected(self):
+        fake = self._fake_winreg()
+        with mock.patch.dict(sys.modules, {"winreg": fake}):
+            self.assertFalse(desktop.webview2_available())
+
+    def test_installed_runtime_is_detected(self):
+        fake = self._fake_winreg(version="130.0.2849.68")
+        with mock.patch.dict(sys.modules, {"winreg": fake}):
+            self.assertTrue(desktop.webview2_available())
+
+    def test_zero_version_counts_as_missing(self):
+        """Edge 更新器会写 `pv=0.0.0.0` 表示未安装。"""
+        fake = self._fake_winreg(version="0.0.0.0")
+        with mock.patch.dict(sys.modules, {"winreg": fake}):
+            self.assertFalse(desktop.webview2_available())
 
 
 if __name__ == "__main__":

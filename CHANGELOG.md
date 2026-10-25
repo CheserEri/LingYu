@@ -2,47 +2,48 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
-## [Unreleased]
+## [0.8.17] - 2026-10-25
 
-**项目结构标准化：`build/` 只放产物、依赖声明补全、加 CI 与 lint。**
+**修掉两个「装了也用不了」的问题，并让安装包本身可以放心分发。**
 
-### 结构调整
+### 修复
 
-- `build/` 里的 **26 个探针/样张脚本原本没入库**——`build/` 被 `.gitignore` 忽略，
-  一次 `git clean -xdf` 就全没了。迁到 `scripts/dev/` 并纳入版本控制。
-- `scripts/phase*.py`（真机联调，会真的发消息）→ `scripts/live/`，与 `dev/` 分开。
-- 根目录的 `wechatauto_logs/`（运行时日志）→ `logs/wechatauto/`，并加入 `.gitignore`。
-- 脚本的路径引导从「依赖当前工作目录」改成由 `__file__` 推导，任意目录都能跑；
-  `ocr_e2e_probe.py` 里写死的 `F:\Code\LingYu` 也一并去掉。
-- 新增 `docs/STRUCTURE.md`（目录与约定）、`CONTRIBUTING.md`、`.editorconfig`、
-  `src/lingyu/py.typed`；README 补「测试/Lint」命令与文档索引。
+- **联系人搜索失败时会抛 `NameError`**（`adapters/wechat.py`）：本地联系人库查询
+  失败的分支里写的是 `logger.debug(...)`，而 `logger` 在该模块从未定义——一进这个
+  `except` 就抛 `NameError: name 'logger' is not defined`，把真正的失败原因
+  （数据库被占用、路径不存在等）整个盖掉，看起来像「搜索功能坏了」。改为模块内的
+  `_listener_logger`。**v0.8.16 的安装包里带着这个 bug**，本版修复。
+- **缺 WebView2 运行时的提示是错的**（`desktop.py`）：界面靠 Edge WebView2 渲染，
+  没装时 `webview.start()` 抛出的异常会被兜底文案说成「Python.Runtime.dll 加载失败，
+  请解除文件锁定」——用户照着做一百遍也没用。现在启动前先查注册表
+  （`EdgeUpdate\Clients\{F3017226-…}`，`pv=0.0.0.0` 视为未装），缺了就弹一句
+  「缺少 Microsoft Edge WebView2 运行时」并直接打开微软官方下载页。
 
-### 依赖与打包
+### 结构与打包
 
+- `build/` 里的 **26 个探针/样张脚本原本没入库**（`build/` 被 `.gitignore` 忽略，
+  一次 `git clean -xdf` 就全没了）→ 迁到 `scripts/dev/` 并纳入版本控制；
+  `scripts/phase*.py`（真机联调）→ `scripts/live/`。
+- 根目录 `wechatauto_logs/`（运行时日志）→ `logs/wechatauto/`，并加入 `.gitignore`。
+- 脚本的路径引导改为由 `__file__` 推导（原来依赖当前工作目录），
+  去掉 `ocr_e2e_probe.py` 里写死的 `F:\Code\LingYu`。
 - **`pip install -e ".[wechat]"` 在 Python 3.12+ 上装不上**：`wechatauto-replica`
   声明了 `winsdk>=1.0.0b10`，而 winsdk 已停止维护、wheel 只到 cp311，pip 会去源码
   编译并失败，连带整个依赖解析一起挂。改为把它移出 extra，用
-  `requirements/wechat.txt` + `--no-deps` 安装——运行期本来就不需要它（桥接层把
-  `winsdk.*` 别名到 `winrt.*`）。README / CONTRIBUTING / TECHNICAL 同步更新。
-- `loguru` 从 `[wechat]` 移到**核心依赖**：`desktop.py` 与 `packaging/wechat_bridge.py`
-  直接用，缺它时有 78 个测试报 `No module named 'loguru'`。
-- 核心依赖补全 `httpx` / `pillow` / `pywebview`（原先只声明了 `mcp`）。
+  `requirements/wechat.txt` + `--no-deps` 安装（运行期由桥接层把 `winsdk.*`
+  别名到 `winrt.*`，本来不需要它）。
+- `loguru` 从 `[wechat]` 移到**核心依赖**（`desktop.py`、`wechat_bridge.py` 直接用，
+  缺它时有 78 个测试报 `No module named 'loguru'`）；核心依赖补全
+  `httpx` / `pillow` / `pywebview`（原先只声明了 `mcp`）。
 - `[tool.setuptools.package-data]` 补 `webui/*`：**原先打 wheel 会丢掉界面文件**，
   `pip install` 后 `--gui` 打开是白屏（冻结包因为 PyInstaller 单独收集，没暴露）。
-- 新增 `[dev]` extra（ruff）、`[tool.ruff]` 配置、`.github/workflows/ci.yml`
-  （lint + 单元测试；打 tag 时构建 zip 并上传 artifact）。
+- 新增 `docs/STRUCTURE.md`、`CONTRIBUTING.md`、`.editorconfig`、`src/lingyu/py.typed`、
+  `[dev]` extra、`[tool.ruff]` 配置与 CI（lint + 单元测试；打 tag 时构建 zip）。
 
-### 修掉的真问题（lint 与干净环境安装暴露）
-
-- `adapters/wechat.py`：联系人库查询失败的分支里写的是 `logger.debug(...)`，而
-  `logger` 在该模块根本没有定义——一进这个 `except` 就抛 `NameError`，把真正的
-  失败原因盖掉。改成模块内的 `_listener_logger`。
-- 清理 7 处未使用导入、3 处无占位符 f-string、2 处一行多语句等（共 27 项 lint 问题，
-  现在 `ruff check src tests packaging scripts` 全绿）。
-
-**验证**：本地 451 项测试全过；另起一个**干净 venv**（Python 3.13）按
-`.[wechat,dev]` + `requirements/wechat.txt` 两步安装，同样 451 项全过——CI 跑的就是
-这两步。wheel 产物已确认包含 `webui/*`、`py.typed` 与 `LICENSE`。
+**验证**：454 项单元测试全过、`ruff` 全绿；另起**干净 venv**（Python 3.13）按
+`.[wechat,dev]` + `requirements/wechat.txt` 两步安装后同样全过（CI 跑的就是这两步）；
+安装包在本机静默覆盖安装后 `--selfcheck` 显示 0.8.17，真实小红书链接解析、
+推文卡片渲染、桌面窗口启动均正常。
 
 ## [0.8.16] - 2026-10-25
 

@@ -17,6 +17,7 @@ import asyncio
 import contextvars
 import io
 import sys
+import webbrowser
 import threading
 from collections import deque
 from pathlib import Path
@@ -458,6 +459,54 @@ def _show_fatal(message: str) -> None:
         pass
 
 
+#: WebView2 运行时的注册表标识（EdgeUpdate 的固定 GUID）。
+_WEBVIEW2_CLIENT = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+#: 微软官方的 Evergreen 引导程序下载页（装一次即可，Win11 通常自带）。
+_WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+
+def webview2_available() -> bool:
+    """本机是否装了 Microsoft Edge WebView2 运行时。
+
+    pywebview 在 Windows 上只支持 EdgeChromium 后端，缺运行时会在
+    ``webview.start()`` 里抛异常；而 :func:`_show_fatal` 的文案是照着
+    「Python.Runtime.dll 加载失败」写的，用户照着排查也解决不了。所以启动前先查一次。
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - Windows 必有 winreg
+        return True
+    paths = (
+        rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLIENT}",
+        rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLIENT}",
+    )
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for path in paths:
+            try:
+                with winreg.OpenKey(root, path) as key:
+                    version, _ = winreg.QueryValueEx(key, "pv")
+            except OSError:
+                continue
+            if str(version or "").strip() not in ("", "0.0.0.0"):
+                return True
+    return False
+
+
+def _prompt_webview2() -> None:
+    """提示缺少 WebView2，并打开官方下载页。"""
+    _show_fatal(
+        "缺少 Microsoft Edge WebView2 运行时，界面无法显示。\n\n"
+        "点「确定」会打开微软官方下载页；装完（只需一次）再启动本程序即可。\n"
+        f"离线安装包地址：{_WEBVIEW2_URL}"
+    )
+    try:
+        webbrowser.open(_WEBVIEW2_URL)
+    except Exception:  # noqa: BLE001 - 打不开浏览器不该再抛一次
+        pass
+
+
 def run() -> None:
     # 先把控制台输出接管到界面运行日志，再启动窗口；这样启动期的日志也不会丢。
     install_console_capture()
@@ -467,6 +516,11 @@ def run() -> None:
     index = webui_dir() / "index.html"
     if not index.is_file():
         raise SystemExit(f"缺少前端入口: {index}")
+
+    # 界面靠 WebView2 渲染，缺了会抛一句与真实原因无关的异常，先查再启动。
+    if not webview2_available():
+        _prompt_webview2()
+        raise SystemExit(1)
 
     # 从 zip 解压的冻结包会被打上「Internet 区域」标记，.NET 拒绝加载
     # 带标记的程序集 → pythonnet 起不来 → 黑屏。这里先自行清除。
