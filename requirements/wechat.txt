@@ -1,0 +1,31 @@
+# 微信自动化运行时里**无法被 pip 正常解析**的那部分。
+#
+# 背景
+# ----
+# `wechatauto-replica` 声明了 `winsdk>=1.0.0b10`，而 winsdk 已停止维护、
+# wheel 只到 cp311 —— 在 Python 3.12/3.13 上 pip 会去源码编译并失败，
+# 连带**整个** `pip install -e ".[wechat]"` 都装不上。
+#
+# 运行期并不需要真正的 winsdk：桥接层 `_install_wechatauto_ocr_compat()`
+# 会把 `winsdk.*` 别名到 `winrt.*`（见 packaging/wechat_bridge.py），
+# OCR 实际走的是 pyproject 里声明的 winrt-* 包。
+#
+# 用法
+# ----
+#     python -m pip install -e ".[wechat]"
+#     python -m pip install --no-deps -r requirements/wechat.txt
+#
+# 因为带 `--no-deps`，它的依赖必须在这里显式列出。已由 pyproject 覆盖的
+# （pillow / httpx / psutil / pywin32 / pyperclip / colorama / comtypes /
+# uiautomation / zstandard / winrt-*）不再重复。
+
+wechatauto-replica==1.2.2.6
+
+# wechatauto 用到、但上面没覆盖到的
+cryptography>=41.0.0
+imageio-ffmpeg>=0.4.9
+
+# 仅「朋友圈」相关能力才需要，本项目的自动化路径不碰，默认不装
+# （opencv-python 有几十 MB，装了也用不上）：
+# pyautogui>=0.9.53
+# opencv-python>=4.8.0

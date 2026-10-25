@@ -1,0 +1,23 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{md,markdown}]
+# Markdown 里行尾两个空格是有意义的换行，不要自动删。
+trim_trailing_whitespace = false
+
+[*.{yml,yaml,json,html,css,js,mjs,ts}]
+indent_size = 2
+
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[*.{iss,isl}]
+# Inno Setup 脚本与语言文件用 CRLF，避免中文在安装向导里变乱码。
+end_of_line = crlf

@@ -668,7 +668,7 @@ class WeChatAdapter:
                 rows = db.search_contact(keyword) or []
                 candidates = self._build_candidates(rows)
             except Exception as exc:
-                logger.debug("查询联系人库失败，回退缓冲区: %s", exc)
+                _listener_logger.debug("查询联系人库失败，回退缓冲区: %s", exc)
                 db = None
 
         if db is None:

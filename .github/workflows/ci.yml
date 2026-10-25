@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + unittest (Windows / py${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: 安装依赖（含微信自动化运行时）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[wechat,dev]"
+          # wechatauto-replica 声明 winsdk（无 cp312+ wheel），必须 --no-deps 单独装
+          python -m pip install --no-deps -r requirements/wechat.txt
+
+      - name: Lint
+        run: python -m ruff check src tests packaging scripts
+
+      - name: 单元测试
+        # 测试全部基于 mock，不需要真实微信；discover 需要 -t . 才能把 tests 当包。
+        run: python -m unittest discover -s tests -t .
+
+  build:
+    name: 构建分发包（仅 tag）
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[wechat]"
+          python -m pip install --no-deps -r requirements/wechat.txt
+
+      - name: 打包 onedir + zip（安装包需要 Inno Setup，CI 上跳过）
+        run: python packaging/build.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lingyu-win32-x64-${{ github.ref_name }}
+          path: dist/lingyu-win32-x64.zip
+          if-no-files-found: error

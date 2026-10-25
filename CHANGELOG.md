@@ -2,6 +2,48 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
+## [Unreleased]
+
+**项目结构标准化：`build/` 只放产物、依赖声明补全、加 CI 与 lint。**
+
+### 结构调整
+
+- `build/` 里的 **26 个探针/样张脚本原本没入库**——`build/` 被 `.gitignore` 忽略，
+  一次 `git clean -xdf` 就全没了。迁到 `scripts/dev/` 并纳入版本控制。
+- `scripts/phase*.py`（真机联调，会真的发消息）→ `scripts/live/`，与 `dev/` 分开。
+- 根目录的 `wechatauto_logs/`（运行时日志）→ `logs/wechatauto/`，并加入 `.gitignore`。
+- 脚本的路径引导从「依赖当前工作目录」改成由 `__file__` 推导，任意目录都能跑；
+  `ocr_e2e_probe.py` 里写死的 `F:\Code\LingYu` 也一并去掉。
+- 新增 `docs/STRUCTURE.md`（目录与约定）、`CONTRIBUTING.md`、`.editorconfig`、
+  `src/lingyu/py.typed`；README 补「测试/Lint」命令与文档索引。
+
+### 依赖与打包
+
+- **`pip install -e ".[wechat]"` 在 Python 3.12+ 上装不上**：`wechatauto-replica`
+  声明了 `winsdk>=1.0.0b10`，而 winsdk 已停止维护、wheel 只到 cp311，pip 会去源码
+  编译并失败，连带整个依赖解析一起挂。改为把它移出 extra，用
+  `requirements/wechat.txt` + `--no-deps` 安装——运行期本来就不需要它（桥接层把
+  `winsdk.*` 别名到 `winrt.*`）。README / CONTRIBUTING / TECHNICAL 同步更新。
+- `loguru` 从 `[wechat]` 移到**核心依赖**：`desktop.py` 与 `packaging/wechat_bridge.py`
+  直接用，缺它时有 78 个测试报 `No module named 'loguru'`。
+- 核心依赖补全 `httpx` / `pillow` / `pywebview`（原先只声明了 `mcp`）。
+- `[tool.setuptools.package-data]` 补 `webui/*`：**原先打 wheel 会丢掉界面文件**，
+  `pip install` 后 `--gui` 打开是白屏（冻结包因为 PyInstaller 单独收集，没暴露）。
+- 新增 `[dev]` extra（ruff）、`[tool.ruff]` 配置、`.github/workflows/ci.yml`
+  （lint + 单元测试；打 tag 时构建 zip 并上传 artifact）。
+
+### 修掉的真问题（lint 与干净环境安装暴露）
+
+- `adapters/wechat.py`：联系人库查询失败的分支里写的是 `logger.debug(...)`，而
+  `logger` 在该模块根本没有定义——一进这个 `except` 就抛 `NameError`，把真正的
+  失败原因盖掉。改成模块内的 `_listener_logger`。
+- 清理 7 处未使用导入、3 处无占位符 f-string、2 处一行多语句等（共 27 项 lint 问题，
+  现在 `ruff check src tests packaging scripts` 全绿）。
+
+**验证**：本地 451 项测试全过；另起一个**干净 venv**（Python 3.13）按
+`.[wechat,dev]` + `requirements/wechat.txt` 两步安装，同样 451 项全过——CI 跑的就是
+这两步。wheel 产物已确认包含 `webui/*`、`py.typed` 与 `LICENSE`。
+
 ## [0.8.16] - 2026-10-25
 
 **新增小红书链接解析：读笔记页内嵌数据，标题/正文/作者/图片/点赞一次拿全；

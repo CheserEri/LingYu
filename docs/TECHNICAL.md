@@ -403,7 +403,12 @@ MCP 客户端 / 桌面界面
 
    ```powershell
    .venv\Scripts\python.exe -m pip install -e ".[wechat]"
+   .venv\Scripts\python.exe -m pip install --no-deps -r requirements\wechat.txt
    ```
+
+   `wechatauto-replica` 声明了 `winsdk>=1.0.0b10`，而 winsdk 的 wheel 只到 cp311，
+   Python 3.12/3.13 上 pip 会去源码编译并失败。运行期由桥接层把 `winsdk.*`
+   别名到 `winrt.*`，所以它必须用 `--no-deps` 单独装（见 `requirements/wechat.txt`）。
 
 ### `get_chat_list` / `get_chat_history` 结果为空
 
@@ -521,24 +526,27 @@ from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-真实环境联调脚本位于 `scripts/`（需要已登录的微信）：
+真实环境联调脚本位于 `scripts/live/`（需要已登录的微信）：
 
 ```powershell
 # 阶段3：以 stdio 协议驱动 Server，覆盖连接/读取/发送/错误路径
-.venv\Scripts\python.exe scripts\phase3_e2e.py --wait-inbound 60
+.venv\Scripts\python.exe scripts\live\phase3_e2e.py --wait-inbound 60
 
 # 阶段4：P1 能力真实微信联调
-.venv\Scripts\python.exe scripts\phase4_live_check.py
+.venv\Scripts\python.exe scripts\live\phase4_live_check.py
 ```
 
 覆盖范围：
 
 | 脚本 | 内容 |
 |---|---|
-| `phase1_live_check.py` | 适配层连接、状态、会话列表 |
-| `phase2_smoke.py` | stdio 握手、工具发现、状态工具调用 |
-| `phase3_e2e.py` | 端到端场景：读取、发送、同名消歧、后端不可用的结构化错误 |
-| `phase4_live_check.py` | 搜索、会话信息、文件发送、增量读取、关注列表 |
+| `live/phase1_live_check.py` | 适配层连接、状态、会话列表 |
+| `live/phase2_smoke.py` | stdio 握手、工具发现、状态工具调用 |
+| `live/phase3_e2e.py` | 端到端场景：读取、发送、同名消歧、后端不可用的结构化错误 |
+| `live/phase4_live_check.py` | 搜索、会话信息、文件发送、增量读取、关注列表 |
+
+一次性探针与卡片样张在 `scripts/dev/`（OCR/UIA/像素探针、推文与小红书卡片样张），
+它们依赖本机的微信版本与屏幕环境，**不进 CI**。
 
 单元测试不依赖真实微信：适配层通过注入 `FakeBridge` 验证参数校验与错误语义。
 

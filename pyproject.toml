@@ -2,19 +2,71 @@
 name = "lingyu"
 version = "0.8.16"
 description = "灵语（LingYu）- 面向通用 AI Agent 的微信桌面自动化工具服务"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["mcp>=2"]
+license = { file = "LICENSE" }
+authors = [{ name = "CheserEri" }]
+keywords = [
+    "wechat",
+    "mcp",
+    "model-context-protocol",
+    "automation",
+    "uiautomation",
+    "agent",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# 运行 MCP 服务 + 桌面助手所需的**公共**依赖（不区分后端）。
+#   mcp      —— MCP 协议服务端
+#   httpx    —— 调用兼容 OpenAI 的模型接口
+#   pillow   —— 推文/小红书卡片渲染
+#   pywebview—— 桌面窗口（--gui），Windows 上会带 pythonnet
+#   loguru   —— 桌面界面的日志 sink，以及 packaging/wechat_bridge.py 直接用
+dependencies = [
+    "mcp>=2",
+    "httpx>=0.27",
+    "pillow>=10",
+    "pywebview>=5",
+    "loguru>=0.7",
+]
 
 [project.scripts]
 lingyu = "lingyu.server:main"
 lingyu-desktop = "lingyu.desktop:run"
 
+[project.urls]
+Homepage = "https://github.com/CheserEri/LingYu"
+Repository = "https://github.com/CheserEri/LingYu"
+Issues = "https://github.com/CheserEri/LingYu/issues"
+Changelog = "https://github.com/CheserEri/LingYu/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/CheserEri/LingYu/blob/main/docs/TECHNICAL.md"
+
 [project.optional-dependencies]
 # 微信桌面自动化所需的运行时依赖（仅在目标 Windows 环境安装）。
 # 适配层通过内置的 wechat_bridge 调用这些库，故需其依赖可用。
+#
+# 注意：**`wechatauto-replica` 不在这个列表里**。它声明了 `winsdk>=1.0.0b10`，
+# 而 winsdk 已停止维护、wheel 只到 cp311，在 Python 3.12/3.13 上 pip 会去源码
+# 编译并失败（本机实测：`Failed building wheel for winsdk`），从而**整个
+# `pip install -e ".[wechat]"` 都会失败**。运行期并不需要它——桥接层的
+# `_install_wechatauto_ocr_compat()` 会把 `winsdk.*` 别名到 `winrt.*`。
+# 所以它单独用 `--no-deps` 安装，见 requirements/wechat.txt。
 wechat = [
-    "loguru>=0.7",
-    "wechatauto-replica==1.2.2.6",
     "wxauto4==41.1.7",
     "uiautomation==2.0.29",
     # 微信 4.x 的部分消息正文是 zstd 压缩帧，缺这个库只能拿到「[类型]」占位符
@@ -25,10 +77,8 @@ wechat = [
     # UIA 一旦失效就彻底发不出消息，日志只有一句
     # `发送消息失败: No module named 'winsdk'`。
     #
-    # 为什么不是 winsdk：它已停止维护，wheel 只到 cp311，Python 3.13 装不上。
-    # winrt 是它的继任者，API 一致、模块名从 `winsdk.windows.*` 变成
-    # `winrt.windows.*`；桥接层的 _install_wechatauto_ocr_compat() 会注册
-    # winsdk 别名，所以 wechatauto 里写死的 import 不用改。
+    # 为什么不是 winsdk：见上，Python 3.12+ 装不上。winrt 是它的继任者，
+    # API 一致、模块名从 `winsdk.windows.*` 变成 `winrt.windows.*`。
     "winrt-runtime>=3.2",
     "winrt-Windows.Foundation>=3.2",
     "winrt-Windows.Foundation.Collections>=3.2",
@@ -38,6 +88,10 @@ wechat = [
     "winrt-Windows.Storage>=3.2",
     "winrt-Windows.Storage.Streams>=3.2",
 ]
+# 开发用（跑 lint / 打包检查），终端用户不需要。
+dev = [
+    "ruff>=0.6",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -45,3 +99,22 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# webui 是纯静态资源目录（没有 __init__.py），必须显式声明；
+# 否则 pip 安装 / 打 wheel 时会丢掉界面文件，`--gui` 打开就是白屏。
+lingyu = ["py.typed", "webui/*.html", "webui/*.js", "webui/*.css"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+extend-exclude = ["vendor", "dsh-plugin", "build", "dist"]
+
+[tool.ruff.lint]
+# 刻意只开「会出真问题」的规则：未定义名、未使用导入、语法级错误。
+# 风格类规则（行宽、引号、导入排序）暂不纳入，避免一次性产生大量无意义 diff。
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# 一次性真机探针：l/t/r/b 是窗口坐标的惯用缩写，改成 left/top/right/bottom 反而更难读。
+"scripts/dev/*" = ["E741"]

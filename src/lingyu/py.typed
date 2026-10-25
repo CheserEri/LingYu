@@ -1,0 +1,1 @@
+# PEP 561 标记：本包自带类型注解，`py.typed` 让下游 mypy/pyright 采用包内注解。

@@ -116,8 +116,6 @@ class EngineLogForwardingTests(unittest.TestCase):
         self.assertIn("[引擎]", self._read("[引擎]"))
 
     def test_engine_levels_are_mapped(self):
-        from loguru import logger
-
         self._install()
         desktop.forward_engine_log(
             SimpleNamespace(level="warning", message="下载失败或超出体积上限，已跳过")

@@ -1336,7 +1336,6 @@ class BridgeAtDetectionTests(unittest.TestCase):
 
     def test_load_keeps_previous_names_when_nothing_readable(self):
         """读不到昵称时保留旧值——清空会让群里 @ 机器人彻底失效。"""
-        module = self._module()
         bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
 
         class _FakeWx:

@@ -127,11 +127,14 @@ dsh plugin --profile web add dsh-lingyu
 ```powershell
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[wechat]"
+# wechatauto-replica 的 winsdk 依赖在 Python 3.12+ 上没有 wheel，必须单独装：
+.venv\Scripts\python.exe -m pip install --no-deps -r requirements\wechat.txt
 ```
 
-`[wechat]` 会安装微信自动化所需的运行时依赖（`wechatauto-replica`、`wxauto4`、
-`uiautomation`、`loguru`）。源码模式与冻结包走同一条桥接路径，
-不需要额外配置外部目录。
+`[wechat]` 会安装微信自动化所需的运行时依赖（`wxauto4`、`uiautomation`、`winrt-*`、
+`zstandard`）；`requirements\wechat.txt` 补上 `wechatauto-replica`（它的 `winsdk`
+依赖已停维护、只到 cp311，运行期由桥接层把 `winsdk.*` 别名到 `winrt.*`，故用
+`--no-deps` 装）。源码模式与冻结包走同一条桥接路径，不需要额外配置外部目录。
 
 桌面窗口（API Key 在界面中填写，无需环境变量）：
 
@@ -199,10 +202,15 @@ python -m venv .venv
 ## 测试
 
 ```powershell
+# 单元测试（全部基于 mock，不需要打开微信）
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
+
+# Lint（与 CI 同一条命令）
+.venv\Scripts\python.exe -m ruff check src tests packaging scripts
 ```
 
-真实环境端到端与联调脚本位于 [scripts/](scripts/)，详见
+真实环境联调脚本位于 [scripts/live/](scripts/live/)（会真的连微信、可能发消息）；
+一次性探针与卡片样张在 [scripts/dev/](scripts/dev/)，不进 CI。详见
 [docs/TECHNICAL.md](docs/TECHNICAL.md#9-测试)。
 
 ## 构建与发布
@@ -232,6 +240,8 @@ npm publish --access public
 ## 文档
 
 - [docs/TECHNICAL.md](docs/TECHNICAL.md) — 架构、工具接口、错误码、故障排查、链接解析、构建
+- [docs/STRUCTURE.md](docs/STRUCTURE.md) — 目录结构与代码约定（`build/` 只放产物）
+- [CONTRIBUTING.md](CONTRIBUTING.md) — 开发环境、测试、改代码的约定
 - [CHANGELOG.md](CHANGELOG.md) — 版本与变更记录
 
 ## 风险提示
