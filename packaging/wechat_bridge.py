@@ -5,6 +5,7 @@ import ctypes
 import html
 import hashlib
 import importlib.util
+import json
 import multiprocessing
 import os
 import queue
@@ -1123,6 +1124,18 @@ class WeChatBridge:
     #: 回查不到时的短暂等待（秒）：监听可能略早于落库，等一下再试一次。
     RAW_LOOKUP_RETRY_DELAY = 0.15
     MESSAGE_DEDUPE_WINDOW_SECONDS = 60.0 # 去重窗口60秒（避免重复但不过长）
+    #: 启动时把各会话的监听水位顶到「库里最新一条」。
+    #:
+    #: 底层 ``wechatauto.db.Listener`` 只推送「水位之后」的消息，而水位会持久化到
+    #: ``<db.workdir>/listener_watermark.json``。它的基线化只在会话**不在**字典里时
+    #: 发生，文件里一旦写进 0 或旧值，之后每次启动都会从那个点重放：机器人停了一晚，
+    #: 第二天启动就把这一晚的群聊全部当成新消息喂进来（实测一个活跃群 2 分钟灌进
+    #: 10759 条，引擎照着历史里的 @ 逐条回复、还去下载几小时前的链接）。
+    #: 这里在注册监听之前主动抬高，从源头掐掉重放。
+    SEED_WATERMARK_ON_START = True
+    #: 消息的「创建时间」比监听启动早多少秒以内仍算新消息。留出注册监听与首次
+    #: 轮询之间的空档，以及本机时钟与消息时间的轻微偏差。
+    STARTUP_GRACE_SECONDS = 10.0
     # 机器人昵称缓存的有效期：微信里改了昵称后不必重启程序——一旦遇到「有 @ 但
     # 没匹配上」的消息，就按这个间隔重读一次昵称（避免每条群消息都去查库）。
     IDENTITY_REFRESH_SECONDS = 60.0
@@ -1192,6 +1205,10 @@ class WeChatBridge:
         self._send_inflight_lock = threading.Lock()
         self._seen_message_ids: dict[str, float] = {}
         self._window_process_ids: set[int] = set()
+        # 「新消息」的判定基准：早于这个时刻创建的都算停机期间的历史。
+        self._listen_started_at = 0.0
+        # 已跳过多少条历史消息（只用于汇总日志，不参与业务判断）。
+        self._history_skipped = 0
 
     @property
     def status(self) -> ConnectionStatus:
@@ -1554,6 +1571,11 @@ class WeChatBridge:
 
         self._running = True
         self._loop = loop
+        # 「新消息」从这一刻开始算：更早产生的都是停机期间的历史，不该被回复。
+        self._listen_started_at = time.time()
+        self._history_skipped = 0
+        # 必须赶在注册监听之前抬高水位，否则底层一启动就会把积压整批推上来。
+        self._seed_listener_watermark()
         self._room_names_by_id.clear()
         self._listen_keys_by_group.clear()
         self._registered_listen_keys_by_group.clear()
@@ -1636,6 +1658,128 @@ class WeChatBridge:
         )
         self._poll_thread.start()
         logger.info("消息监听已启动（轮询模式）")
+
+    # ------------------------------------------------------------ 历史消息隔离
+    def _listener_watermark_path(self) -> str:
+        """底层监听水位文件的路径（与 ``wechatauto.db.Listener`` 的约定一致）。"""
+        db = getattr(self._wx, "_db", None)
+        workdir = str(getattr(db, "workdir", "") or "")
+        if not workdir:
+            return ""
+        return os.path.join(workdir, "listener_watermark.json")
+
+    def _seed_listener_watermark(self) -> int:
+        """把每个会话的监听水位抬到库里最新一条，返回被抬高的会话数。
+
+        为什么不用「当前时间戳」当水位：``sort_seq`` 在 4.x 里恰好是毫秒时间戳，
+        但那是实现细节，别的版本可能是自增序号——写成时间戳会**把之后所有消息
+        全挡掉**。所以只取数据库里真实存在的 ``sort_seq``，且只在它比现有水位大
+        时才抬高，任何情况下都不会让水位跑到库的前面去。
+
+        调用时机很关键：必须在 ``AddListenAll`` / ``AddListenChat`` 之前。底层
+        的 ``Listener.__init__`` 会读这个文件，注册监听时只在「会话不在水位字典
+        里」才做基线化——文件里是 0 或旧值时它不会纠正，于是每次启动都重放。
+        """
+        if not self.SEED_WATERMARK_ON_START:
+            return 0
+        path = self._listener_watermark_path()
+        db = getattr(self._wx, "_db", None)
+        if not path or db is None:
+            return 0
+
+        stored: dict[str, int] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError):
+            raw = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                try:
+                    stored[str(key)] = int(value)
+                except (TypeError, ValueError):
+                    continue
+
+        try:
+            sessions = db.get_sessions(limit=500) or []
+        except Exception as exc:
+            logger.debug(f"读取会话列表失败，跳过监听水位初始化: {exc}")
+            return 0
+
+        raised = 0
+        for session in sessions:
+            username = str(session.get("username") or "")
+            if not username:
+                continue
+            try:
+                rows = db.get_messages(username, limit=1)
+            except Exception:
+                # 单个会话读不出来（分片缺失/正在同步）就跳过，别拖住整个启动。
+                continue
+            if not rows:
+                continue
+            try:
+                newest = int(rows[0].get("sort_seq") or 0)
+            except (TypeError, ValueError):
+                continue
+            if newest > stored.get(username, 0):
+                stored[username] = newest
+                raised += 1
+
+        if not raised:
+            return 0
+
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(stored, handle, ensure_ascii=False, indent=0)
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.debug(f"写入监听水位失败: {exc}")
+            return 0
+
+        # 断线重连时 Listener 已存在，文件要等下次构造才生效，这里同步到内存。
+        listener = getattr(self._wx, "_listener", None)
+        watermark = getattr(listener, "_watermark", None)
+        if isinstance(watermark, dict):
+            try:
+                for key, value in stored.items():
+                    if value > watermark.get(key, 0):
+                        watermark[key] = value
+                listener.save_watermark(force=True)
+            except Exception:
+                pass
+
+        logger.info(
+            f"已把 {raised} 个会话的监听水位顶到最新："
+            "启动前收到的历史消息不会被当成新消息处理"
+        )
+        return raised
+
+    def _is_pre_start_history(self, msg) -> bool:
+        """这条消息是否产生于本次监听启动之前（= 停机期间的历史）。
+
+        只有 DB 回调这条路带 ``create_time``（wechatauto）；UI 轮询后端没有这个
+        字段，无法判断，一律按新消息处理——宁可多回一条，也不能把真消息吞掉。
+        """
+        started = self._listen_started_at
+        created = getattr(msg, "create_time", None)
+        if not started or not created:
+            return False
+        try:
+            created = float(created)
+        except (TypeError, ValueError):
+            return False
+        if created >= started - self.STARTUP_GRACE_SECONDS:
+            return False
+        self._history_skipped += 1
+        if self._history_skipped == 1 or self._history_skipped % 1000 == 0:
+            logger.info(
+                f"已跳过 {self._history_skipped} 条启动前的历史消息"
+                f"（最近一条产生于 {int(started - created)} 秒前）"
+            )
+        return True
 
     def _resolve_wechatauto_group_id(self, group: str) -> str | None:
         """将群名解析为群聊 wxid，避免同名联系人优先匹配。"""
@@ -1831,6 +1975,11 @@ class WeChatBridge:
                 or lower_id.startswith("gh_")
             ):
                 logger.debug(f"已忽略公众号/系统账号消息: {chat_id}")
+                return
+
+            # 停机期间产生的历史消息一律丢弃：否则一开机就把昨晚群聊里的 @
+            # 全部当成新消息回一遍，链接也会照着几小时前的分享重新下载。
+            if self._is_pre_start_history(msg):
                 return
 
             room_name = room_name or self._chat_display_name(chat_id)

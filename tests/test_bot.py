@@ -1172,6 +1172,145 @@ class BridgeNormalizeTests(unittest.TestCase):
         self.assertEqual(normalize(raw), "只有标题")
 
 
+class _FakeHistoryDb:
+    """只实现启动水位初始化用到的三个接口（workdir / 会话列表 / 最新一条）。"""
+
+    def __init__(self, workdir, stored, newest, broken=()):
+        self.workdir = str(workdir)
+        self._newest = dict(newest)
+        self.broken = set(broken)
+        path = Path(self.workdir) / "listener_watermark.json"
+        path.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+
+    def get_sessions(self, limit=500):
+        return [{"username": name} for name in self._newest]
+
+    def get_messages(self, user, limit=1):
+        if user in self.broken:
+            raise RuntimeError("分片缺失")
+        return [{"sort_seq": self._newest[user]}]
+
+
+class BridgeStartupHistoryTests(unittest.TestCase):
+    """启动时不能把停机期间的历史消息当成新消息。
+
+    背景：底层 ``wechatauto`` 的 Listener 从持久化水位续传，机器人停一晚再启动，
+    这一晚的群聊会被整批重放（实测一个活跃群 2 分钟灌进 10759 条，引擎照着历史里
+    的 @ 逐条回复，还去下载几小时前分享的链接）。两道防线：
+
+    1. 注册监听前把水位顶到库里最新一条——从源头不重放；
+    2. 兜底按消息真实创建时间丢弃早于启动的消息——水位再次被写坏也不至于回错。
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_history", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _bridge(self, started_at):
+        module = self._module()
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._listen_started_at = started_at
+        bridge._history_skipped = 0
+        return bridge
+
+    def test_message_created_before_start_is_history(self):
+        bridge = self._bridge(time.time())
+        msg = SimpleNamespace(create_time=time.time() - 3600)
+        self.assertTrue(bridge._is_pre_start_history(msg))
+        self.assertEqual(bridge._history_skipped, 1)
+
+    def test_message_created_after_start_is_new(self):
+        started = time.time()
+        bridge = self._bridge(started)
+        msg = SimpleNamespace(create_time=started + 1)
+        self.assertFalse(bridge._is_pre_start_history(msg))
+        self.assertEqual(bridge._history_skipped, 0)
+
+    def test_grace_window_keeps_near_start_messages(self):
+        """刚启动前几秒的消息可能是正常到达的，别误杀。"""
+        started = time.time()
+        bridge = self._bridge(started)
+        msg = SimpleNamespace(create_time=started - 3)
+        self.assertFalse(bridge._is_pre_start_history(msg))
+
+    def test_missing_create_time_is_treated_as_new(self):
+        """UI 轮询后端没有 create_time，无法判断时宁可多回也不能吞消息。"""
+        bridge = self._bridge(time.time())
+        self.assertFalse(bridge._is_pre_start_history(SimpleNamespace()))
+
+    def test_no_baseline_before_listening_starts(self):
+        bridge = self._bridge(0.0)
+        msg = SimpleNamespace(create_time=time.time() - 3600)
+        self.assertFalse(bridge._is_pre_start_history(msg))
+
+    def test_handle_message_drops_history_before_any_processing(self):
+        """历史消息在解析正文、查库之前就返回，不产生任何副作用。"""
+        bridge = self._bridge(time.time())
+        msg = SimpleNamespace(
+            create_time=time.time() - 7200, content="早上好", sender="张三"
+        )
+        bridge._handle_message("123@chatroom", msg, room_name="某群")
+        self.assertEqual(bridge._history_skipped, 1)
+
+    def test_seed_raises_stale_watermark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _FakeHistoryDb(
+                tmp,
+                stored={"g1@chatroom": 100, "g2@chatroom": 0},
+                newest={"g1@chatroom": 900, "g2@chatroom": 500},
+            )
+            bridge = self._bridge(0.0)
+            bridge._wx = SimpleNamespace(_db=db)
+            self.assertEqual(bridge._seed_listener_watermark(), 2)
+            data = json.loads(
+                (Path(tmp) / "listener_watermark.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(data["g1@chatroom"], 900)
+            self.assertEqual(data["g2@chatroom"], 500)
+
+    def test_seed_never_lowers_watermark(self):
+        """水位只能抬高：写小了会把已处理过的消息又推一遍。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _FakeHistoryDb(
+                tmp,
+                stored={"g1@chatroom": 999},
+                newest={"g1@chatroom": 100},
+            )
+            bridge = self._bridge(0.0)
+            bridge._wx = SimpleNamespace(_db=db)
+            self.assertEqual(bridge._seed_listener_watermark(), 0)
+            data = json.loads(
+                (Path(tmp) / "listener_watermark.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(data["g1@chatroom"], 999)
+
+    def test_seed_survives_unreadable_session(self):
+        """单个会话读不出来（分片缺失/正在同步）不能拖住启动。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _FakeHistoryDb(
+                tmp,
+                stored={},
+                newest={"g1@chatroom": 700, "g2@chatroom": 300},
+                broken={"g2@chatroom"},
+            )
+            bridge = self._bridge(0.0)
+            bridge._wx = SimpleNamespace(_db=db)
+            self.assertEqual(bridge._seed_listener_watermark(), 1)
+            data = json.loads(
+                (Path(tmp) / "listener_watermark.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("g2@chatroom", data)
+
+
 class BridgeCardLookupTests(unittest.TestCase):
     """卡片消息正文回查。
 
