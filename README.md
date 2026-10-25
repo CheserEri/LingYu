@@ -86,7 +86,16 @@
   含视频时再下载视频一并回发。
   外文推文会**自动翻译成中文**（可关），卡片正文用译文、原文缩成灰色小字附在下面；
   中日韩英俄阿泰等文字**按字符选字体**，不会出现豆腐块。
-- **微博 / 小红书**要求带 Cookie，需在同一页填一份 Netscape 格式的 `cookies.txt`。
+- **小红书**直接读笔记页里服务端渲染的 `__INITIAL_STATE__`（标题/正文/作者/图片/
+  点赞），不需要签名、也不需要登录——关键是请求要用**移动端 UA**（桌面 UA 会被
+  要求登录）。短链 `xhslink.com` / `xhslink.cn` 会自动展开，分享文案里**不带
+  `http://` 的裸短链**也能识别。解析结果会和推文一样**渲染成卡片图**（同一套
+  版式：头像、昵称、标题+正文、配图竖排长图、赞/评论），超过 4 张图时页脚标
+  「共 N 张图」；视频笔记在卡片之后再下载视频回发，图文笔记只发卡片。
+  注意：链接必须带 `xsec_token`（App 里「分享 → 复制链接」拿到的就有），手工拼的
+  `explore/<id>` 会被跳到「当前笔记暂时无法浏览」；极少数笔记仍要求登录态，这时才
+  需要 `cookies.txt`。
+- **微博**等站点要求带 Cookie，需在同一页填一份 Netscape 格式的 `cookies.txt`。
 - 群里**不必 @ 机器人**，只要消息里有链接就会先回一句固定提示（默认「正在解析链接」，
   不经过大模型，文案可改），再把解析结果发回。
 - 下载目录有**总占用上限**（默认 1 GB），超出后每次下载完自动删掉**最旧**的文件。
@@ -207,7 +216,7 @@ python -m venv .venv
 node dsh-plugin\scripts\stage-runtime.mjs
 
 # 3. 发布 GitHub Release（需已登录 gh）
-gh release create v0.8.13 dist\lingyu-win32-x64.zip dist\lingyu-setup-x64.exe --title "v0.8.13" --notes "…"
+gh release create v0.8.16 dist\lingyu-win32-x64.zip dist\lingyu-setup-x64.exe --title "v0.8.16" --notes "…"
 
 # 4. 发布 npm 插件（prepack 会自动执行第 2 步）
 cd dsh-plugin

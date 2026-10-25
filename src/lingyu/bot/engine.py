@@ -27,7 +27,8 @@ from typing import Any, Callable
 from ..adapters.wechat import WeChatAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
-from . import storage, tweet
+from . import storage, tweet, xiaohongshu
+from .card import note_to_card
 from .links import (
     DownloadOutcome,
     LinkResolver,
@@ -779,8 +780,9 @@ class BotEngine:
     async def _download_and_send(self, record: MessageRecord) -> None:
         """把触发消息里链接的内容发回当前聊天。
 
-        X（Twitter）推文走特殊流程：先本地渲染一张推文卡片图发出去，
-        推文里**含视频**时再下载视频一并回发；其它链接沿用「下载后回发」。
+        X（Twitter）推文与小红书笔记走特殊流程：先本地渲染一张卡片图发出去
+        （两者共用同一套版式），推文/笔记**含视频**时再下载视频一并回发；
+        其它链接沿用「下载后回发」。
         """
         urls = extract_urls(record.content)[: self._config.link_download_max]
         if not urls:
@@ -791,6 +793,8 @@ class BotEngine:
             for url in urls:
                 if tweet.is_tweet_url(url):
                     await self._send_tweet(record, url, outdir)
+                elif xiaohongshu.is_xhs_url(url):
+                    await self._send_xhs(record, url, outdir)
                 else:
                     await self._download_and_send_one(record, url, outdir)
         finally:
@@ -861,6 +865,61 @@ class BotEngine:
             await self._send_tweet_video(record, info, url, outdir)
         else:
             self._log("info", f"推文无视频，仅发卡片：{url}")
+
+    async def _send_xhs(self, record: MessageRecord, url: str, outdir: Path) -> None:
+        """小红书笔记：发卡片图（与推文卡片同一套版式）；视频笔记再下载视频回发。
+
+        图文笔记**只发卡片**：原图常有 5～9 张，逐张发等于往聊天里刷 N 条消息，
+        和「一条链接回发一份内容」的语义不符；卡片把标题、正文、配图竖排长图
+        一次给全，信息不丢。
+        """
+        loop = asyncio.get_running_loop()
+        # 分享出来的是短链（xhslink.cn/o/xxx），本身没有笔记 ID，必须先展开成
+        # 带 xsec_token 的真实地址——下载那一路会自己展开，卡片这条路得先做。
+        target = await loop.run_in_executor(
+            None, self._links.expand_short_link, url
+        )
+        note = await loop.run_in_executor(
+            None,
+            lambda: xiaohongshu.note_for(
+                target,
+                cookies_file=usable_cookies_file(self._config.link_cookies_file),
+                timeout=self._config.link_parse_timeout,
+                logger=self._log,
+            ),
+        )
+        if not note.ok:
+            # 解析不出来（缺 xsec_token / 笔记已删 / 要求登录）时退回通用下载：
+            # 那一路会把失败原因当提示发进聊天，用户能知道到底怎么了。
+            self._log("warning", f"小红书解析失败，改为直接下载：{url}｜{note.error}")
+            await self._download_and_send_one(record, url, outdir)
+            return
+
+        sent_card = False
+        if self._config.link_xhs_card_enabled:
+            card_path = await loop.run_in_executor(
+                None,
+                lambda: tweet.render_card(
+                    note_to_card(note),
+                    outdir,
+                    timeout=self._config.link_parse_timeout,
+                    logger=self._log,
+                ),
+            )
+            if card_path:
+                sent_card = await self._send_file(record.chat, card_path, "小红书卡片")
+            else:
+                self._log("warning", f"小红书卡片渲染失败：{url}")
+
+        if note.is_video:
+            # 视频在卡片之后再发一条；下载/重试/失败提示都复用通用那一路。
+            await self._download_and_send_one(record, url, outdir)
+        elif not sent_card:
+            # 卡片关了或没渲染出来：图文退回通用下载，至少给出「暂不支持下载」的
+            # 提示，而不是链接发出去石沉大海。
+            await self._download_and_send_one(record, url, outdir)
+        else:
+            self._log("info", f"小红书图文笔记，仅发卡片：{url}")
 
     async def _translate_tweet(self, info: "tweet.Tweet", url: str) -> None:
         """把外文推文正文翻成中文，写进 ``info.translation``。

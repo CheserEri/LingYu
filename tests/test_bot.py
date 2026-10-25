@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -23,6 +24,7 @@ from lingyu.adapters.wechat import (
 from lingyu.bot import BotConfig, BotEngine, get_persona, reset_persona
 from lingyu.bot import browser as browser_mod
 from lingyu.bot import douyin as douyin_mod
+from lingyu.bot import xiaohongshu as xhs_mod
 from lingyu.bot import engine as engine_mod
 from lingyu.bot import links as links_mod
 from lingyu.bot.links import LinkInfo, extract_urls, format_link_block
@@ -3141,6 +3143,429 @@ class DouyinLinkTests(unittest.TestCase):
         self.assertIsNone(path)
 
 
+class XhsTests(unittest.TestCase):
+    """小红书：URL 识别、状态解析、Cookie 过滤。"""
+
+    # 与线上 ``window.__INITIAL_STATE__.note.noteDetailMap`` 同构的样例
+    STATE = {
+        "note": {
+            "noteDetailMap": {
+                "64f0a1b2000000001f00abcd": {
+                    "note": {
+                        "noteId": "64f0a1b2000000001f00abcd",
+                        "title": "周末去了趟山里",
+                        "desc": "空气很好\n下次还来",
+                        "type": "normal",
+                        "user": {"nickname": "阿柴"},
+                        "imageList": [
+                            {
+                                "urlDefault": "https://sns-img/default-1.jpg",
+                                "infoList": [
+                                    {"imageScene": "WB_PRV", "url": "https://sns-img/prev-1.jpg"},
+                                    {"imageScene": "WB_DFT", "url": "https://sns-img/dft-1.jpg"},
+                                ],
+                            },
+                            {"urlPre": "https://sns-img/pre-2.jpg"},
+                        ],
+                        "interactInfo": {"likedCount": "1.2万"},
+                    }
+                }
+            }
+        }
+    }
+
+    def test_is_xhs_url(self):
+        for url in (
+            "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd",
+            "https://www.xiaohongshu.com/discovery/item/601a87f50000000001000a07",
+            "http://xhslink.com/a/AbCdEf",
+            "https://xhslink.com/m/1gJ5tO",
+            "https://xhslink.cn/o/C9IHM7t3Ir",
+        ):
+            self.assertTrue(xhs_mod.is_xhs_url(url), url)
+        for url in (
+            "https://example.com/explore/64f0a1b2000000001f00abcd",
+            "https://www.douyin.com/video/123",
+            "",
+        ):
+            self.assertFalse(xhs_mod.is_xhs_url(url), url)
+
+    def test_extract_note_id(self):
+        cases = {
+            "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd?xsec_token=ABC": "64f0a1b2000000001f00abcd",
+            "https://www.xiaohongshu.com/discovery/item/601a87f50000000001000a07": "601a87f50000000001000a07",
+            "https://www.xiaohongshu.com/user/profile/5febdf07000000000100591e/64f0a1b2000000001f00abcd": "64f0a1b2000000001f00abcd",
+        }
+        for url, expected in cases.items():
+            self.assertEqual(xhs_mod.extract_note_id(url), expected, url)
+        # 短链本身没有笔记 ID，得先展开
+        self.assertEqual(xhs_mod.extract_note_id("http://xhslink.com/a/AbCdEf"), "")
+
+    def test_parse_likes(self):
+        self.assertEqual(xhs_mod.parse_likes("1.2万"), 12000)
+        self.assertEqual(xhs_mod.parse_likes("3.4亿"), 340000000)
+        self.assertEqual(xhs_mod.parse_likes(1234), 1234)
+        self.assertEqual(xhs_mod.parse_likes(""), 0)
+        self.assertEqual(xhs_mod.parse_likes("赞"), 0)
+
+    def test_extract_state_tolerates_undefined(self):
+        """状态是 JS 字面量，里面会出现 undefined（不是合法 JSON）。"""
+        html = (
+            "<script>window.__INITIAL_STATE__="
+            '{"note":{"noteDetailMap":{},"firstNoteId":undefined}};'
+            "</script>"
+        )
+        state = xhs_mod.extract_state(html)
+        self.assertIsInstance(state, dict)
+        self.assertIsNone(state["note"]["firstNoteId"])
+
+    def test_note_from_state(self):
+        note = xhs_mod.note_from_state(self.STATE, "64f0a1b2000000001f00abcd")
+        self.assertIsNotNone(note)
+        self.assertTrue(note.ok)
+        self.assertEqual(note.title, "周末去了趟山里")
+        self.assertEqual(note.uploader, "阿柴")
+        self.assertIn("空气很好", note.description)
+        self.assertEqual(note.likes, 12000)
+        # WB_DFT 优先（原图尺度），没有 infoList 的退回 urlPre
+        self.assertEqual(
+            note.images, ["https://sns-img/dft-1.jpg", "https://sns-img/pre-2.jpg"]
+        )
+        self.assertEqual(note.kind, "normal")
+        self.assertFalse(note.is_video)
+        self.assertEqual(note.kind_label, "图文（2 张）")
+
+    def test_note_from_state_without_note(self):
+        self.assertIsNone(xhs_mod.note_from_state({"note": {"noteDetailMap": {}}}, "x"))
+        self.assertIsNone(xhs_mod.note_from_state(None, "x"))
+
+    def test_note_from_mobile_state(self):
+        """移动 H5 的数据在 noteData.data.noteData（免登录走的就是这条）。"""
+        state = {
+            "noteData": {
+                "data": {
+                    "noteData": {
+                        "title": "国家电网数据接入 Home Assistant｜两种方法",
+                        "desc": "接入前：先下载「网上国网」App",
+                        "type": "normal",
+                        "user": {"nickName": "阿景造点东西"},
+                        "interactInfo": {"likedCount": "397"},
+                        "imageList": [
+                            {
+                                "url": "http://sns-webpic/fallback.jpg",
+                                "infoList": [
+                                    {"imageScene": "H5_PRV", "url": "http://sns-webpic/prev.jpg"},
+                                    {"imageScene": "H5_DTL", "url": "http://sns-webpic/dtl.jpg"},
+                                ],
+                            },
+                            {"url": "http://sns-webpic/only-url.jpg"},
+                        ],
+                    }
+                }
+            }
+        }
+        note = xhs_mod.note_from_state(state, "6ad706aa0000000025037430")
+        self.assertIsNotNone(note)
+        self.assertTrue(note.ok)
+        self.assertEqual(note.title, "国家电网数据接入 Home Assistant｜两种方法")
+        self.assertEqual(note.uploader, "阿景造点东西")
+        self.assertEqual(note.likes, 397)
+        # H5_DTL（1080 宽）优先，没有 infoList 的退回顶层 url
+        self.assertEqual(
+            note.images, ["http://sns-webpic/dtl.jpg", "http://sns-webpic/only-url.jpg"]
+        )
+
+    def test_unwrap_redirect(self):
+        """桌面 UA 打开分享链会被甩到 /login，真地址藏在 redirectPath 里。"""
+        inner = (
+            "http://www.xiaohongshu.com/discovery/item/6ad706aa0000000025037430"
+            "?xsec_token=CBCbrroM%3D"
+        )
+        wrapped = (
+            "https://www.xiaohongshu.com/login?redirectPath="
+            + urllib.parse.quote(inner, safe="")
+        )
+        self.assertEqual(xhs_mod.unwrap_redirect(wrapped), inner)
+        # 不是小红书地址 / 没有 redirectPath 时原样返回
+        self.assertEqual(xhs_mod.unwrap_redirect("https://x.com/a"), "https://x.com/a")
+
+    def test_user_agent_is_mobile(self):
+        """桌面 UA 一定被要求登录，HTTP 路线必须用移动 UA。"""
+        self.assertIn("iPhone", xhs_mod.user_agent())
+
+    def test_parse_video_note(self):
+        """视频笔记：h264 masterUrl 当直链，kind=video。"""
+        card = {
+            "note_id": "64f0a1b2000000001f00abcd",
+            "title": "vlog",
+            "desc": "第一次拍",
+            "type": "video",
+            "user": {"nickName": "阿柴"},
+            "image_list": [{"url_default": "https://sns-img/cover.jpg"}],
+            "video": {
+                "media": {"stream": {"h264": [{"masterUrl": "https://sns-video/1.mp4"}]}}
+            },
+            "interact_info": {"liked_count": "88"},
+        }
+        note = xhs_mod.parse_note(card)
+        self.assertTrue(note.ok)
+        self.assertEqual(note.video_url, "https://sns-video/1.mp4")
+        self.assertEqual(note.uploader, "阿柴")
+        self.assertEqual(note.likes, 88)
+        self.assertTrue(note.is_video)
+        self.assertEqual(note.kind_label, "视频")
+
+    def test_cookie_header_filters_domain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cookies.txt"
+            path.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".xiaohongshu.com\tTRUE\t/\tFALSE\t0\tweb_session\tabc\n"
+                ".xiaohongshu.com\tTRUE\t/\tFALSE\t0\ta1\txyz\n"
+                ".douyin.com\tTRUE\t/\tFALSE\t0\tsessionid\tnope\n",
+                encoding="utf-8",
+            )
+            header = xhs_mod._cookie_header(str(path))
+        self.assertIn("web_session=abc", header)
+        self.assertIn("a1=xyz", header)
+        self.assertNotIn("sessionid", header)
+
+    def test_cookie_header_missing_file(self):
+        self.assertEqual(xhs_mod._cookie_header(""), "")
+        self.assertEqual(xhs_mod._cookie_header("X:/no-such-cookies.txt"), "")
+
+    def test_error_message_from_404_url(self):
+        """没有 xsec_token 时会被 302 到 /404，错误说明要如实带回来。"""
+        url = (
+            "https://www.xiaohongshu.com/404?source=/404/sec_x"
+            "&error_code=300031&error_msg=%E5%BD%93%E5%89%8D%E7%AC%94%E8%AE%B0"
+        )
+        self.assertEqual(xhs_mod._error_from_url(url), "当前笔记")
+
+    def test_parse_note_keeps_avatar_and_comments(self):
+        """头像与评论数也要解析出来（卡片头部和页脚要用）。"""
+        note = xhs_mod.parse_note(
+            {
+                "noteId": "n1",
+                "title": "标题",
+                "desc": "正文",
+                "type": "normal",
+                "user": {"nickname": "阿柴", "avatar": "https://sns-avatar/a.jpg"},
+                "imageList": [{"urlDefault": "https://sns-img/1.jpg"}],
+                "interactInfo": {"likedCount": "397", "commentCount": "2.3万"},
+            }
+        )
+        self.assertEqual(note.avatar, "https://sns-avatar/a.jpg")
+        self.assertEqual(note.comments, 23000)
+
+    def test_note_to_card_maps_fields(self):
+        """笔记 → 卡片：标题与正文合并、副标题带类型、互动口径改成赞/评论。"""
+        from lingyu.bot.card import note_to_card
+
+        note = xhs_mod.parse_note(
+            {
+                "noteId": "n2",
+                "title": "国家电网数据接入 Home Assistant",
+                "desc": "两种方法都试过了",
+                "type": "normal",
+                "user": {"nickname": "阿景造点东西", "avatar": "https://sns-avatar/b.jpg"},
+                "imageList": [
+                    {"urlDefault": "https://sns-img/1.jpg"},
+                    {"urlDefault": "https://sns-img/2.jpg"},
+                ],
+                "interactInfo": {"likedCount": "397", "commentCount": "12"},
+            }
+        )
+        card = note_to_card(note)
+        self.assertEqual(card.id, "n2")
+        self.assertEqual(
+            card.text, "国家电网数据接入 Home Assistant\n\n两种方法都试过了"
+        )
+        self.assertEqual(card.author_name, "阿景造点东西")
+        self.assertEqual(card.subtitle, "小红书 · 图文（2 张）")
+        self.assertEqual(card.avatar_url, "https://sns-avatar/b.jpg")
+        self.assertEqual(card.photos, ["https://sns-img/1.jpg", "https://sns-img/2.jpg"])
+        self.assertEqual((card.likes, card.likes_label), (397, "赞"))
+        self.assertEqual((card.replies, card.replies_label), (12, "评论"))
+        self.assertEqual(card.photo_total, 2)
+        # 落盘前缀用 xhs，别和推文卡片混在一起
+        self.assertEqual(card.prefix, "xhs")
+        # 图文笔记没有播放角标
+        self.assertEqual(card.video_poster, "")
+        self.assertFalse(card.has_video)
+
+    def test_note_to_card_does_not_repeat_title(self):
+        """正文本身以标题开头时不要再拼一遍标题。"""
+        from lingyu.bot.card import note_to_card
+
+        note = xhs_mod.parse_note(
+            {"noteId": "n3", "title": "标题即首行", "desc": "标题即首行\n后面还有内容"}
+        )
+        self.assertEqual(note_to_card(note).text, "标题即首行\n后面还有内容")
+
+    def test_note_to_card_video_uses_first_image_as_poster(self):
+        from lingyu.bot.card import note_to_card
+
+        note = xhs_mod.parse_note(
+            {
+                "noteId": "n4",
+                "title": "视频笔记",
+                "type": "video",
+                "imageList": [{"urlDefault": "https://sns-img/cover.jpg"}],
+                "video": {
+                    "media": {"stream": {"h264": [{"masterUrl": "https://sns-v/1.mp4"}]}}
+                },
+            }
+        )
+        card = note_to_card(note)
+        self.assertTrue(card.has_video)
+        self.assertEqual(card.video_poster, "https://sns-img/cover.jpg")
+
+    def test_render_card_accepts_card_data(self):
+        """渲染器改吃 CardData：小红书笔记也能直接出图，文件名带 xhs 前缀。"""
+        from lingyu.bot import tweet as tweet_mod
+        from lingyu.bot.card import note_to_card
+
+        note = xhs_mod.parse_note(
+            {
+                "noteId": "n5",
+                "title": "标题",
+                "desc": "正文内容，够长才能看出折行是否正确。",
+                "user": {"nickname": "阿柴"},
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = tweet_mod.render_card(note_to_card(note), tmp, timeout=5)
+            self.assertIsNotNone(path)
+            self.assertEqual(Path(path).name, "xhs-n5.png")
+            self.assertTrue(Path(path).is_file())
+
+    def test_card_footer_marks_extra_photos(self):
+        """只画得下前几张时，页脚标「共 N 张图」——多一行页脚，卡片更高。"""
+        from PIL import Image
+
+        from lingyu.bot import tweet as tweet_mod
+        from lingyu.bot.card import CardData
+
+        base = dict(id="x1", text="正文", author_name="阿柴")
+        plain = CardData(**base)
+        many = CardData(
+            **{**base, "id": "x2"},
+            photos=["https://sns-img/1.jpg", "https://sns-img/2.jpg"],
+            photo_total=6,
+        )
+        original = tweet_mod._load_image
+        tweet_mod._load_image = lambda url, timeout: Image.new("RGB", (400, 300), (9, 9, 9))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                plain_path = tweet_mod.render_card(plain, tmp, timeout=5)
+                many_path = tweet_mod.render_card(many, tmp, timeout=5)
+                with Image.open(plain_path) as img:
+                    plain_h = img.size[1]
+                with Image.open(many_path) as img:
+                    many_h = img.size[1]
+        finally:
+            tweet_mod._load_image = original
+        self.assertGreater(many_h, plain_h)
+
+
+class XhsLinkTests(unittest.TestCase):
+    """小红书在 links.py 里的接线：解析走 SSR 状态，视频走直链下载。"""
+
+    def tearDown(self):
+        xhs_mod.forget_cached()
+
+    def test_resolve_routes_to_xhs_parser(self):
+        resolver = links_mod.LinkResolver()
+        note = xhs_mod.XhsNote(
+            note_id="64f0a1b2000000001f00abcd",
+            ok=True,
+            title="周末去了趟山里",
+            uploader="阿柴",
+            description="空气很好",
+            images=["https://sns-img/1.jpg", "https://sns-img/2.jpg"],
+            likes=12000,
+            kind="normal",
+        )
+        with mock.patch.object(xhs_mod, "note_for", lambda *a, **k: note), \
+             mock.patch.object(
+                 links_mod, "load_yt_dlp", side_effect=AssertionError("不该加载 yt-dlp")
+             ):
+            info = resolver._resolve_sync(
+                "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd?xsec_token=ABC"
+            )
+        self.assertTrue(info.ok)
+        self.assertEqual(info.label, "小红书")
+        self.assertEqual(info.title, "周末去了趟山里")
+        self.assertEqual(info.uploader, "阿柴")
+        self.assertEqual(info.extractor, "小红书")
+        self.assertEqual(info.meta, "类型：图文（2 张） · 12000 赞")
+        self.assertFalse(info.is_media)
+        self.assertIn("[小红书]", info.summary())
+
+    def test_resolve_video_marks_media(self):
+        resolver = links_mod.LinkResolver()
+        note = xhs_mod.XhsNote(
+            note_id="64f0a1b2000000001f00abcd",
+            ok=True,
+            title="vlog",
+            video_url="https://sns-video/1.mp4",
+            kind="video",
+        )
+        with mock.patch.object(xhs_mod, "note_for", lambda *a, **k: note):
+            info = resolver._resolve_sync(
+                "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd"
+            )
+        self.assertTrue(info.is_media)
+        self.assertEqual(info.meta, "类型：视频")
+
+    def test_resolve_reports_failure(self):
+        resolver = links_mod.LinkResolver()
+        note = xhs_mod.XhsNote(
+            note_id="x", ok=False, error="当前笔记暂时无法浏览"
+        )
+        with mock.patch.object(xhs_mod, "note_for", lambda *a, **k: note):
+            info = resolver._resolve_sync(
+                "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd"
+            )
+        self.assertFalse(info.ok)
+        self.assertIn("无法浏览", info.error)
+
+    def test_download_video_note(self):
+        resolver = links_mod.LinkResolver()
+        note = xhs_mod.XhsNote(
+            note_id="x", ok=True, title="vlog", video_url="https://v/1.mp4", kind="video"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "xhs.mp4"
+            target.write_bytes(b"v")
+            with mock.patch.object(xhs_mod, "note_for", lambda *a, **k: note), \
+                 mock.patch.object(
+                     xhs_mod, "download_video", lambda *a, **k: str(target)
+                 ):
+                outcome = resolver._attempt_download(
+                    "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd", tmp, 0
+                )
+        self.assertTrue(outcome.ok)
+        self.assertEqual(Path(outcome.path).name, "xhs.mp4")
+
+    def test_download_images_note_is_not_retryable(self):
+        """图文笔记没有可下的文件，重试也没意义。"""
+        resolver = links_mod.LinkResolver()
+        note = xhs_mod.XhsNote(
+            note_id="x", ok=True, title="图文", images=["https://i/1.jpg"], kind="normal"
+        )
+        with mock.patch.object(xhs_mod, "note_for", lambda *a, **k: note):
+            outcome = resolver._attempt_download(
+                "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd",
+                tempfile.gettempdir(),
+                0,
+            )
+        self.assertFalse(outcome.ok)
+        self.assertFalse(outcome.retryable)
+        self.assertIn("图文笔记", outcome.error)
+
+
 class TweetTests(unittest.TestCase):
     """X 推文：URL 识别、token、JSON 解析、卡片渲染。"""
 
@@ -3741,6 +4166,131 @@ class TweetTests(unittest.TestCase):
             id="t4", url="https://x.com/a/status/t4", text="一样的文字", author_name="A"
         )
         self.assertEqual(self._card_height(same), self._card_height(plain))
+
+
+class XhsEngineTests(unittest.IsolatedAsyncioTestCase):
+    """引擎：小红书笔记发卡片图；视频笔记再下载视频；关掉开关不发卡片。"""
+
+    URL = "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd?xsec_token=ABC"
+
+    def _engine(self, adapter, **cfg_kwargs):
+        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options.update(cfg_kwargs)
+        cfg = BotConfig(**options)
+        llm = FakeLLM(cfg)
+        return BotEngine(adapter, cfg, llm_factory=lambda c: llm)
+
+    @staticmethod
+    def _note(is_video: bool):
+        return xhs_mod.XhsNote(
+            note_id="64f0a1b2000000001f00abcd",
+            ok=True,
+            title="标题",
+            uploader="阿柴",
+            description="正文",
+            images=["https://sns-img/1.jpg"],
+            video_url="https://sns-v/1.mp4" if is_video else "",
+            kind="video" if is_video else "normal",
+        )
+
+    async def _run(self, *, is_video: bool):
+        from lingyu.bot import tweet as tweet_mod
+
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_download_enabled=True)
+        originals = (xhs_mod.note_for, tweet_mod.render_card)
+        with tempfile.TemporaryDirectory() as tmp:
+            card = Path(tmp) / "xhs-card.png"
+            card.write_bytes(b"card")
+            video = Path(tmp) / "video.mp4"
+            video.write_bytes(b"video")
+            xhs_mod.note_for = lambda *a, **k: self._note(is_video)
+            tweet_mod.render_card = lambda *a, **k: card
+
+            async def _fake_download(u, outdir, max_mb=0):
+                return links_mod.DownloadOutcome(path=str(video))
+
+            engine._links.download_detailed = _fake_download
+            try:
+                await engine._download_and_send(
+                    make_record(
+                        is_at_me=True, message_id="m1", content=f"看 {self.URL}"
+                    )
+                )
+            finally:
+                xhs_mod.note_for, tweet_mod.render_card = originals
+        return [Path(path).name for _, path in adapter.files]
+
+    async def test_image_note_sends_only_card(self):
+        """图文笔记只发卡片，不逐张发原图。"""
+        self.assertEqual(await self._run(is_video=False), ["xhs-card.png"])
+
+    async def test_video_note_sends_card_then_video(self):
+        self.assertEqual(await self._run(is_video=True), ["xhs-card.png", "video.mp4"])
+
+    async def test_short_link_is_expanded_before_parsing(self):
+        """分享短链要先展开成真实地址，否则解析必然报「未能识别笔记 ID」。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        short = "https://xhslink.cn/o/C9IHM7t3Ir"
+        full = (
+            "https://www.xiaohongshu.com/discovery/item/64f0a1b2000000001f00abcd"
+            "?xsec_token=ABC"
+        )
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_download_enabled=True)
+        seen = []
+        originals = (
+            xhs_mod.note_for,
+            tweet_mod.render_card,
+            engine._links.expand_short_link,
+        )
+        engine._links.expand_short_link = lambda url: full
+        xhs_mod.note_for = lambda url, **kwargs: (seen.append(url), self._note(False))[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            card = Path(tmp) / "card.png"
+            card.write_bytes(b"card")
+            tweet_mod.render_card = lambda *a, **k: card
+            try:
+                await engine._download_and_send(
+                    make_record(is_at_me=True, message_id="m1", content=f"看 {short}")
+                )
+            finally:
+                (
+                    xhs_mod.note_for,
+                    tweet_mod.render_card,
+                    engine._links.expand_short_link,
+                ) = originals
+        self.assertEqual(seen, [full])
+
+    async def test_card_can_be_disabled(self):
+        """关掉卡片开关后不渲染卡片；图文退回通用下载并如实提示不支持。"""
+        from lingyu.bot import tweet as tweet_mod
+
+        adapter = FakeAdapter()
+        engine = self._engine(
+            adapter, link_download_enabled=True, link_xhs_card_enabled=False
+        )
+        originals = (xhs_mod.note_for, tweet_mod.render_card)
+        rendered = []
+        xhs_mod.note_for = lambda *a, **k: self._note(False)
+        tweet_mod.render_card = lambda *a, **k: rendered.append(1)
+
+        async def _fail(u, outdir, max_mb=0):
+            return links_mod.DownloadOutcome(
+                error="图文笔记暂不支持下载（1 张图）", retryable=False
+            )
+
+        engine._links.download_detailed = _fail
+        try:
+            await engine._download_and_send(
+                make_record(is_at_me=True, message_id="m1", content=f"看 {self.URL}")
+            )
+        finally:
+            xhs_mod.note_for, tweet_mod.render_card = originals
+        self.assertEqual(rendered, [])
+        self.assertEqual(adapter.files, [])
+        self.assertTrue(any("暂不支持下载" in text for _, text in adapter.sent))
 
 
 class TweetEngineTests(unittest.IsolatedAsyncioTestCase):

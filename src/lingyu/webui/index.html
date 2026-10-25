@@ -265,7 +265,7 @@
             <label>cookies.txt 路径（可选）</label>
             <input type="text" data-key="link_cookies_file" placeholder="C:\Users\你\Downloads\cookies.txt"/>
           </div>
-          <p class="hint"><b>抖音</b>走「浏览器桥」解析：用本机 Chrome/Edge 打开一次作品页、由页面自己完成风控签名，<b>无需登录、也无需 Cookie</b>（要求系统装有 Edge 或 Chrome，Windows 10/11 自带 Edge）。<b>微博、小红书</b>等站点则会对不带 Cookie 的请求返回 403，必须提供一份 <b>Netscape 格式</b>的 cookies.txt 才能解析（在浏览器里登录对应网站后用扩展导出一次，<b>不必登录也能解析的站点则留空即可</b>）。文件不存在或留空时按原样走匿名请求，这些站点会解析失败并给出提示。</p>
+          <p class="hint"><b>抖音</b>走「浏览器桥」解析：用本机 Chrome/Edge 打开一次作品页、由页面自己完成风控签名，<b>无需登录、也无需 Cookie</b>（要求系统装有 Edge 或 Chrome，Windows 10/11 自带 Edge）。<b>小红书</b>直接读笔记页里的内嵌数据（服务端渲染，不需要签名），并用<b>移动端 UA</b> 请求——桌面 UA 会被要求登录。但<b>分享链接里必须带 <code>xsec_token</code></b>：手工拼的 <code>explore/&lt;id&gt;</code> 会被跳到「当前笔记暂时无法浏览」，所以请直接粘贴 App 里「分享 → 复制链接」的原文。极少数笔记仍要求登录态，这时才需要 cookies.txt。<b>微博</b>等站点会对不带 Cookie 的请求返回 403，同样需要 cookies.txt（在浏览器里登录后用扩展导出一次）。文件不存在或留空时按原样走匿名请求，这些站点会解析失败并给出提示。</p>
         </div>
 
         <div class="card">
@@ -333,6 +333,12 @@
             <input type="text" data-key="link_tweet_translate_target" placeholder="简体中文"/>
           </div>
           <p class="hint">中文推文不翻译（省 token）；英、日、韩、俄、阿、泰等外文会先翻成目标语言，卡片<b>正文用译文</b>、原文缩成灰色小字附在下面。翻译走上面「模型设置」里的接口，<b>未配 API Key 或调用失败时自动跳过</b>，卡片仍按原文渲染。</p>
+        </div>
+        <div class="card">
+          <div class="card-label">小红书笔记卡片</div>
+          <label class="switch-row"><span>笔记链接额外发一张卡片图（与推文同一套版式）</span>
+            <input type="checkbox" class="switch" data-key="link_xhs_card_enabled"/></label>
+          <p class="hint">检测到小红书笔记链接时，本地把笔记渲染成一张图片（头像、昵称、标题+正文、配图、赞/评论）发回聊天。配图<b>竖排合成一张长图</b>（一条消息发完，不裁切、不拆条），超过 4 张时页脚标「共 N 张图」。<b>视频笔记</b>在卡片之后再下载视频一并回发；<b>图文笔记只发卡片</b>，不逐张发原图。需先开启上面的「下载并回发」。</p>
         </div>
         <div class="actions"><button class="btn primary" id="save-links">保存设置</button></div>
       </section>

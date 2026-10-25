@@ -240,11 +240,15 @@ class BrowserSession:
         logger: _LOGGER | None = None,
         timeout: float = 30.0,
         port: int = 0,
+        extra_args: "tuple[str, ...] | list[str] | None" = None,
     ) -> None:
         self._log = logger or (lambda level, message: None)
         self._timeout = float(timeout)
         self._fixed_port = bool(port)
         self._port = port or _free_port()
+        # 额外启动参数：有些站点会看 UA/自动化特征（``--headless=new`` 的 UA 里
+        # 明晃晃带着 ``HeadlessChrome``，小红书直接判风控），由调用方按需补。
+        self._extra_args = tuple(extra_args or ())
         self._process: subprocess.Popen | None = None
         self._profile = ""
         self._stderr_path = ""
@@ -301,6 +305,7 @@ class BrowserSession:
             f"--remote-debugging-port={self._port}",
             f"--user-data-dir={self._profile}",
             *_LAUNCH_FLAGS,
+            *self._extra_args,
             "about:blank",
         ]
         creation = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW

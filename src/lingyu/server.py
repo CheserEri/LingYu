@@ -13,7 +13,7 @@ from .logging_config import configure_logging
 from .service import WeChatService
 
 SERVER_NAME = "lingyu"
-SERVER_VERSION = "0.8.15"
+SERVER_VERSION = "0.8.16"
 
 
 def build_server(service: WeChatService | None = None) -> MCPServer:

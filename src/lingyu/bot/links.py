@@ -6,6 +6,9 @@
   （``skip_download=True``，只取元数据）。
 - **抖音**单独走浏览器桥（见 :mod:`lingyu.bot.douyin`）：它的接口要求
   ``a_bogus`` 签名，内置 yt-dlp 没实现，网页兜底也只能拿到空壳。
+- **小红书**走 :mod:`lingyu.bot.xiaohongshu`：笔记页是 SSR 的，HTML 里就带
+  ``__INITIAL_STATE__``，一次 GET 就能拿到标题/正文/作者/图片（浏览器兜底）。
+- **X（Twitter）** 走 :mod:`lingyu.bot.tweet`（syndication 接口 + 本地渲染卡片）。
 - **普通网页**回退到直接抓取 ``<title>`` 与 ``meta description``。
 - 结果按 URL **缓存**（成功永久、失败带 TTL 允许重试），重复出现不再请求。
 - yt-dlp 是阻塞调用，统一放到线程池执行，避免卡住事件循环。
@@ -31,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import douyin, tweet
+from . import douyin, tweet, xiaohongshu
 
 # --------------------------------------------------------------------------- #
 # URL 检测
@@ -40,10 +43,14 @@ from . import douyin, tweet
 # URL 允许的字符（RFC 3986）。刻意不含中文与全角标点，避免把紧跟其后的
 # 中文句子一起吞进 URL。
 _URL_CHARS = r"A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%"
-# 单条交替正则：http(s):// 开头，或裸 www. 域名（其前不能是字母/数字/@/./-/）。
+# 已知短链主机：分享文案里**经常不带** ``http://``（小红书 App 现在就是这样，
+# 复制出来是 ``xhslink.com/a/xxxx 复制本条信息…``），裸域名也认。
+# 只放白名单，避免把普通聊天里出现的域名当成链接。
+_BARE_HOSTS = r"(?:www\.|xhslink\.(?:com|cn)/|b23\.tv/|v\.douyin\.com/|t\.cn/)"
+# 单条交替正则：http(s):// 开头，或裸的已知主机（其前不能是字母/数字/@/./-/）。
 # 用一条正则保证匹配按出现顺序返回。
 _LINK_RE = re.compile(
-    rf"(?:https?://|(?<![\w@./-])www\.)[{_URL_CHARS}]+",
+    rf"(?:https?://|(?<![\w@./-]){_BARE_HOSTS})[{_URL_CHARS}]+",
     re.IGNORECASE,
 )
 # 末尾常见标点（中英文），解析前剥掉。
@@ -325,6 +332,7 @@ _SHORT_LINK_HOSTS = {
     "b23.tv",         # 哔哩哔哩分享短链
     "v.douyin.com",   # 抖音
     "xhslink.com",    # 小红书
+    "xhslink.cn",     # 小红书（App 分享文案用这个）
     "t.cn",           # 微博
     "sourl.cn",
     "dwz.cn",
@@ -332,11 +340,13 @@ _SHORT_LINK_HOSTS = {
 }
 
 # b23.tv 等有时是 JS/meta 跳转而非 302，从正文里兜底捞真实地址。
+# 小红书这条**必须把 query 一起带上**：``xsec_token`` 在 query 里，丢了它
+# 页面会跳到 /404「当前笔记暂时无法浏览」。
 _SHORT_LINK_TARGET_RE = re.compile(
     r"https?://(?:www\.)?(?:"
     r"bilibili\.com/video/[A-Za-z0-9]+"
     r"|douyin\.com/video/\d+"
-    r"|xiaohongshu\.com/[A-Za-z0-9/_\-]+"
+    r"|xiaohongshu\.com/[A-Za-z0-9/_\-]+(?:\?[A-Za-z0-9=&%_\-.~:+/]*)?"
     r"|weibo\.com/[A-Za-z0-9/_\-]+"
     r")",
     re.IGNORECASE,
@@ -636,14 +646,27 @@ class LinkResolver:
                 result[url] = info
         return result
 
+    def expand_short_link(self, url: str) -> str:
+        """展开短链的公开入口：成功返回真实地址，失败或本来就不是短链则原样返回。
+
+        卡片那条路（``engine._send_xhs``）需要**先展开再解析**——短链本身没有
+        笔记 ID，``xiaohongshu.note_for`` 会直接报「未能识别笔记 ID」；而下载那一路
+        是在 :meth:`_attempt_download` 里自己展开的，两条路的展开时机不一样。
+        """
+        target, _ = self._expand_short_link(url)
+        return target or url
+
     def _expand_short_link(self, url: str) -> tuple[str, str]:
         """展开短链。返回 ``(真实地址, 错误说明)``；无法展开时地址为空串。"""
         if not _is_short_link(url):
             return "", ""
+        # 小红书短链要用移动 UA 展开：桌面 UA 会被跳到 /login，真正的笔记地址
+        # （带 xsec_token）被塞进 redirectPath 里，等于白跳一趟。
+        is_xhs = xiaohongshu.is_xhs_url(url)
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": _UA,
+                "User-Agent": xiaohongshu.user_agent() if is_xhs else _UA,
                 "Accept": "text/html,application/xhtml+xml",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
@@ -651,6 +674,9 @@ class LinkResolver:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                 final = resp.geturl()
+                if is_xhs:
+                    # 登录墙/风控页把原地址藏在 redirectPath 里，先解出来
+                    final = xiaohongshu.unwrap_redirect(final)
                 # 只有跳到**非短链主机**才算展开成功；http→https 这种同主机
                 # 跳转（b23.tv 常见）不算，得继续看正文。
                 if final and final != url and not _is_short_link(final):
@@ -684,6 +710,11 @@ class LinkResolver:
             # 网页兜底又只能拿到空壳（正文由 JS 渲染），两条路都必然失败。
             # 放在 load_yt_dlp() 之前，省掉一次没用的 yt-dlp 加载。
             return _rekey(self._douyin_link_info(lookup), url, lookup)
+        if xiaohongshu.is_xhs_url(lookup):
+            # 小红书笔记页是 SSR 的，HTML 里就带 __INITIAL_STATE__，不必过 yt-dlp
+            # （它对小红书没有提取器，只会把分享码当标题）。短链已在上一步展开，
+            # 这里拿到的地址带着 xsec_token——少了它页面会跳到 /404。
+            return _rekey(self._xhs_link_info(lookup), url, lookup)
         module = load_yt_dlp()
         ytdlp_info: LinkInfo | None = None
         if module is not None:
@@ -727,6 +758,35 @@ class LinkResolver:
             webpage_url=url,
             label="抖音",
             meta=meta,
+        )
+
+    def _xhs_link_info(self, url: str) -> LinkInfo:
+        """小红书笔记解析（见 :mod:`lingyu.bot.xiaohongshu`）。"""
+        note = xiaohongshu.note_for(
+            url,
+            cookies_file=self.cookies_file,
+            timeout=self.timeout,
+            logger=self._log,
+        )
+        if not note.ok:
+            return LinkInfo(
+                url=url, ok=False, error=note.error or "小红书解析失败", label="小红书"
+            )
+        meta_parts = [f"类型：{note.kind_label}"]
+        if note.likes:
+            meta_parts.append(f"{note.likes} 赞")
+        return LinkInfo(
+            url=url,
+            ok=True,
+            title=note.title,
+            uploader=note.uploader,
+            description=note.description,
+            extractor="小红书",
+            # 只有视频能下载；图文笔记的内容在 description/标题里，够模型用了。
+            is_media=note.is_video,
+            webpage_url=url,
+            label="小红书",
+            meta=" · ".join(meta_parts),
         )
 
     def _extract_with_ytdlp(self, module: Any, url: str) -> LinkInfo:
@@ -856,6 +916,8 @@ class LinkResolver:
         if douyin.is_douyin_url(url):
             # 抖音不经过 yt-dlp（缺 a_bogus 签名），直接下 play_addr 直链。
             return self._download_douyin(url, outdir, max_mb)
+        if xiaohongshu.is_xhs_url(url):
+            return self._download_xhs(url, outdir, max_mb)
         module = load_yt_dlp()
         if module is None:
             self._log("error", "内置 yt-dlp 不可用，无法下载链接内容。")
@@ -984,3 +1046,41 @@ class LinkResolver:
             if path:
                 return DownloadOutcome(path=path)
         return DownloadOutcome(error="抖音直链下载失败")
+
+    def _download_xhs(self, url: str, outdir: str, max_mb: int) -> DownloadOutcome:
+        """下载小红书笔记：视频笔记下 mp4；图文笔记只解析不下载。
+
+        图文作品要发就得把 N 张图逐张发出去（微信里是 N 条消息），和「一条
+        链接回发一份内容」的语义不符，故如实告知「暂不支持」而不是悄悄只发一张。
+        """
+        # 直链带时效：先用缓存里的，失败后强制重取一次再试。
+        for force in (False, True):
+            note = xiaohongshu.note_for(
+                url,
+                cookies_file=self.cookies_file,
+                timeout=self.timeout,
+                logger=self._log,
+                force=force,
+            )
+            if not note.ok:
+                self._log("warning", f"下载小红书内容失败 {url}：{note.error}")
+                return DownloadOutcome(error=note.error or "小红书笔记解析失败")
+            if not note.is_video:
+                self._log(
+                    "info",
+                    f"小红书图文笔记暂不支持下载（{len(note.images)} 张图）：{url}",
+                )
+                return DownloadOutcome(
+                    error=f"图文笔记暂不支持下载（{len(note.images)} 张图）",
+                    retryable=False,
+                )
+            path = xiaohongshu.download_video(
+                note,
+                outdir,
+                timeout=max(self.timeout, 60.0),
+                max_mb=max_mb,
+                logger=self._log,
+            )
+            if path:
+                return DownloadOutcome(path=path)
+        return DownloadOutcome(error="小红书视频直链下载失败")

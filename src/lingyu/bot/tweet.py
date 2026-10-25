@@ -51,6 +51,8 @@ from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .card import CardData
+
 # --------------------------------------------------------------------------- #
 # 推文 URL
 # --------------------------------------------------------------------------- #
@@ -133,6 +135,25 @@ class Tweet:
     # 译文（通常是简体中文）。空串 = 未翻译，卡片直接画正文；
     # 非空时卡片以译文为正文、原文缩成灰色小字附在下面。
     translation: str = ""
+
+    def to_card(self) -> CardData:
+        """转成渲染器认识的卡片数据（见 :mod:`lingyu.bot.card`）。"""
+        return CardData(
+            id=self.id,
+            url=self.url,
+            text=self.text,
+            translation=self.translation,
+            author_name=self.author_name,
+            author_handle=self.author_handle,
+            avatar_url=self.avatar_url,
+            verified=self.verified,
+            created_at=self.created_at,
+            photos=list(self.photos),
+            video_poster=self.video_poster,
+            has_video=self.has_video,
+            likes=self.likes,
+            replies=self.replies,
+        )
 
     def summary(self) -> str:
         """压成一行注入模型上下文。"""
@@ -803,13 +824,17 @@ _RULE_COLOR = (207, 217, 222)
 
 
 def render_card(
-    tweet: Tweet,
+    data: "CardData | Tweet",
     outdir: str | Path,
     timeout: float = 20.0,
     logger: Callable[[str, str], None] | None = None,
     include_media: bool = True,
 ) -> Path | None:
-    """把推文渲染成 PNG，返回文件路径；失败返回 ``None``。
+    """把一张「社交帖子」渲染成 PNG，返回文件路径；失败返回 ``None``。
+
+    ``data`` 传 :class:`~lingyu.bot.card.CardData`；也兼容直接传 :class:`Tweet`
+    （内部自动 :meth:`Tweet.to_card`，老调用点不用改）。小红书笔记经
+    :func:`~lingyu.bot.card.note_to_card` 转成同一套结构，所以两边**版式完全一致**。
 
     排版自上而下依次是：头像/昵称块 → 正文（有译文时用译文）→ 原文块
     （仅在有译文时）→ 配图 → 页脚。每个块的高度都由**字号度量**算出，
@@ -819,6 +844,7 @@ def render_card(
     不裁切也不拉伸，整张卡片就是一条长图，一条消息发完。
     ``include_media=False`` 时只画文字（供只需要文字卡的场景）。
     """
+    card = data.to_card() if isinstance(data, Tweet) else data
     log = logger or (lambda level, message: None)
     outdir = Path(outdir)
     try:
@@ -831,11 +857,11 @@ def render_card(
     text_width = CARD_WIDTH - _PAD - text_x
 
     # 头像先取：有没有头像会影响「昵称块」到底占多高（没头像时不该空出 76px）。
-    avatar_img = _load_image(tweet.avatar_url, timeout) if tweet.avatar_url else None
+    avatar_img = _load_image(card.avatar_url, timeout) if card.avatar_url else None
 
     # 正文：有译文就画译文，原文另起一块缩成灰色小字。
-    translation = (tweet.translation or "").strip()
-    original = (tweet.text or "").strip()
+    translation = (card.translation or "").strip()
+    original = (card.text or "").strip()
     body_text = translation or original
     body_lines = _wrap(body_text, _BODY_SIZE, False, text_width) if body_text else []
     quote_lines = (
@@ -848,10 +874,10 @@ def render_card(
     # 取 `name=large` 而不是 syndication 默认的小图，长图放大后才不糊。
     media: list[tuple[Image.Image, bool]] = []
     if include_media:
-        for url in tweet.photos[:4]:
+        for url in card.photos[:4]:
             img = _load_image(best_photo_url(url), timeout)
             if img is not None:
-                media.append((img, bool(tweet.video_poster) and url == tweet.video_poster))
+                media.append((img, bool(card.video_poster) and url == card.video_poster))
     media_boxes = _media_boxes(media, text_width, text_x)
     media_height = max(
         (top + height for _, (_, top, _, height), _ in media_boxes), default=0
@@ -868,7 +894,7 @@ def render_card(
     handle_baseline = name_baseline + name_descent + 8 + handle_ascent
     # 头像高度只在**真的取到头像**时才算进头部；没有 @用户名 时也不留那一行。
     head_bottom = name_baseline + name_descent
-    if tweet.author_handle:
+    if card.author_handle:
         head_bottom = handle_baseline + handle_descent
     if avatar_img is not None:
         head_bottom = max(head_bottom, _PAD + _AVATAR)
@@ -895,16 +921,17 @@ def render_card(
     if media_boxes:
         y = media_top + media_height
 
-    # 页脚：多图走「原图单独发」时在这里标一句「N 张图」，让用户知道后面还有图。
-    footer_parts = [tweet.created_at]
-    if not include_media:
-        count = len(photo_urls(tweet))
-        if count:
-            footer_parts.append(f"{count} 张图")
+    # 页脚：只画了部分配图时标一句「共 N 张图」，让用户知道后面还有图。
+    footer_parts = [card.created_at]
+    total_photos = card.photo_total or (len(card.photos) if not include_media else 0)
+    if total_photos > len(media_boxes):
+        footer_parts.append(
+            f"共 {total_photos} 张图" if media_boxes else f"{total_photos} 张图"
+        )
     footer_parts.extend(
         [
-            f"{tweet.likes} 喜欢" if tweet.likes else "",
-            f"{tweet.replies} 回复" if tweet.replies else "",
+            f"{card.likes} {card.likes_label}" if card.likes else "",
+            f"{card.replies} {card.replies_label}" if card.replies else "",
         ]
     )
     footer = " · ".join(part for part in footer_parts if part)
@@ -914,39 +941,39 @@ def render_card(
         y = foot_baseline + foot_descent
     height = int(y + _PAD)
 
-    card = Image.new("RGB", (CARD_WIDTH, max(height, 160)), (255, 255, 255))
-    draw = ImageDraw.Draw(card)
+    canvas = Image.new("RGB", (CARD_WIDTH, max(height, 160)), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
 
     # 头像（圆角裁切；同一张圆图既当蒙版又当内容，只算一次）
     if avatar_img is not None:
         circle = _circle(avatar_img, _AVATAR)
-        card.paste(circle, (_PAD, _PAD), circle)
+        canvas.paste(circle, (_PAD, _PAD), circle)
 
     # 昵称 + 认证（昵称留 40px 给认证徽标，超长截断）
     name_glyphs = _ellipsize(
-        _glyphs(tweet.author_name or "未知用户", _NAME_SIZE, True),
+        _glyphs(card.author_name or "未知用户", _NAME_SIZE, True),
         text_width - 40,
         _NAME_SIZE,
     )
     name_x = _draw_glyphs(draw, text_x, name_baseline, name_glyphs, _TEXT_COLOR)
-    if tweet.verified:
+    if card.verified:
         badge_size = _NAME_SIZE - 7
         _draw_badge(
             draw,
             name_x + 8,
             name_baseline - name_ascent + max(0, (_NAME_SIZE - badge_size) / 2),
             badge_size,
-            tweet.verified,
+            card.verified,
         )
 
     # @handle
-    if tweet.author_handle:
+    if card.author_handle:
         _draw_glyphs(
             draw,
             text_x,
             handle_baseline,
             _ellipsize(
-                _glyphs(f"@{tweet.author_handle}", _HANDLE_SIZE),
+                _glyphs(f"@{card.author_handle}", _HANDLE_SIZE),
                 text_width,
                 _HANDLE_SIZE,
             ),
@@ -984,18 +1011,22 @@ def render_card(
     # 配图（竖排长图：按原比例缩放，不裁切不拉伸；圆角；视频封面加播放角标）
     for img, (left, top, width, height_), play in media_boxes:
         mask = _rounded_mask((width, height_), _MEDIA_RADIUS)
-        card.paste(img.resize((width, height_), Image.LANCZOS), (left, int(media_top) + top), mask)
+        canvas.paste(
+            img.resize((width, height_), Image.LANCZOS),
+            (left, int(media_top) + top),
+            mask,
+        )
         if play:
-            _draw_play_badge(card, left, int(media_top) + top, width, height_)
+            _draw_play_badge(canvas, left, int(media_top) + top, width, height_)
 
     # 底部时间 / 互动
     if footer:
         _draw_glyphs(draw, text_x, foot_baseline, _glyphs(footer, _FOOT_SIZE), _MUTED_COLOR)
 
-    path = outdir / f"tweet-{tweet.id}.png"
+    path = outdir / f"{card.prefix or 'card'}-{card.id}.png"
     try:
-        card.save(path, "PNG")
+        canvas.save(path, "PNG")
     except OSError as exc:
-        log("warning", f"保存推文卡片失败：{exc}")
+        log("warning", f"保存卡片失败：{exc}")
         return None
     return path

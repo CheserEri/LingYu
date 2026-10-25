@@ -152,6 +152,10 @@ class BotConfig:
     link_tweet_translate: bool = True
     # 译文目标语言。
     link_tweet_translate_target: str = "简体中文"
+    # 小红书笔记额外发一张本地渲染的卡片图（与推文卡片同一套版式：
+    # 头像/昵称/正文/竖排长图/页脚）。图文笔记只发卡片（不下载原图），
+    # 视频笔记在卡片之后再下载视频回发。
+    link_xhs_card_enabled: bool = True
     # 识别到链接时先回一句**固定**提示（不经过大模型），让用户知道正在处理。
     # 私聊与群聊都生效（群聊里不必 @ 机器人）。
     link_ack_enabled: bool = True
@@ -243,6 +247,7 @@ class BotConfig:
         config.link_send_attempts = min(10, max(0, int(config.link_send_attempts)))
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)
         config.link_tweet_translate = bool(config.link_tweet_translate)
+        config.link_xhs_card_enabled = bool(config.link_xhs_card_enabled)
         # 目标语言留空即回到默认值——空串会让提示词变成「翻译成」这种半句话。
         config.link_tweet_translate_target = (
             str(config.link_tweet_translate_target or "").strip() or "简体中文"
