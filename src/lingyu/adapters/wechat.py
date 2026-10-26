@@ -851,6 +851,96 @@ class WeChatAdapter:
             },
         )
 
+    # ------------------------------------------------------------------ 撤回
+
+    async def recall_last_message(self, chat_name: str) -> SendResult:
+        """撤回该会话里机器人最近发出的一条消息。
+
+        微信只允许撤回自己发的、2 分钟内的最新一条，所以这里没有「指定消息 ID」
+        这种接口；上层要撤更早的内容只能连续撤。结果无法确认时返回 ``ok=False``，
+        由调用方如实告知用户「可能需要手动撤回」。
+        """
+        try:
+            recipient = validate_recipient(chat_name)
+        except LingyuError as exc:
+            return SendResult(
+                ok=False,
+                status=SendStatus.FAILED,
+                recipient=str(chat_name or ""),
+                error=exc.to_dict(),
+            )
+
+        if not self.is_connected:
+            error = NotConnectedError("尚未连接微信，无法撤回消息").to_dict()
+            return SendResult(
+                ok=False,
+                status=SendStatus.FAILED,
+                recipient=recipient,
+                error=error,
+            )
+
+        target = self.resolve_chat_identifier(recipient)
+        if not target:
+            return SendResult(
+                ok=False,
+                status=SendStatus.FAILED,
+                recipient=recipient,
+                error=_unresolved_target_error(recipient),
+            )
+
+        resolved, candidates = resolve_target(target, self._known_chat_names())
+        if candidates:
+            error = TargetAmbiguousError(
+                "目标不唯一，请指定更完整的名称：" + "、".join(candidates),
+                candidates,
+            ).to_dict()
+            return SendResult(
+                ok=False,
+                status=SendStatus.FAILED,
+                recipient=recipient,
+                error=error,
+            )
+
+        action = getattr(self._bridge, "recall_last_message", None)
+        if action is None:
+            return SendResult(
+                ok=False,
+                status=SendStatus.FAILED,
+                recipient=recipient,
+                resolved_recipient=resolved,
+                error={
+                    "code": "recall_unsupported",
+                    "message": "当前微信后端不支持撤回，请手动撤回",
+                },
+            )
+
+        async with self._send_lock:
+            try:
+                recalled = bool(await action(resolved))
+            except Exception as exc:
+                return SendResult(
+                    ok=False,
+                    status=SendStatus.FAILED,
+                    recipient=recipient,
+                    resolved_recipient=resolved,
+                    message_preview="撤回最近一条",
+                    error={"code": "recall_failed", "message": str(exc)},
+                )
+
+        return SendResult(
+            ok=recalled,
+            status=SendStatus.SENT if recalled else SendStatus.FAILED,
+            recipient=recipient,
+            resolved_recipient=resolved,
+            message_preview="撤回最近一条",
+            error=None
+            if recalled
+            else {
+                "code": "recall_failed",
+                "message": "撤回未成功：消息可能已超过 2 分钟，或窗口控件不可识别",
+            },
+        )
+
     # ------------------------------------------------------------------ 关注列表
 
     def set_monitored_chats(

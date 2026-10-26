@@ -37,6 +37,10 @@
           <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l2.4-2.4a5 5 0 0 0-7.1-7.1L11.5 4.4"/><path d="M14 11a5 5 0 0 0-7.1 0L4.5 13.4a5 5 0 0 0 7.1 7.1l.9-.9"/></svg>
           <span>链接解析</span>
         </button>
+        <button class="nav-item" data-page="recall">
+          <svg viewBox="0 0 24 24"><path d="M4 10a8 8 0 1 1 2.3 5.7"/><path d="M4 5v5h5"/></svg>
+          <span>撤回</span>
+        </button>
         <button class="nav-item" data-page="model">
           <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg>
           <span>模型设置</span>
@@ -261,6 +265,14 @@
             </div>
           </div>
           <p class="hint">内置 yt-dlp：媒体站点（YouTube / Bilibili 等）取标题、作者、时长、简介；普通网页取标题与摘要。解析结果以「[链接] …」附在该条消息之后，让机器人能就链接内容回应。</p>
+          <label class="switch-row"><span>只解析支持的媒体站点（推荐）</span>
+            <input type="checkbox" class="switch" data-key="link_supported_only"/></label>
+          <p class="hint">开启时<b>只处理媒体平台链接</b>（抖音 / 快手 / B 站 / YouTube / X / 小红书 / 微博 / TikTok 等），购物、团购、新闻、公众号这类链接<b>不解析、不下载、也不会回「无法解析」</b>——它们本来就没有音视频可发。关掉后任何链接都会尝试解析（不推荐，容易在群里刷出没用的提示）。</p>
+          <div class="field">
+            <label>额外支持的站点（可选，逗号分隔）</label>
+            <input type="text" data-key="link_extra_sites" placeholder="qq.com, v.youku.com"/>
+          </div>
+          <p class="hint">白名单之外的站点写在这里，子域同样命中（填 <code>qq.com</code> 连 <code>v.qq.com</code> 一起支持）。命中后按「其它媒体」走内置 yt-dlp 通用提取。</p>
           <div class="field">
             <label>cookies.txt 路径（可选）</label>
             <input type="text" data-key="link_cookies_file" placeholder="C:\Users\你\Downloads\cookies.txt"/>
@@ -341,6 +353,69 @@
           <p class="hint">检测到小红书笔记链接时，本地把笔记渲染成一张图片（头像、昵称、标题+正文、配图、赞/评论）发回聊天。配图<b>竖排合成一张长图</b>（一条消息发完，不裁切、不拆条），超过 4 张时页脚标「共 N 张图」。<b>视频笔记</b>在卡片之后再下载视频一并回发；<b>图文笔记只发卡片</b>，不逐张发原图。需先开启上面的「下载并回发」。</p>
         </div>
         <div class="actions"><button class="btn primary" id="save-links">保存设置</button></div>
+      </section>
+
+      <!-- 撤回 -->
+      <section class="page" id="page-recall">
+        <h1 class="page-title">撤回</h1>
+
+        <div class="card">
+          <div class="card-label">应急撤回</div>
+          <label class="switch-row"><span>允许用「@机器人 撤回」撤回最新发出的媒体</span>
+            <input type="checkbox" class="switch" data-key="recall_enabled"/></label>
+          <p class="hint">机器人偶尔会发出不该发的东西（违规视频、解析错的素材）。开启后，聊天里有人发一句<b>「@机器人 撤回」</b>，机器人就会撤回自己<b>最新发出的那条消息</b>——撤的是消息不是文件，微信侧对方也看不到了。<b>只对 2 分钟内发出的消息有效</b>（微信限制），超过就只能手动删。</p>
+          <div class="field">
+            <label>指令词（逗号分隔）</label>
+            <input type="text" data-key="recall_keywords" placeholder="撤回"/>
+          </div>
+          <p class="hint">只认「指令词 + 允许的后缀」（撤回 / 撤回一下 / 撤回吧 / /撤回 / @机器人 撤回），像「别撤回」「撤回的消息看不到」这种日常对话<b>不会</b>被当成指令。</p>
+          <label class="switch-row"><span>群里必须 @ 机器人才算指令</span>
+            <input type="checkbox" class="switch" data-key="recall_require_at"/></label>
+          <p class="hint">推荐开启：群里出现「撤回」两个字太常见，不 @ 容易误触发。私聊不受此项影响。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">谁能下指令</div>
+          <label class="switch-row"><span>只允许下列成员下指令</span>
+            <input type="checkbox" class="switch" data-key="recall_admin_only"/></label>
+          <p class="hint">默认<b>关闭</b>：群里任何人都能喊停——违规内容越快撤掉越好。若担心被乱用，可打开并填上管理员昵称（与微信里显示的昵称一致）。</p>
+          <div class="field">
+            <label>允许的成员（每行一个）</label>
+            <textarea id="recall-admins-input" rows="3" placeholder="张三&#10;李四"></textarea>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-label">撤回范围与回执</div>
+          <div class="grid-2">
+            <div class="field">
+              <label>只撤这个时间窗内（秒）</label>
+              <input type="number" min="0" max="120" data-key="recall_window_seconds"/>
+            </div>
+            <div class="field">
+              <label>最多一次撤几条</label>
+              <input type="number" min="1" max="5" data-key="recall_max_messages"/>
+            </div>
+          </div>
+          <p class="hint">微信只提供「撤回最新一条」，所以要撤到某个视频，可能得连它后面发的提示一起撤。默认时间窗 110 秒（微信上限 2 分钟，留点余量；填 0 表示不按时间筛，但仍受微信 2 分钟限制）、最多撤 2 条。</p>
+          <label class="switch-row"><span>撤回时顺带取消还没发出去的下载</span>
+            <input type="checkbox" class="switch" data-key="recall_stop_download"/></label>
+          <p class="hint">避免「刚撤完又冒出来一条同样的视频」：正在下载的内容会被直接丢弃，不再发送。</p>
+          <label class="switch-row"><span>撤回后回一句结果</span>
+            <input type="checkbox" class="switch" data-key="recall_notice_enabled"/></label>
+          <div class="grid-2">
+            <div class="field">
+              <label>成功文案</label>
+              <input type="text" data-key="recall_ok_text" placeholder="已撤回上一条消息"/>
+            </div>
+            <div class="field">
+              <label>失败文案</label>
+              <input type="text" data-key="recall_fail_text" placeholder="撤回失败，可能需要手动撤回"/>
+            </div>
+          </div>
+          <p class="hint">回执是<b>固定文案</b>，不经过大模型。失败常见原因：消息已超过 2 分钟、微信窗口被最小化/遮挡、当前微信版本控件不可识别。</p>
+        </div>
+        <div class="actions"><button class="btn primary" id="save-recall">保存设置</button></div>
       </section>
 
       <!-- 模型设置 -->

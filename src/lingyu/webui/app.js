@@ -59,6 +59,9 @@ function bindDraftToControls() {
 
   // 人设
   $("#persona-input").value = draft.persona_custom || "";
+
+  // 撤回指令的允许成员
+  $("#recall-admins-input").value = (draft.recall_admins || []).join("\n");
 }
 
 function collectDraft() {
@@ -66,6 +69,10 @@ function collectDraft() {
   draft.all_groups = $$(".seg").find((b) => b.classList.contains("active")).dataset.scope === "all";
   draft.groups = $("#groups-input").value.split("\n").map((s) => s.trim()).filter(Boolean);
   draft.persona_custom = $("#persona-input").value;
+  draft.recall_admins = $("#recall-admins-input").value
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
   return draft;
 }
 
@@ -90,6 +97,7 @@ $("#save-chats").addEventListener("click", saveAll);
 $("#save-human").addEventListener("click", saveAll);
 $("#save-quiet").addEventListener("click", saveAll);
 $("#save-links").addEventListener("click", saveAll);
+$("#save-recall").addEventListener("click", saveAll);
 $("#save-model").addEventListener("click", saveAll);
 $("#save-persona").addEventListener("click", saveAll);
 

@@ -27,6 +27,7 @@ from lingyu.bot import douyin as douyin_mod
 from lingyu.bot import xiaohongshu as xhs_mod
 from lingyu.bot import engine as engine_mod
 from lingyu.bot import links as links_mod
+from lingyu.bot import recall as recall_mod
 from lingyu.bot.links import LinkInfo, extract_urls, format_link_block
 from lingyu.bot.llm import LLMClient, LLMError
 from lingyu.schemas import (
@@ -36,6 +37,12 @@ from lingyu.schemas import (
     SendStatus,
     StatusResult,
 )
+
+
+# 链接服务默认只放行「媒体站点」链接（购物/新闻等普通网页不解析、不提示），
+# 所以链接相关的用例统一用一个真实存在的媒体地址；这些用例都把网络请求与
+# 下载替换成了假实现，不会真的访问 B 站。
+MEDIA_URL = "https://www.bilibili.com/video/BV1xx411c7mD"
 
 
 def make_record(
@@ -71,6 +78,8 @@ class FakeAdapter:
         self.names = set(names or [])
         self.sent = []
         self.files = []
+        # 撤回调用记录（每次调用追加一次会话名）。
+        self.recalls = []
         # 适配层配置（None 表示未提供，链接下载的白名单注入会跳过）。
         self.config = None
         # 引擎推过来的「发送失败后重试次数」（未推送时为 None）。
@@ -97,6 +106,18 @@ class FakeAdapter:
     async def send_file(self, recipient, file_path, dry_run=False, confirm=False):
         self.files.append((recipient, file_path))
         return SimpleNamespace(ok=True, status=SendStatus.SENT, error=None)
+
+    async def recall_last_message(self, chat):
+        """记录撤回调用；``recall_ok=False`` 可模拟撤回失败。"""
+        self.recalls.append(chat)
+        ok = bool(getattr(self, "recall_ok", True))
+        return SendResult(
+            ok=ok,
+            status=SendStatus.SENT if ok else SendStatus.FAILED,
+            recipient=chat,
+            message_preview="撤回最近一条",
+            error=None if ok else {"code": "recall_failed", "message": "撤回未成功"},
+        )
 
     async def dispatch(self, record):
         for listener in list(self.listeners):
@@ -2262,6 +2283,110 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
         )
         self.assertFalse(module.WeChatBridge._press_enter(gui))
         self.assertEqual(pressed, [])
+
+
+class BridgeRecallTests(unittest.TestCase):
+    """桥接层撤回：能力检查、调用底层 API、失败如实返回。"""
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_recall", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _bridge(self, module, wx, backend="wechatauto", connected=True):
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._backend = backend
+        bridge._wx = wx
+        bridge._status = (
+            module.ConnectionStatus.CONNECTED
+            if connected
+            else module.ConnectionStatus.DISCONNECTED
+        )
+        bridge._send_gate = None
+        bridge._last_send_at = 0.0
+        return bridge
+
+    def test_calls_underlying_api(self):
+        module = self._module()
+        calls: list[str] = []
+
+        def _recall(who=None):
+            calls.append(who)
+            return SimpleNamespace(is_success=True)
+
+        wx = SimpleNamespace(RecallLastMessage=_recall)
+        bridge = self._bridge(module, wx)
+        self.assertTrue(asyncio.run(bridge.recall_last_message("测试群")))
+        self.assertEqual(calls, ["测试群"])
+
+    def test_failure_is_reported(self):
+        module = self._module()
+        wx = SimpleNamespace(
+            RecallLastMessage=lambda who=None: SimpleNamespace(is_success=False)
+        )
+        bridge = self._bridge(module, wx)
+        self.assertFalse(asyncio.run(bridge.recall_last_message("测试群")))
+
+    def test_unsupported_backend_is_rejected(self):
+        """wxauto4 等后端没有撤回能力，要如实拒绝而不是假装成功。"""
+        module = self._module()
+        calls: list[str] = []
+        wx = SimpleNamespace(RecallLastMessage=lambda who=None: calls.append(who))
+        bridge = self._bridge(module, wx, backend="wxauto4")
+        self.assertFalse(asyncio.run(bridge.recall_last_message("测试群")))
+        self.assertEqual(calls, [])
+
+    def test_not_connected_is_rejected(self):
+        module = self._module()
+        wx = SimpleNamespace(RecallLastMessage=lambda who=None: True)
+        bridge = self._bridge(module, wx, connected=False)
+        self.assertFalse(asyncio.run(bridge.recall_last_message("测试群")))
+
+    def test_uia_recall_used_when_self_row_found(self):
+        """认出自己那一行时走「右键自己 → 点撤回」，不去右键别人最新的消息。"""
+        module = self._module()
+
+        class _Row:
+            ClassName = "mmui::ChatVideoItemView"
+
+            def __init__(self):
+                self.BoundingRectangle = SimpleNamespace(
+                    left=0, top=100, right=400, bottom=160
+                )
+
+        self_row = _Row()
+
+        class _List:
+            def GetChildren(self):
+                return [self_row]
+
+        clicked: list[str] = []
+        uia = SimpleNamespace(
+            ensure_window=lambda: True,
+            current_chat=lambda: "测试群",
+            _message_list=lambda: _List(),
+            _set_cursor=lambda x, y: None,
+            _right_click=lambda: None,
+            _uia_find_menu_item=lambda name: SimpleNamespace(name=name),
+            _uia_click_menu_item=lambda item: clicked.append(item.name) or True,
+        )
+        wx = SimpleNamespace(
+            _gui=SimpleNamespace(_get_uia=lambda: uia),
+            RecallLastMessage=lambda who=None: self.fail("不该走兜底路径"),
+        )
+        bridge = self._bridge(module, wx)
+        # 假消息行的重心在右侧 → 认成「自己发的」。
+        bridge._row_ink_centroid_x = lambda rect: rect.right - 60
+        self.assertTrue(asyncio.run(bridge.recall_last_message("测试群")))
+        self.assertEqual(clicked, ["撤回"])
 
 
 class _FakeGui:
@@ -4745,7 +4870,7 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_link_gets_fixed_ack(self):
         adapter, _ = await self._run(
-            make_record(is_group=False, content="https://example.com/a")
+            make_record(is_group=False, content=MEDIA_URL)
         )
         self.assertEqual(adapter.sent[0], ("测试群", "正在解析链接"))
 
@@ -4755,25 +4880,25 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ack_text_is_configurable(self):
         adapter, _ = await self._run(
-            make_record(content="https://example.com/a"), link_ack_text="稍等，我看看"
+            make_record(content=MEDIA_URL), link_ack_text="稍等，我看看"
         )
         self.assertEqual(adapter.sent, [("测试群", "稍等，我看看")])
 
     async def test_ack_can_be_disabled(self):
         adapter, _ = await self._run(
-            make_record(content="https://example.com/a"), link_ack_enabled=False
+            make_record(content=MEDIA_URL), link_ack_enabled=False
         )
         self.assertEqual(adapter.sent, [])
 
     async def test_blank_ack_text_sends_nothing(self):
         adapter, _ = await self._run(
-            make_record(content="https://example.com/a"), link_ack_text="   "
+            make_record(content=MEDIA_URL), link_ack_text="   "
         )
         self.assertEqual(adapter.sent, [])
 
     async def test_group_out_of_scope_has_no_ack(self):
         adapter, _ = await self._run(
-            make_record(is_group=True, chat="别的群", content="https://example.com/a"),
+            make_record(is_group=True, chat="别的群", content=MEDIA_URL),
             all_groups=False,
             groups=["测试群"],
         )
@@ -4783,13 +4908,13 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
         adapter = FakeAdapter()
         engine = self._engine(adapter)
         engine._in_quiet_hours = lambda now=None: True
-        await engine._handle(make_record(content="https://example.com/a"))
+        await engine._handle(make_record(content=MEDIA_URL))
         self.assertEqual(adapter.sent, [])
 
     async def test_same_message_id_is_acked_once(self):
         adapter = FakeAdapter()
         engine = self._engine(adapter)
-        record = make_record(message_id="m1", content="https://example.com/a")
+        record = make_record(message_id="m1", content=MEDIA_URL)
         await engine._handle(record)
         await engine._handle(record)
         self.assertEqual(len(adapter.sent), 1)
@@ -4797,7 +4922,7 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
     async def test_llm_still_replies_by_default(self):
         """默认 link_llm_followup=True：原本会回复的场景保持原样（提示 + 模型回复）。"""
         adapter, engine = await self._run(
-            make_record(is_group=False, content="https://example.com/a")
+            make_record(is_group=False, content=MEDIA_URL)
         )
         self.assertEqual(
             [text for _, text in adapter.sent], ["正在解析链接", "本鲸鱼娘收到啦。"]
@@ -4807,7 +4932,7 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
     async def test_llm_followup_can_be_disabled(self):
         """关掉后带链接的消息只回固定提示，不再调用模型。"""
         adapter, engine = await self._run(
-            make_record(is_group=False, content="https://example.com/a"),
+            make_record(is_group=False, content=MEDIA_URL),
             link_llm_followup=False,
         )
         self.assertEqual([text for _, text in adapter.sent], ["正在解析链接"])
@@ -4826,7 +4951,7 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
 
             engine._links.download_detailed = _fake_download
             await engine._handle(
-                make_record(is_group=True, content="https://example.com/v")
+                make_record(is_group=True, content=MEDIA_URL)
             )
             await self._drain(engine)
         self.assertEqual([Path(p).name for _, p in adapter.files], ["video.mp4"])
@@ -4844,10 +4969,312 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
 
         engine._links.download_detailed = _fake_download
         await engine._handle(
-            make_record(is_group=False, content="https://example.com/v")
+            make_record(is_group=False, content=MEDIA_URL)
         )
         await self._drain(engine)
-        self.assertEqual(started, ["https://example.com/v"])
+        self.assertEqual(started, [MEDIA_URL])
+
+
+class LinkSiteFilterTests(unittest.TestCase):
+    """链接服务只处理媒体站点：购物/新闻等普通网页不解析、也不提示失败。"""
+
+    def test_supported_sites(self):
+        for url in (
+            "https://v.douyin.com/iRxAbcd/",
+            "https://www.douyin.com/video/7300000000000000000",
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+            "https://b23.tv/P7kJlgt",
+            "https://youtu.be/abc",
+            "https://www.youtube.com/watch?v=abc",
+            "https://x.com/someone/status/1",
+            "https://xhslink.com/a/abcd",
+            "https://www.xiaohongshu.com/explore/abc",
+            "https://weibo.com/1234/abcd",
+            "https://v.kuaishou.com/abcd",
+        ):
+            self.assertTrue(links_mod.is_supported_url(url), url)
+
+    def test_shopping_and_news_links_are_ignored(self):
+        for url in (
+            "https://item.taobao.com/item.htm?id=1",
+            "https://detail.tmall.com/item.htm?id=1",
+            "https://mobile.yangkeduo.com/goods.html?goods_id=1",
+            "https://item.jd.com/1.html",
+            "https://mp.weixin.qq.com/s/abcdef",
+            "https://www.zhihu.com/question/1",
+            "https://example.com/a",
+        ):
+            self.assertFalse(links_mod.is_supported_url(url), url)
+
+    def test_host_matching_handles_subdomain_port_and_userinfo(self):
+        self.assertTrue(links_mod.is_supported_url("https://m.bilibili.com/video/BV1"))
+        self.assertTrue(links_mod.is_supported_url("https://www.x.com:443/a/status/1"))
+        self.assertTrue(links_mod.is_supported_url("https://user:pw@youtu.be/abc"))
+
+    def test_domain_suffix_trick_is_not_supported(self):
+        """``bilibili.com.evil.com`` 这种伪装域名不能命中白名单。"""
+        self.assertFalse(
+            links_mod.is_supported_url("https://bilibili.com.evil.com/video/BV1")
+        )
+
+    def test_supported_urls_keeps_only_media_links(self):
+        text = (
+            "买这个 https://item.taobao.com/item.htm?id=1 "
+            "再看 https://b23.tv/xyz 和 https://example.com/a"
+        )
+        self.assertEqual(links_mod.supported_urls(text), ["https://b23.tv/xyz"])
+
+    def test_extra_sites_are_honored(self):
+        url = "https://v.qq.com/x/cover/abc.html"
+        self.assertFalse(links_mod.is_supported_url(url))
+        self.assertTrue(links_mod.is_supported_url(url, ["qq.com"]))
+
+
+class LinkScopeEngineTests(unittest.IsolatedAsyncioTestCase):
+    """引擎层面：普通网页链接不进链接服务，媒体链接照旧。"""
+
+    def _engine(self, adapter, **cfg_kwargs):
+        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options.update(cfg_kwargs)
+        cfg = BotConfig(**options)
+        return BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
+
+    @staticmethod
+    async def _drain(engine, rounds: int = 100) -> None:
+        for _ in range(rounds):
+            if not engine._download_tasks:
+                return
+            await asyncio.sleep(0.01)
+
+    async def test_shopping_link_gets_no_ack_and_no_download(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_download_enabled=True)
+        started: list[str] = []
+
+        async def _fake_download(url, outdir, max_mb=0):
+            started.append(url)
+            return links_mod.DownloadOutcome(path="C:/tmp/v.mp4")
+
+        engine._links.download_detailed = _fake_download
+        await engine._handle(
+            make_record(
+                is_group=True, content="这个划算 https://item.taobao.com/item.htm?id=1"
+            )
+        )
+        await self._drain(engine)
+        self.assertEqual(adapter.sent, [], "普通网页链接不该回「正在解析链接」")
+        self.assertEqual(started, [], "普通网页链接不该触发下载")
+        self.assertEqual(adapter.files, [])
+
+    async def test_media_link_still_acked(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        await engine._handle(make_record(is_group=True, content=f"看 {MEDIA_URL}"))
+        self.assertEqual([text for _, text in adapter.sent], ["正在解析链接"])
+
+    async def test_whitelist_can_be_turned_off(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_supported_only=False)
+        await engine._handle(
+            make_record(is_group=True, content="https://item.taobao.com/item.htm?id=1")
+        )
+        self.assertEqual([text for _, text in adapter.sent], ["正在解析链接"])
+
+    async def test_extra_sites_enable_custom_site(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_extra_sites="qq.com")
+        await engine._handle(
+            make_record(is_group=True, content="https://v.qq.com/x/cover/abc.html")
+        )
+        self.assertEqual([text for _, text in adapter.sent], ["正在解析链接"])
+
+
+class RecallCommandTests(unittest.IsolatedAsyncioTestCase):
+    """「@机器人 撤回」：撤掉机器人最新发出的媒体消息。"""
+
+    def _engine(self, adapter, **cfg_kwargs):
+        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options.update(cfg_kwargs)
+        cfg = BotConfig(**options)
+        return BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
+
+    async def _bot_sent_media(self, engine, chat="测试群", text="正在解析链接"):
+        """模拟机器人先回了一句提示，再发出一条媒体。"""
+        await engine._send_reply(chat, text)
+        await engine._send_file(chat, "C:/tmp/v.mp4", "链接内容")
+
+    def test_command_variants_are_recognized(self):
+        for text in (
+            "撤回",
+            "@灵语 撤回",
+            "@灵语\u2005撤回",
+            "/撤回",
+            "撤回一下",
+            "撤回吧",
+            "撤回上一条",
+        ):
+            self.assertTrue(
+                recall_mod.is_recall_command(text, ["撤回"]), text
+            )
+
+    def test_daily_talk_is_not_a_command(self):
+        for text in (
+            "别撤回",
+            "他撤回了",
+            "撤回的消息看不到吧",
+            "撤回这条消息为什么没了呢",
+            "这个视频撤回了吗",
+        ):
+            self.assertFalse(
+                recall_mod.is_recall_command(text, ["撤回"]), text
+            )
+
+    def test_at_mention_is_stripped(self):
+        self.assertEqual(recall_mod.normalize_command("@灵语\u2005撤回"), "撤回")
+        self.assertEqual(recall_mod.normalize_command("@灵语 撤回。"), "撤回")
+
+    async def test_recall_removes_latest_media_and_notices(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        await self._bot_sent_media(engine)
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m9", content="@灵语 撤回")
+        )
+        self.assertEqual(adapter.recalls, ["测试群"])
+        self.assertEqual(adapter.sent[-1], ("测试群", "已撤回上一条消息"))
+
+    async def test_recall_also_removes_followup_text(self):
+        """媒体后面又发了一条提示时，要连它一起撤才能撤到媒体。"""
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        await self._bot_sent_media(engine)
+        await engine._send_reply("测试群", "下载失败：网络不通，先不发了。")
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m9", content="撤回一下")
+        )
+        self.assertEqual(len(adapter.recalls), 2)
+
+    async def test_group_command_requires_at(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        await self._bot_sent_media(engine)
+        await engine._handle(make_record(is_at_me=False, content="撤回"))
+        self.assertEqual(adapter.recalls, [])
+
+    async def test_at_not_required_when_configured(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, recall_require_at=False)
+        await self._bot_sent_media(engine)
+        await engine._handle(make_record(is_at_me=False, content="撤回"))
+        self.assertEqual(adapter.recalls, ["测试群"])
+
+    async def test_private_chat_needs_no_at(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        await self._bot_sent_media(engine, chat="张三")
+        await engine._handle(
+            make_record(chat="张三", is_group=False, content="撤回")
+        )
+        self.assertEqual(adapter.recalls, ["张三"])
+
+    async def test_disabled_recall_falls_through_to_llm(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, recall_enabled=False)
+        await self._bot_sent_media(engine, chat="张三")
+        await engine._handle(
+            make_record(chat="张三", is_group=False, content="撤回")
+        )
+        self.assertEqual(adapter.recalls, [])
+        self.assertEqual(adapter.sent[-1], ("张三", "本鲸鱼娘收到啦。"))
+
+    async def test_admin_only_ignores_other_members(self):
+        adapter = FakeAdapter()
+        engine = self._engine(
+            adapter, recall_admin_only=True, recall_admins=["管理员"]
+        )
+        await self._bot_sent_media(engine)
+        await engine._handle(
+            make_record(sender="张三", is_at_me=True, message_id="m1", content="撤回")
+        )
+        self.assertEqual(adapter.recalls, [])
+        # 张三那条 @ 了机器人，模型回了一句（也进了账本），先清账再测管理员那条。
+        engine._recall_book.clear("测试群")
+        engine._recall_book.record_media("测试群", "C:/tmp/v.mp4", "链接内容")
+        await engine._handle(
+            make_record(sender="管理员", is_at_me=True, message_id="m2", content="撤回")
+        )
+        self.assertEqual(adapter.recalls, ["测试群"])
+
+    async def test_repeated_command_is_deduped(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        await self._bot_sent_media(engine)
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m1", content="撤回")
+        )
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m2", content="撤回")
+        )
+        self.assertEqual(adapter.recalls, ["测试群"], "连点两次只该撤一条")
+
+    async def test_failure_sends_fail_text(self):
+        adapter = FakeAdapter()
+        adapter.recall_ok = False
+        engine = self._engine(adapter)
+        await self._bot_sent_media(engine)
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m1", content="撤回")
+        )
+        self.assertEqual(adapter.sent[-1], ("测试群", "撤回失败，可能需要手动撤回"))
+
+    async def test_notice_can_be_disabled(self):
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, recall_notice_enabled=False)
+        await self._bot_sent_media(engine)
+        before = len(adapter.sent)
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m1", content="撤回")
+        )
+        self.assertEqual(adapter.recalls, ["测试群"])
+        self.assertEqual(len(adapter.sent), before)
+
+    async def test_recall_cancels_pending_download(self):
+        """撤回时把还没发出去的下载掐掉，免得刚撤完又冒出来一条。"""
+        adapter = FakeAdapter()
+        engine = self._engine(adapter, link_download_enabled=True)
+
+        async def _slow(url, outdir, max_mb=0):
+            await asyncio.sleep(5)
+            return links_mod.DownloadOutcome(path="C:/tmp/v.mp4")
+
+        engine._links.download_detailed = _slow
+        await engine._handle(make_record(is_group=True, content=f"看 {MEDIA_URL}"))
+        await asyncio.sleep(0.05)
+        self.assertTrue(engine._download_tasks, "下载任务应已在跑")
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m2", content="撤回")
+        )
+        await asyncio.sleep(0.05)
+        self.assertEqual(adapter.files, [], "被取消的下载不该再发文件")
+        self.assertEqual(engine._download_tasks, set())
+
+    async def test_expired_media_is_not_recalled(self):
+        """超过撤回时限的记录不再尝试（微信 2 分钟后只允许「删除」）。"""
+        adapter = FakeAdapter()
+        engine = self._engine(adapter)
+        engine._recall_book.record_media("测试群", "C:/tmp/v.mp4", "链接内容")
+        for item in engine._recall_book.recent("测试群"):
+            item.ts -= 600  # 十分钟前发的
+        await engine._handle(
+            make_record(is_at_me=True, message_id="m1", content="撤回")
+        )
+        # 账本里没有窗口内的媒体 → 兜底撤最新一条（仍会调用一次）。
+        self.assertEqual(adapter.recalls, ["测试群"])
+        self.assertNotIn(
+            recall_mod.KIND_MEDIA,
+            [item.kind for item in engine._recall_book.recent("测试群")],
+            "撤回成功后要把那条记录从账本上抹掉",
+        )
 
 
 class LinkConfigTests(unittest.TestCase):
@@ -4947,6 +5374,67 @@ class LinkConfigTests(unittest.TestCase):
         self.assertEqual(
             BotConfig.from_dict({"link_send_attempts": 0}).link_send_attempts, 0
         )
+
+    def test_supported_only_defaults_and_extra_sites(self):
+        cfg = BotConfig()
+        self.assertTrue(cfg.link_supported_only, "默认只解析媒体站点链接")
+        self.assertEqual(cfg.link_extra_site_list(), ())
+        cfg = BotConfig.from_dict(
+            {"link_extra_sites": "qq.com, v.youku.com\nfoo.cn"}
+        )
+        self.assertEqual(
+            cfg.link_extra_site_list(), ("qq.com", "v.youku.com", "foo.cn")
+        )
+
+
+class RecallConfigTests(unittest.TestCase):
+    """撤回相关配置的默认值与范围纠正。"""
+
+    def test_defaults(self):
+        cfg = BotConfig()
+        self.assertTrue(cfg.recall_enabled)
+        self.assertEqual(cfg.recall_keyword_list(), ["撤回"])
+        self.assertTrue(cfg.recall_require_at, "群里必须 @ 机器人才算指令")
+        self.assertFalse(cfg.recall_admin_only, "默认任何人都能喊停")
+        self.assertEqual(cfg.recall_window_seconds, 110.0)
+        self.assertEqual(cfg.recall_max_messages, 2)
+        self.assertTrue(cfg.recall_stop_download)
+        self.assertTrue(cfg.recall_notice_enabled)
+        self.assertEqual(cfg.recall_ok_text, "已撤回上一条消息")
+
+    def test_keywords_are_split(self):
+        # 前导的「/」会被去掉（指令里写「/撤回」也能命中），去重后只留两个。
+        cfg = BotConfig.from_dict({"recall_keywords": "撤回，撤掉 /撤回"})
+        self.assertEqual(cfg.recall_keyword_list(), ["撤回", "撤掉"])
+
+    def test_blank_keywords_fall_back(self):
+        """指令词留空等于「没有指令」，与关掉撤回重复，故回填默认值。"""
+        self.assertEqual(
+            BotConfig.from_dict({"recall_keywords": "   "}).recall_keywords, "撤回"
+        )
+
+    def test_window_is_clamped_to_wechat_limit(self):
+        """微信 2 分钟后只允许「删除」，时间窗不该超过 120 秒。"""
+        self.assertEqual(
+            BotConfig.from_dict({"recall_window_seconds": 999}).recall_window_seconds,
+            120.0,
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"recall_window_seconds": -1}).recall_window_seconds,
+            0.0,
+        )
+
+    def test_max_messages_is_clamped(self):
+        self.assertEqual(
+            BotConfig.from_dict({"recall_max_messages": 0}).recall_max_messages, 1
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"recall_max_messages": 99}).recall_max_messages, 5
+        )
+
+    def test_admins_are_trimmed(self):
+        cfg = BotConfig.from_dict({"recall_admins": [" 张三 ", "", "李四"]})
+        self.assertEqual(cfg.recall_admins, ["张三", "李四"])
 
 
 class SendAttemptsWiringTests(unittest.TestCase):
@@ -5187,7 +5675,7 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_link_info_injected_into_context(self):
         adapter = FakeAdapter()
         engine, llm = self._engine(adapter)
-        url = "https://example.com/v"
+        url = MEDIA_URL
         engine._links = StubResolver(
             {
                 url: LinkInfo(
@@ -5217,7 +5705,7 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_parse_disabled_no_link_block(self):
         adapter = FakeAdapter()
         engine, llm = self._engine(adapter, link_parse_enabled=False)
-        url = "https://example.com/v"
+        url = MEDIA_URL
         engine._links = StubResolver({url: LinkInfo(url=url, ok=True, title="X")})
         await engine.start()
         await adapter.dispatch(
@@ -5235,20 +5723,20 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
         await engine.start()
         await adapter.dispatch(
             make_record(
-                sender="李四", message_id="m0", content="之前的 https://old.example/x"
+                sender="李四", message_id="m0", content=f"之前的 {MEDIA_URL}"
             )
         )
         await adapter.pump()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1", content="在吗"))
         await adapter.pump()
         self.assertTrue(engine._links.batches)
-        self.assertIn("https://old.example/x", engine._links.batches[-1])
+        self.assertIn(MEDIA_URL, engine._links.batches[-1])
         await engine.stop()
 
     async def test_download_and_send_back(self):
         adapter = FakeAdapter()
         engine, _llm = self._engine(adapter, link_download_enabled=True)
-        url = "https://example.com/v"
+        url = MEDIA_URL
         engine._links = StubResolver(
             {url: LinkInfo(url=url, ok=True, title="X")},
             download_path="C:/tmp/v.mp4",
@@ -5264,7 +5752,7 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_disabled_sends_no_file(self):
         adapter = FakeAdapter()
         engine, _llm = self._engine(adapter)
-        url = "https://example.com/v"
+        url = MEDIA_URL
         engine._links = StubResolver(
             {url: LinkInfo(url=url, ok=True, title="X")},
             download_path="C:/tmp/v.mp4",
@@ -5281,7 +5769,7 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
         adapter = FakeAdapter()
         adapter.config = SimpleNamespace(allow_send_dirs=())
         engine, _llm = self._engine(adapter, link_download_enabled=True)
-        url = "https://example.com/v"
+        url = MEDIA_URL
         engine._links = StubResolver(
             {url: LinkInfo(url=url, ok=True, title="X")},
             download_path="C:/tmp/v.mp4",
@@ -5567,7 +6055,7 @@ class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
 
             engine._links.download_detailed = _fake_download
             await engine._download_and_send(
-                make_record(content="https://example.com/video")
+                make_record(content=MEDIA_URL)
             )
 
             self.assertFalse(old.exists(), "超出配额时应删掉最旧的下载")
@@ -5592,7 +6080,7 @@ class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
 
             engine._links.download_detailed = _fake_download
             await engine._download_and_send(
-                make_record(content="https://example.com/video")
+                make_record(content=MEDIA_URL)
             )
             self.assertTrue(old.exists(), "配额为 0 表示不限制，不应删除任何文件")
 
@@ -5613,7 +6101,7 @@ class DownloadRetryEngineTests(unittest.IsolatedAsyncioTestCase):
         )
         return BotEngine(self.adapter, cfg, llm_factory=lambda c: FakeLLM(c))
 
-    async def _run(self, engine, outcomes, url="https://example.com/v"):
+    async def _run(self, engine, outcomes, url=MEDIA_URL):
         """按顺序返回 outcomes（用完后重复最后一项），返回实际尝试次数。"""
         calls = []
 

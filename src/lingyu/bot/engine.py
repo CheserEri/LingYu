@@ -27,6 +27,7 @@ from typing import Any, Callable
 from ..adapters.wechat import WeChatAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
+from . import recall as recall_mod
 from . import storage, tweet, xiaohongshu
 from .card import note_to_card
 from .links import (
@@ -34,6 +35,7 @@ from .links import (
     LinkResolver,
     extract_urls,
     format_link_block,
+    supported_urls,
     usable_cookies_file,
 )
 from .llm import LLMClient, LLMError
@@ -190,6 +192,14 @@ class BotEngine:
         # 同一个链接不会并发下载多次。
         self._download_tasks: set[asyncio.Task] = set()
         self._downloading_urls: set[str] = set()
+        # 下载任务 → 会话显示名：撤回时要把该会话还没发出去的下载一起掐掉，
+        # 免得刚撤完又冒出来一条同样的内容。
+        self._download_task_chat: dict[asyncio.Task, str] = {}
+
+        # 撤回：记录机器人最近发出的消息（文本 + 附件），供「@机器人 撤回」定位。
+        self._recall_book = recall_mod.RecallBook()
+        # 会话 → 上次执行撤回的时间，避免连点/重复投递把后续消息也撤了。
+        self._last_recall_at: dict[str, float] = {}
 
         # 桌面壳可注入：新日志产生时回调（用于推送到前端）。
         self.on_log: Callable[[LogLine], Any] | None = None
@@ -410,6 +420,11 @@ class BotEngine:
         if record.message_id and record.message_id in self._processed_ids:
             return
 
+        # 撤回指令最先处理：违规内容越早撤掉越好，不能被链接服务、冷却或
+        # 「拟人化概率」这些挡在前面。
+        if await self._handle_recall(record):
+            return
+
         # 链接服务：与「这条消息要不要回」无关。群里没 @ 机器人也该解析，
         # 因为这是确定性动作，不是「接话」。放在 _should_reply 之前。
         acked = await self._handle_links(record)
@@ -497,6 +512,146 @@ class BotEngine:
         # 链接内容的「下载并回发」已由 _handle_links 统一调度（无论这条消息
         # 是否触发模型回复），这里不再重复调度，避免同一链接被下载两次。
 
+    # ------------------------------------------------------------------ 撤回
+
+    def _is_recall_admin(self, sender: str) -> bool:
+        name = str(sender or "").strip()
+        if not name:
+            return False
+        return name in {item.strip() for item in self._config.recall_admins}
+
+    def _cancel_downloads(self, chat: str) -> int:
+        """取消该会话还没跑完的「下载并回发」任务，返回取消数量。
+
+        正在跑的下载线程本身停不下来（线程池任务不可取消），但协程被取消后
+        就**不会**再走到发送那一步——这正是撤回想要的效果。
+        """
+        cancelled = 0
+        for task in list(self._download_tasks):
+            if self._download_task_chat.get(task) != chat:
+                continue
+            if task.done():
+                continue
+            task.cancel()
+            cancelled += 1
+        return cancelled
+
+    async def _handle_recall(self, record: MessageRecord) -> bool:
+        """处理「@机器人 撤回」：撤掉机器人最新发出的（媒体）消息。
+
+        返回 True 表示这条消息已被当成指令消费掉，后面不再走链接服务/大模型。
+        """
+        config = self._config
+        if not config.recall_enabled:
+            return False
+        if not recall_mod.is_recall_command(
+            record.content, config.recall_keyword_list()
+        ):
+            return False
+        # 群聊作用范围：不在关注群里的「撤回」不当指令，避免误操作别的群。
+        if record.is_group:
+            if not self._in_group_scope(record):
+                return False
+            if config.recall_require_at and not record.is_at_me:
+                # 群里必须 @ 机器人：日常聊天里出现「撤回」两个字太常见了。
+                self._log(
+                    "info",
+                    f"群内「撤回」未 @ 机器人，不当指令 [{record.chat}] "
+                    f"{record.sender}。",
+                )
+                return False
+            if config.recall_admin_only and not self._is_recall_admin(
+                record.sender
+            ):
+                self._log(
+                    "info",
+                    f"「撤回」指令来自非授权成员，忽略 [{record.chat}] "
+                    f"{record.sender}。",
+                )
+                return False
+
+        chat = record.chat
+        now = time.time()
+        # 指令已被消费：记进已处理集合，重复投递不会再撤一次。
+        if record.message_id and record.message_id not in self._processed_ids:
+            self._processed_ids.append(record.message_id)
+        # 连点/重复投递：3 秒内的第二条指令直接吞掉，否则会把更早的正常消息也撤了。
+        if now - self._last_recall_at.get(chat, 0.0) < 3.0:
+            self._log("info", f"撤回指令过于频繁，忽略 [{chat}]。")
+            return True
+        self._last_recall_at[chat] = now
+
+        self._log(
+            "info", f"收到撤回指令 [{chat}] {record.sender}：{record.content[:30]}"
+        )
+        if config.recall_stop_download:
+            stopped = self._cancel_downloads(chat)
+            if stopped:
+                self._log("info", f"已取消 {stopped} 个未完成的下载回发 [{chat}]。")
+
+        plan = self._recall_book.plan(
+            chat,
+            now=now,
+            window=config.recall_window_seconds,
+            max_items=config.recall_max_messages,
+        )
+        if not plan:
+            # 账本里没有媒体记录（刚重启、或撤的不是链接内容）：兜底撤最新一条，
+            # 微信只提供「撤最新一条」，能撤掉就是有用的。
+            plan = self._recall_book.plan(
+                chat,
+                now=now,
+                window=config.recall_window_seconds,
+                max_items=1,
+                require_media=False,
+            )
+        fallback_single = not plan
+        if fallback_single:
+            plan = [recall_mod.SentItem(kind="unknown")]
+
+        recalled: list[recall_mod.SentItem] = []
+        for item in plan:
+            if not await self._recall_one(chat):
+                break
+            recalled.append(item)
+
+        if recalled:
+            self._recall_book.forget(chat, len(recalled))
+            described = "、".join(
+                item.describe() for item in recalled if item.kind != "unknown"
+            )
+            self._log(
+                "info",
+                f"已撤回 {len(recalled)} 条消息 [{chat}]"
+                + (f"：{described}" if described else "。"),
+            )
+        else:
+            self._log("warning", f"撤回失败 [{chat}]（可能已超过 2 分钟或窗口不可识别）。")
+
+        if config.recall_notice_enabled:
+            text = config.recall_ok_text if recalled else config.recall_fail_text
+            if text:
+                await self._send_reply(chat, text)
+        return True
+
+    async def _recall_one(self, chat: str) -> bool:
+        """让适配层撤回该会话最新一条机器人消息；成功返回 True。"""
+        action = getattr(self._adapter, "recall_last_message", None)
+        if action is None:
+            self._log("warning", "适配层不支持撤回，已跳过。")
+            return False
+        try:
+            result = await action(chat)
+        except Exception as exc:  # 撤回失败不该影响后续消息处理
+            self._log("warning", f"撤回异常：{exc}")
+            return False
+        if getattr(result, "ok", False):
+            return True
+        self._log("warning", f"撤回未成功：{_send_error(result)}")
+        return False
+
+    # ------------------------------------------------------------------ 发送
+
     async def _send_reply(self, chat_display: str, reply: str) -> bool:
         """按拟人化规则分条发送回复；任一条失败即停止并返回 False。"""
         parts = self._split_reply(reply)
@@ -507,6 +662,8 @@ class BotEngine:
                 message = (result.error or {}).get("message", "结果未确认")
                 self._log("error", f"回复发送失败：{message}")
                 return False
+            # 记账：撤回指令要能定位到「机器人最新发了什么」。
+            self._recall_book.record_text(chat_display, part)
             if index < len(parts) - 1:
                 await asyncio.sleep(
                     random.uniform(
@@ -677,6 +834,17 @@ class BotEngine:
 
     # ------------------------------------------------------------------ 链接解析
 
+    def _supported_urls(self, text: str) -> list[str]:
+        """消息里**值得处理**的链接。
+
+        默认只认媒体站点白名单（抖音/B 站/YouTube/X/小红书…）：购物、团购、
+        新闻、公众号文章这类链接既没有音视频可发，也不该让机器人去解析并回一句
+        「解析失败」。关掉 ``link_supported_only`` 才回到「所有链接都试一遍」。
+        """
+        if not self._config.link_supported_only:
+            return extract_urls(text)
+        return supported_urls(text, self._config.link_extra_site_list())
+
     def _context_items(self, chat: str) -> list[HistoryItem]:
         """当前会话送给模型的最近上下文（受 context_messages 限制）。"""
         items = self._history.get(chat)
@@ -685,11 +853,15 @@ class BotEngine:
         return list(items)[-self._config.context_messages :]
 
     async def _prefetch_links(self, chat: str) -> None:
-        """解析上下文里出现过的链接（带缓存，已解析过的不会重复请求）。"""
+        """解析上下文里出现过的**媒体站点**链接（带缓存，已解析过的不重复请求）。
+
+        普通网页链接（购物、新闻、公众号…）不在这里解析：它们进不了上下文块，
+        解析它们只是白白多发几次请求。
+        """
         urls: list[str] = []
         for item in self._context_items(chat):
             if item.role == "user" and item.content:
-                urls.extend(extract_urls(item.content))
+                urls.extend(self._supported_urls(item.content))
         if not urls:
             return
         try:
@@ -706,25 +878,28 @@ class BotEngine:
         infos = [
             info
             for info in (
-                self._links.cached(url) for url in extract_urls(item.content)
+                self._links.cached(url) for url in self._supported_urls(item.content)
             )
             if info is not None
         ]
         return format_link_block(infos)
 
     async def _handle_links(self, record: MessageRecord) -> bool:
-        """链接服务：识别到链接就回一句**固定**提示，并把链接内容处理掉。
+        """链接服务：识别到**媒体链接**就回一句固定提示，并把内容处理掉。
 
         刻意**独立于** ``_should_reply``：群聊里没 @ 机器人时也要解析链接，
         因为这是确定性的服务动作，不是「接话」。提示语由配置写死，
         **不经过大模型**（``link_ack_text``），避免为一句「正在解析链接」烧 token。
+
+        只有「媒体站点白名单」里的链接才会走到这里：购物、团购、新闻这类链接
+        既不解析、也不提示——**失败提示只在真的下载不下来、发不出去时出现**。
 
         返回是否真的发出了固定提示（供 ``link_llm_followup`` 判断要不要再让模型接话）。
         """
         config = self._config
         if not config.link_parse_enabled:
             return False
-        if not extract_urls(record.content):
+        if not self._supported_urls(record.content):
             return False
         # 群聊作用范围：只在配置允许的群里动手，避免在无关群里刷屏。
         if record.is_group and not self._in_group_scope(record):
@@ -763,16 +938,18 @@ class BotEngine:
 
         同一个链接在下载完成前不会重复起任务（用户可能连着发几次同一条链接）。
         """
-        urls = extract_urls(record.content)[: self._config.link_download_max]
+        urls = self._supported_urls(record.content)[: self._config.link_download_max]
         fresh = [url for url in urls if url not in self._downloading_urls]
         if not fresh:
             return
         self._downloading_urls.update(fresh)
         task = asyncio.create_task(self._download_and_send(record))
         self._download_tasks.add(task)
+        self._download_task_chat[task] = record.chat
 
         def _done(_task: "asyncio.Task[None]") -> None:
             self._download_tasks.discard(task)
+            self._download_task_chat.pop(task, None)
             self._downloading_urls.difference_update(fresh)
 
         task.add_done_callback(_done)
@@ -784,7 +961,7 @@ class BotEngine:
         （两者共用同一套版式），推文/笔记**含视频**时再下载视频一并回发；
         其它链接沿用「下载后回发」。
         """
-        urls = extract_urls(record.content)[: self._config.link_download_max]
+        urls = self._supported_urls(record.content)[: self._config.link_download_max]
         if not urls:
             return
         outdir = self._config.download_dir()
@@ -1107,6 +1284,8 @@ class BotEngine:
             return False
         if getattr(result, "ok", False):
             self._log("info", f"已发回{label}：{Path(path).name}")
+            # 记账：媒体是「违规内容」的主要载体，撤回时优先撤它。
+            self._recall_book.record_media(chat, path, label)
             return True
         self._log("warning", f"{label} 发送未成功：{_send_error(result)}")
         return False

@@ -3100,6 +3100,224 @@ class WeChatBridge:
         logger.info(f"文件已发送到 [{room_name}]: {path}")
         return True
 
+    async def recall_last_message(
+        self,
+        room_name: str,
+        timeout: float = 30.0,
+    ) -> bool:
+        """撤回该会话里**机器人最新发出的一条**消息。
+
+        底层微信只提供「撤回自己发的、2 分钟内的最新一条消息」：右键最新消息行，
+        点菜单里的「撤回」（UIA 优先，OCR 兜底，见 ``uia_driver.recall_last_message``）。
+        这里与发送共用一把闸门——撤回同样是「操作微信窗口」，和发送并行会互相
+        抢焦点、把右键菜单点飞。
+        """
+        if not self._wx or self._status != ConnectionStatus.CONNECTED:
+            logger.error("微信未连接，无法撤回消息")
+            return False
+        if self._backend != "wechatauto":
+            logger.error(f"当前后端 {self._backend} 不支持撤回消息")
+            return False
+
+        logger.info(f"开始撤回最近一条消息: [{room_name}]")
+        send_gate = self._get_send_gate()
+        gate_held = False
+        try:
+            await send_gate.acquire()
+            gate_held = True
+            wait = (
+                self._last_send_at
+                + self.SEND_MIN_INTERVAL_SECONDS
+                - time.monotonic()
+            )
+            if wait > 0:
+                await asyncio.sleep(wait)
+            ok = bool(
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._recall_sync, room_name),
+                    timeout=max(5.0, float(timeout)),
+                )
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"撤回超时（{timeout:.0f}s）: [{room_name}]")
+            return False
+        except Exception as exc:
+            logger.error(f"撤回异常: [{room_name}] {exc}")
+            return False
+        finally:
+            if gate_held:
+                send_gate.release()
+
+        if ok:
+            self._last_send_at = time.monotonic()
+            logger.info(f"已撤回 [{room_name}] 最近一条消息")
+        else:
+            logger.error(f"撤回未成功: [{room_name}]")
+        return ok
+
+    def _recall_sync(self, room_name: str) -> bool:
+        """在线程里执行撤回（UIA 要操作窗口，不能占事件循环）。
+
+        优先用 ``WeChat.RecallLastMessage``（自带后端选择）；该版本没有这个方法
+        时退回 UIA 驱动的 ``recall_last_message``。
+        """
+        try:
+            from wechatauto.utils.lock import LockManager
+        except Exception:  # 没有 LockManager 时不必强求，UIA 自己会等窗口
+            LockManager = None  # type: ignore[assignment]
+        try:
+            if LockManager is not None:
+                with LockManager.acquire():
+                    return self._recall_once(room_name)
+            return self._recall_once(room_name)
+        except Exception as exc:
+            logger.error(f"撤回失败: {exc}")
+            return False
+
+    def _recall_once(self, room_name: str) -> bool:
+        uia = self._uia_driver()
+        if uia is not None and self._recall_via_uia(uia, room_name):
+            return True
+        recall = getattr(self._wx, "RecallLastMessage", None)
+        if callable(recall):
+            result = recall(who=room_name)
+            ok = bool(getattr(result, "is_success", result))
+            if not ok:
+                logger.warning(f"撤回未成功: {result}")
+            return ok
+        if uia is not None and hasattr(uia, "recall_last_message"):
+            return bool(uia.recall_last_message(room_name))
+        logger.error("当前微信版本不支持撤回（未找到 UIA 驱动）")
+        return False
+
+    def _uia_driver(self):
+        """取底层 UIA 驱动实例；拿不到返回 None。"""
+        gui = getattr(self._wx, "_gui", None)
+        getter = getattr(gui, "_get_uia", None)
+        try:
+            return getter() if callable(getter) else None
+        except Exception:
+            return None
+
+    def _recall_via_uia(self, uia, room_name: str) -> bool:
+        """右键**机器人自己最新的一条消息**，再点菜单里的「撤回」。
+
+        底层 ``RecallLastMessage`` 右键的是「可视区最底部那条」消息，不管是
+        谁发的；群里有人紧跟着回话时就会右键到别人的消息上，菜单里没有
+        「撤回」，撤回随之失败——而这正是「刚发出违规视频、群里已经有人
+        说话」的典型场景。这里改成先认出「自己发的行」（内容重心靠右），
+        再右键它，命中率更高。
+        """
+        try:
+            ensure = getattr(uia, "ensure_window", None)
+            if callable(ensure) and not ensure():
+                return False
+            current = getattr(uia, "current_chat", None)
+            if room_name and callable(current):
+                name = current() or ""
+                if not (name == room_name or name.startswith(f"{room_name} ")):
+                    opener = getattr(uia, "open_chat", None)
+                    if not callable(opener) or not opener(room_name):
+                        return False
+            lister = getattr(uia, "_message_list", None)
+            if not callable(lister):
+                return False
+            message_list = lister()
+            if message_list is None:
+                return False
+            target = self._latest_self_row(message_list)
+            if target is None:
+                return False
+            control, centroid_x = target
+            rect = control.BoundingRectangle
+            center_y = (rect.top + rect.bottom) // 2
+            setter = getattr(uia, "_set_cursor", None)
+            right_click = getattr(uia, "_right_click", None)
+            find_item = getattr(uia, "_uia_find_menu_item", None)
+            click_item = getattr(uia, "_uia_click_menu_item", None)
+            if not all(
+                callable(item)
+                for item in (setter, right_click, find_item, click_item)
+            ):
+                return False
+            setter(centroid_x, center_y)
+            time.sleep(0.2)
+            right_click()
+            time.sleep(1.0)
+            item = find_item("撤回")
+            if item is None:
+                logger.warning("右键菜单里没有「撤回」（可能已超过 2 分钟）")
+                return False
+            return bool(click_item(item))
+        except Exception as exc:
+            logger.debug(f"UIA 撤回失败: {exc}")
+            return False
+
+    def _latest_self_row(self, message_list):
+        """可视区内最新的一条「自己发的」消息行，返回 ``(控件, 内容重心 x)``。"""
+        rows: list[tuple[object, object]] = []
+        try:
+            children = list(message_list.GetChildren())
+        except Exception:
+            return None
+        for child in children:
+            try:
+                class_name = child.ClassName or ""
+                if not class_name.startswith("mmui::Chat"):
+                    continue
+                # 时间分隔行不是消息
+                if class_name in (
+                    "mmui::ChatItemView",
+                    "mmui::ChatSystemInfoItemView",
+                ):
+                    continue
+                rect = child.BoundingRectangle
+                if rect.bottom - rect.top < 40:
+                    continue
+                rows.append((child, rect))
+            except Exception:
+                continue
+        for child, rect in sorted(
+            rows, key=lambda item: item[1].bottom, reverse=True
+        ):
+            centroid_x = self._row_ink_centroid_x(rect)
+            if centroid_x is None:
+                continue
+            if centroid_x > (rect.left + rect.right) / 2:
+                return child, centroid_x
+        return None
+
+    @staticmethod
+    def _row_ink_centroid_x(rect) -> int | None:
+        """一行里「有内容」像素的水平重心（绝对坐标）。
+
+        自己发的消息气泡靠右、对方的靠左，据此判断某一行是不是机器人发的。
+        没有 numpy 也能算：把二值化后的截图按列压成 1 像素高，再读每列均值。
+        """
+        try:
+            from PIL import Image, ImageGrab
+        except Exception:  # 没有 Pillow 就放弃自判，交给上层兜底
+            return None
+        try:
+            image = ImageGrab.grab(
+                bbox=(rect.left, rect.top, rect.right, rect.bottom)
+            )
+            mask = image.convert("L").point(
+                lambda value: 255 if value < 235 else 0
+            )
+            width = mask.width
+            if width <= 0:
+                return None
+            # 按列求均值（BOX 重采样）：得到长度 = 宽度的「每列墨量」。
+            values = list(mask.resize((width, 1), Image.BOX).getdata())
+        except Exception:
+            return None
+        total = sum(values)
+        if total <= 0:
+            return None
+        centroid = sum(index * value for index, value in enumerate(values)) / total
+        return int(rect.left + centroid)
+
     async def _observe_file_send(
         self,
         task: asyncio.Task,

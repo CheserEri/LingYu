@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from .recall import parse_keywords as parse_recall_keywords
 
 
 def default_config_path() -> Path:
@@ -165,6 +168,35 @@ class BotConfig:
     # 默认 True：私聊等原本会回复的场景保持原样（多一条提示）。
     # 设为 False 则「带链接的消息只回固定提示 + 回发解析结果」，不烧 token。
     link_llm_followup: bool = True
+    # 只处理「能真正解析出东西」的媒体站点链接（抖音/B 站/YouTube/X/小红书…）。
+    # 购物、团购、新闻、公众号等普通网页链接**不解析、不下载、也不提示失败**——
+    # 它们既没有音视频可发，逐条解析只会多一次无用的网络请求和一句噪音。
+    link_supported_only: bool = True
+    # 白名单之外还想解析的站点（逗号/换行分隔的域名，子域同样命中）。
+    # 命中这些域名的链接按「其它媒体」处理，走内置 yt-dlp 通用提取。
+    link_extra_sites: str = ""
+
+    # ---- 撤回（违规内容应急下架）----
+    # 开启后，聊天里有人发「@机器人 撤回」就会撤回机器人最新发出的媒体消息。
+    recall_enabled: bool = True
+    # 指令词（逗号分隔）。识别时只认「指令词 + 允许的后缀」（撤回一下 / 撤回吧…），
+    # 像「别撤回」「撤回的消息看不到」这类日常对话不会被误判。
+    recall_keywords: str = "撤回"
+    # 群里是否必须 @ 机器人才算指令（推荐开启，避免把日常聊天里的「撤回」当指令）。
+    recall_require_at: bool = True
+    # 只允许指定成员下指令（默认 False：群里任何人都能喊停，违规内容越快撤掉越好）。
+    recall_admin_only: bool = False
+    recall_admins: list[str] = field(default_factory=list)
+    # 只撤这个时间窗内发出的消息（微信撤回时限 2 分钟，留点余量）。
+    recall_window_seconds: float = 110.0
+    # 最多一次撤几条：要撤到媒体，可能得连它后面发的提示一起撤。
+    recall_max_messages: int = 2
+    # 撤回时顺带取消该会话还没发出去的下载任务（避免刚撤完又冒出来一条）。
+    recall_stop_download: bool = True
+    # 撤回后是否回一句结果（固定文案，不经过大模型）。
+    recall_notice_enabled: bool = True
+    recall_ok_text: str = "已撤回上一条消息"
+    recall_fail_text: str = "撤回失败，可能需要手动撤回"
 
     def normalized_api_base(self) -> str:
         """去掉末尾斜杠，便于拼接 /chat/completions。"""
@@ -256,7 +288,46 @@ class BotConfig:
         # 文案留空即视为「不发提示」，故不做默认值回填（只去空白与换行）。
         config.link_ack_text = " ".join(str(config.link_ack_text or "").split())
         config.link_llm_followup = bool(config.link_llm_followup)
+        config.link_supported_only = bool(config.link_supported_only)
+        config.link_extra_sites = str(config.link_extra_sites or "").strip()
+        # 撤回参数。
+        config.recall_enabled = bool(config.recall_enabled)
+        # 指令词留空会变成「没有指令」，这与「关掉撤回」重复，故空串回填默认值。
+        config.recall_keywords = (
+            " ".join(str(config.recall_keywords or "").split()) or "撤回"
+        )
+        config.recall_require_at = bool(config.recall_require_at)
+        config.recall_admin_only = bool(config.recall_admin_only)
+        # 手改配置文件时可能把名单写成一行字符串，这里一并兼容。
+        raw_admins = config.recall_admins
+        if isinstance(raw_admins, str):
+            raw_admins = re.split(r"[,，、;；\s]+", raw_admins)
+        config.recall_admins = [
+            str(item).strip() for item in (raw_admins or []) if str(item).strip()
+        ]
+        # 超过 120 秒微信就不让撤了，钳到上限免得给出一个做不到的承诺。
+        config.recall_window_seconds = min(
+            120.0, max(0.0, float(config.recall_window_seconds))
+        )
+        config.recall_max_messages = min(
+            5, max(1, int(config.recall_max_messages))
+        )
+        config.recall_stop_download = bool(config.recall_stop_download)
+        config.recall_notice_enabled = bool(config.recall_notice_enabled)
+        config.recall_ok_text = " ".join(str(config.recall_ok_text or "").split())
+        config.recall_fail_text = " ".join(
+            str(config.recall_fail_text or "").split()
+        )
         return config
+
+    def link_extra_site_list(self) -> tuple[str, ...]:
+        """白名单之外的站点域名（配置里用逗号/换行分隔）。"""
+        raw = re.split(r"[,，、;；\s]+", str(self.link_extra_sites or ""))
+        return tuple(item.strip().lower() for item in raw if item.strip())
+
+    def recall_keyword_list(self) -> list[str]:
+        """撤回指令词列表。"""
+        return parse_recall_keywords(self.recall_keywords)
 
     def download_dir(self) -> Path:
         """链接下载目录：显式配置优先，否则用 %APPDATA%\\lingyu\\downloads。"""

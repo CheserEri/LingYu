@@ -58,9 +58,11 @@ class FakeBridge:
         self.listening = False
         self.sent: list[tuple[str, str]] = []
         self.sent_files: list[tuple[str, str]] = []
+        self.recalled: list[str] = []
         self.fail_send = False
         self.raise_on_send = False
         self.fail_send_file = False
+        self.fail_recall = False
         # 供 search_contact 使用的本地联系人库句柄。
         self._wx = SimpleNamespace(_db=FakeContactDb())
 
@@ -97,6 +99,12 @@ class FakeBridge:
         if self.fail_send_file:
             return False
         self.sent_files.append((room_name, file_path))
+        return True
+
+    async def recall_last_message(self, room_name: str) -> bool:
+        if self.fail_recall:
+            return False
+        self.recalled.append(room_name)
         return True
 
     def start_listening(self, loop) -> None:
@@ -168,6 +176,28 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status.window_visible)
         self.assertEqual(status.backend, "fake")
         self.assertTrue(self.bridge.listening)
+
+    # ---------------------------------------------------------------- 撤回
+
+    async def test_recall_last_message(self):
+        await self.adapter.connect()
+        result = await self.adapter.recall_last_message("测试群")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, SendStatus.SENT)
+        self.assertEqual(self.bridge.recalled, ["测试群"])
+
+    async def test_recall_failure_is_not_reported_as_success(self):
+        await self.adapter.connect()
+        self.bridge.fail_recall = True
+        result = await self.adapter.recall_last_message("测试群")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, SendStatus.FAILED)
+        self.assertIn("2 分钟", result.error["message"])
+
+    async def test_recall_before_connect_fails(self):
+        result = await self.adapter.recall_last_message("测试群")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error["code"], "not_connected")
 
     async def test_disconnect(self):
         await self.adapter.connect()

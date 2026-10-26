@@ -95,6 +95,118 @@ def contains_url(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 站点白名单：只处理「真的能解析出东西」的媒体平台
+# --------------------------------------------------------------------------- #
+#
+# 聊天里出现的链接绝大多数是购物、团购、招聘、新闻、公众号文章……这些既没有
+# 音视频可下，也不该让机器人去逐条解析——解析它们只会带来一次无意义的网络
+# 请求，以及一句「解析失败」的噪音。故这里维护一份**媒体站点白名单**，
+# 只有命中白名单的链接才进入「解析 / 下载 / 固定提示」流程。
+#
+# 站点名同时用于日志与提示文案（例如「抖音解析失败」）。
+SUPPORTED_SITES: dict[str, str] = {
+    # 抖音：走浏览器桥（a_bogus 签名）
+    "douyin.com": "抖音",
+    "iesdouyin.com": "抖音",
+    # 快手
+    "kuaishou.com": "快手",
+    "gifshow.com": "快手",
+    "chenzhongtech.com": "快手",
+    # 哔哩哔哩：b23.tv 是分享短链，先展开再解析
+    "bilibili.com": "哔哩哔哩",
+    "b23.tv": "哔哩哔哩",
+    "bili2233.cn": "哔哩哔哩",
+    # YouTube
+    "youtube.com": "YouTube",
+    "youtu.be": "YouTube",
+    # X（Twitter）：t.co 是短链
+    "x.com": "X",
+    "twitter.com": "X",
+    "t.co": "X",
+    # 小红书：xhslink 是分享短链
+    "xiaohongshu.com": "小红书",
+    "xhslink.com": "小红书",
+    "xhslink.cn": "小红书",
+    # 微博
+    "weibo.com": "微博",
+    "weibo.cn": "微博",
+    "t.cn": "微博",
+    # TikTok
+    "tiktok.com": "TikTok",
+    # 西瓜视频 / 好看视频
+    "ixigua.com": "西瓜视频",
+    "haokan.baidu.com": "好看视频",
+    # Instagram
+    "instagram.com": "Instagram",
+    # Vimeo
+    "vimeo.com": "Vimeo",
+    # 网易云音乐 / QQ 音乐（yt-dlp 能取元数据）
+    "music.163.com": "网易云音乐",
+    "y.qq.com": "QQ音乐",
+}
+
+
+def url_host(url: str) -> str:
+    """取 URL 的主机名（小写、去端口与 userinfo、去 ``www.`` 前缀）。"""
+    try:
+        host = urllib.parse.urlsplit((url or "").strip()).netloc.lower()
+    except ValueError:
+        return ""
+    if "@" in host:  # 去掉 userinfo
+        host = host.rsplit("@", 1)[-1]
+    host = host.split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def site_label(url: str) -> str:
+    """命中白名单时返回站点名（如「抖音」），否则返回空串。"""
+    host = url_host(url)
+    if not host:
+        return ""
+    for domain, label in SUPPORTED_SITES.items():
+        if host == domain or host.endswith("." + domain):
+            return label
+    return ""
+
+
+def is_supported_url(url: str, extra_sites: tuple[str, ...] | list[str] = ()) -> bool:
+    """是否「值得解析」的媒体链接。
+
+    ``extra_sites`` 是用户额外补充的域名（子域同样命中），用来支持白名单
+    之外的站点；命中这些域名时按「其它媒体」处理（走 yt-dlp 通用提取）。
+    """
+    if site_label(url):
+        return True
+    host = url_host(url)
+    if not host:
+        return False
+    for domain in extra_sites:
+        item = str(domain or "").strip().lower().lstrip(".")
+        if item.startswith("www."):
+            item = item[4:]
+        if not item:
+            continue
+        if host == item or host.endswith("." + item):
+            return True
+    return False
+
+
+def supported_urls(
+    text: str, extra_sites: tuple[str, ...] | list[str] = ()
+) -> list[str]:
+    """从文本里抽出**媒体站点**链接（顺序去重）。
+
+    购物、新闻、公众号等普通网页不会返回，因此也不会触发解析、下载或
+    「无法解析」的提示。
+    """
+    return [
+        url for url in extract_urls(text) if is_supported_url(url, extra_sites)
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # 内置 yt-dlp 的导入引导
 # --------------------------------------------------------------------------- #
 
