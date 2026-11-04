@@ -43,6 +43,7 @@ dependencies = [
     "pillow>=10",
     "pywebview>=5",
     "loguru>=0.7",
+    "psutil>=5.9",
 ]
 
 [project.scripts]

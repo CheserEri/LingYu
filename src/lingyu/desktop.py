@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import io
+import json
+import os
 import sys
 import webbrowser
 import threading
@@ -27,6 +29,7 @@ import webview
 
 from .adapters.wechat import WeChatAdapter
 from .bot import BotConfig, BotEngine, default_config_path
+from .bridge import GuiBridge
 from .bot.llm import LLMClient, LLMError
 from .config import AdapterConfig
 from .unblock import unblock_bundled_assemblies
@@ -345,6 +348,8 @@ class DesktopApi:
         self.engine: BotEngine | None = None
         self.config: BotConfig | None = None
         self._ready = threading.Event()
+        self.bridge: GuiBridge | None = None
+        self.bridge_url = ""
 
     def _call(self, coro: Any, timeout: float = DEFAULT_TIMEOUT) -> Any:
         self._ready.wait(timeout=timeout)
@@ -355,15 +360,91 @@ class DesktopApi:
     async def _bootstrap_async(self) -> None:
         self.adapter = WeChatAdapter(AdapterConfig.from_env())
         self.config = BotConfig.load()
+        self._apply_send_dirs()
         self.engine = BotEngine(self.adapter, self.config)
         # 引擎就绪后接管控制台输出，连接微信期间的日志即可直接显示到界面。
         UI_LOG.attach(self.engine)
         # 界面那份只在内存里（进程一退就没了），再转发一份给 loguru 才能落盘。
         self.engine.on_log = forward_engine_log
         # 连接失败不阻塞界面，用户可在状态页重连。
-        await self.adapter.connect()
+        try:
+            await self.adapter.connect()
+        except Exception:
+            self.engine.log("info", "微信连接失败（可在界面手动重连）")
+            pass
+        try:
+            self.bridge = GuiBridge(self._bridge_call)
+            self.bridge_url = self.bridge.start()
+        except Exception as e:
+            self.engine.log("warning", f"GUI bridge 启动失败: {e}")
+            self.bridge = None
+            self.bridge_url = None
+        bridge_file = Path(os.environ.get("APPDATA", str(Path.home()))) / "lingyu" / "gui-bridge.json"
+        bridge_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            bridge_file.write_text(
+                json.dumps(
+                    {
+                        "url": self.bridge_url,
+                        "token": self.bridge.token if self.bridge else "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except PermissionError:
+            self.engine.log("warning", "gui-bridge.json 写入失败（可能被占用）")
+        except Exception as e:
+            self.engine.log("warning", f"gui-bridge.json 写入失败: {e}")
+        print(f"LingYu GUI bridge: {self.bridge_url}")
+        # 纯触发 HTTP 模式必须先启动 Webhook，再接收微信事件。
+        if self.config.webhook_enabled or (
+            self.config.agent_enabled
+            and self.config.agent_self_reply
+            and self.config.agent_reply_transport == "http"
+        ):
+            from .webhook import start_webhook
+            try:
+                # 创建临时的 WeChatService 用于 webhook
+                from .service import WeChatService
+                svc = WeChatService(adapter=self.adapter)
+                self._webhook_server, self._webhook_thread = start_webhook(
+                    svc,
+                    self.config.webhook_port,
+                    self.config.webhook_token or None,
+                    loop=self._hub.loop,
+                )
+                self.config.webhook_token = getattr(self._webhook_server, "webhook_token", self.config.webhook_token)
+                print(f"Webhook 已启动: http://127.0.0.1:{self.config.webhook_port}/webhook")
+            except Exception as e:
+                print(f"Webhook 启动失败: {e}", file=sys.stderr)
         if self.config.enabled:
             await self.engine.start()
+
+    def _bridge_call(self, path: str, payload: dict) -> Any:
+        async def call() -> Any:
+            if path == "/status":
+                return self.adapter.get_status().to_dict()
+            if path == "/send_message":
+                self.engine.log("info", f"Codex MCP 请求发送微信消息 [{payload.get('recipient', '')}]。")
+                self.engine.log("debug", f"共享发送进入 GUI 事件循环 [{payload.get('recipient', '')}]。")
+                result = (await self.adapter.send_message(**payload)).to_dict()
+                self.engine.log("info" if result.get("ok") else "error", f"Codex MCP 发送结果：{result.get('status', 'unknown')}。")
+                return result
+            if path == "/send_file":
+                return (await self.adapter.send_file(**payload)).to_dict()
+            if path == "/recent_messages":
+                return self.adapter.get_recent_messages(**payload).to_dict()
+            if path == "/chat_history":
+                return self.adapter.get_chat_history(**payload).to_dict()
+            if path == "/chat_list":
+                return self.adapter.get_chat_list(**payload).to_dict()
+            if path == "/chat_info":
+                return self.adapter.get_chat_info(**payload).to_dict()
+            if path == "/search_contact":
+                return self.adapter.search_contact(**payload).to_dict()
+            raise ValueError(f"unknown bridge path: {path}")
+
+        return self._hub.call(call(), timeout=120)
 
     def bootstrap(self) -> None:
         try:
@@ -391,8 +472,18 @@ class DesktopApi:
             await self.engine.stop()
         # 就地更新共享对象：引擎与本 API 持有同一引用，立即生效。
         self.config.__dict__.update(new.to_dict())
+        self._apply_send_dirs()
         self.config.save()
         return await self._get_state_async()
+
+    def _apply_send_dirs(self) -> None:
+        """Always allow files inside the Agent workspace plus optional roots."""
+        roots = [*self.config.allow_send_dirs]
+        if self.config.agent_workspace:
+            roots.insert(0, self.config.agent_workspace)
+        self.adapter.config.allow_send_dirs = tuple(
+            Path(item).expanduser() for item in dict.fromkeys(roots)
+        )
 
     def save_config(self, data: dict) -> dict:
         return self._call(self._save_config_async(BotConfig.from_dict(data)))
@@ -558,6 +649,16 @@ def run() -> None:
             "然后重新解压。"
         )
         raise
+    finally:
+        if api.bridge:
+            api.bridge.stop()
+            bridge_file = Path(os.environ.get("APPDATA", str(Path.home()))) / "lingyu" / "gui-bridge.json"
+            try:
+                data = json.loads(bridge_file.read_text(encoding="utf-8"))
+                if data.get("token") == api.bridge.token:
+                    bridge_file.unlink()
+            except (OSError, ValueError, TypeError):
+                pass
 
 
 if __name__ == "__main__":

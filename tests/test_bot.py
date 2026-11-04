@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import shutil
 import tempfile
 import threading
@@ -1066,6 +1067,60 @@ class QuoteParserTests(unittest.TestCase):
     def test_no_refermsg(self):
         self.assertEqual(self._parser()("普通文本"), "")
         self.assertEqual(self._parser()(""), "")
+
+
+class OutboundEchoTests(unittest.IsolatedAsyncioTestCase):
+    """发送动作完成后，晚到的自身回流仍应在确认窗口内生效。"""
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_echo", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    async def test_echo_event_exists_before_enqueue_and_survives_send_return(self):
+        module = self._module()
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._send_queue = queue.Queue(maxsize=8)
+        bridge._send_inflight = {}
+        bridge._send_inflight_lock = threading.Lock()
+        bridge._outbound_events = {}
+        bridge._pending_outbound = {}
+        bridge._outbound_lock = threading.Lock()
+        bridge._recent_outbound = {}
+        bridge._recent_sent = {}
+        bridge._sender_thread = None
+        bridge._sender_busy = threading.Event()
+        bridge._sender_busy_since = 0.0
+        bridge._accepting_sends = True
+        bridge._backend = "fake"
+        bridge._last_send_at = 0.0
+        bridge.SEND_ITEM_TTL_SECONDS = 30.0
+
+        def fake_send(room, content):
+            key = bridge._sent_key(room, content)
+            with bridge._outbound_lock:
+                self.assertIn(key, bridge._outbound_events)
+            return True
+
+        bridge._send_text_sync = fake_send
+        future = await bridge._enqueue_send("群", "晚到回流")
+        self.assertTrue(future)
+        key = bridge._sent_key("群", "晚到回流")
+        with bridge._outbound_lock:
+            event = bridge._outbound_events[key]
+            event.set()
+        self.assertTrue(event.is_set())
+        bridge._end_outbound("群", "晚到回流")
+        bridge._send_queue.put(None)
+        bridge._sender_thread.join(timeout=1.0)
 
 
 class VisionTests(unittest.TestCase):

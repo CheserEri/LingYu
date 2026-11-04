@@ -39,6 +39,7 @@ from .links import (
     usable_cookies_file,
 )
 from .llm import LLMClient, LLMError
+from .agent import CodexAgentClient, close_agent_connections
 from .persona import get_persona
 
 # 每个会话在引擎内保留的历史条数上限（上下文窗口之外的环形缓冲）。
@@ -61,9 +62,7 @@ BEHAVIOR_HINT = (
     "可以自然地用「嗯」「哈哈」「好呀」这类语气词，"
     "不要像客服或 AI 那样一本正经地长篇大论；"
     "一般两三句话以内，对方明确要求详细说明时才展开。"
-    "回复必须是微信可直接发送的纯文本：禁止使用任何 Markdown 标记，"
-    "例如 **加粗**、*斜体*、# 标题、- 列表符号、``` 代码块或表格；"
-    "需要分点时用「1. 2. 3.」或分号自然叙述，不要出现这些符号。"
+    "回复必须是微信可直接发送的纯文本；需要 Markdown 时应生成文件，由上层以文件形式发送。"
 )
 
 # 主动参与（水群）时的行为约束：允许模型自己判断「这次不发言」。
@@ -75,9 +74,7 @@ PROACTIVE_HINT = (
     "如果话题与你无关、或没有合适的话，必须只回复 "
     f"{SILENT_SENTINEL} 这一串字符，不要输出任何其它内容。"
     "发言时口语化、随意，一般一句话以内，像真人水群那样，不要长篇大论。"
-    "回复必须是微信可直接发送的纯文本：禁止使用任何 Markdown 标记"
-    "（如 **加粗**、# 标题、- 列表、``` 代码块或表格）；"
-    "需要分点时用「1. 2. 3.」或分号自然叙述。"
+    "回复必须是微信可直接发送的纯文本；需要 Markdown 时应生成文件，由上层以文件形式发送。"
 )
 
 # 可交给视觉模型的图片类型与单张体积上限（超过则跳过，避免请求体过大）。
@@ -127,6 +124,7 @@ class HistoryItem:
     is_group: bool = False
     # 该条消息对应的本地图片路径（非图片为空串），供视觉模型识别。
     image_path: str = ""
+    voice_path: str = ""
 
 
 @dataclass
@@ -175,6 +173,9 @@ class BotEngine:
         self._consume_task: asyncio.Task | None = None
         self._proactive_task: asyncio.Task | None = None
         self._running = False
+        self._active_agent_tasks: set[asyncio.Task] = set()
+        self._active_agent_by_chat: dict[str, asyncio.Task] = {}
+        self._active_agent_clients: dict[str, CodexAgentClient] = {}
 
         self._date_key = time.strftime("%Y-%m-%d")
         self.reply_count_today = 0
@@ -198,6 +199,9 @@ class BotEngine:
 
         # 撤回：记录机器人最近发出的消息（文本 + 附件），供「@机器人 撤回」定位。
         self._recall_book = recall_mod.RecallBook()
+        # HTTP Webhook
+        self._webhook_server = None
+        self._webhook_thread = None
         # 会话 → 上次执行撤回的时间，避免连点/重复投递把后续消息也撤了。
         self._last_recall_at: dict[str, float] = {}
 
@@ -222,6 +226,12 @@ class BotEngine:
     def update_config(self, config: BotConfig) -> None:
         """界面保存配置后热替换（下次处理即生效）。"""
         self._config = config
+        if not config.agent_enabled or not config.agent_self_reply:
+            for task in list(self._active_agent_tasks):
+                task.cancel()
+            self._active_agent_tasks.clear()
+            self._active_agent_by_chat.clear()
+            self._active_agent_clients.clear()
         # 解析超时随配置热更新；缓存保留，避免重复解析。
         self._links.timeout = config.link_parse_timeout
         # 发送重试次数同样热更新，不必重启。
@@ -266,6 +276,10 @@ class BotEngine:
         if not self._running:
             return
         self._running = False
+        # Stop Webhook
+        if self._webhook_server:
+            self._webhook_server.shutdown()
+            self._webhook_server = None
         self._adapter.remove_message_listener(self._enqueue)
         for attr in ("_consume_task", "_proactive_task"):
             task = getattr(self, attr)
@@ -276,6 +290,14 @@ class BotEngine:
                 except asyncio.CancelledError:
                     pass
                 setattr(self, attr, None)
+        for task in list(self._active_agent_tasks):
+            task.cancel()
+        if self._active_agent_tasks:
+            await asyncio.gather(*self._active_agent_tasks, return_exceptions=True)
+        self._active_agent_tasks.clear()
+        self._active_agent_by_chat.clear()
+        self._active_agent_clients.clear()
+        await close_agent_connections()
         for task in list(self._download_tasks):
             task.cancel()
         self._download_tasks.clear()
@@ -291,11 +313,40 @@ class BotEngine:
             record = await self._queue.get()
             self._record_inbound(record)
             try:
-                await self._handle(record)
+                if self._config.agent_enabled and self._config.agent_self_reply:
+                    key = self._chat_key(record)
+                    previous = self._active_agent_by_chat.get(key)
+                    if previous and not previous.done():
+                        client = self._active_agent_clients.get(key)
+                        if client and client.has_active_turn():
+                            if await client.steer_record(record):
+                                continue
+                            self._log("warning", f"活动 Codex turn 引导失败，改为重新处理 [{record.chat}]")
+                    client = CodexAgentClient(self._config, session_key=key)
+                    task = asyncio.create_task(self._handle(record, agent_client=client))
+                    self._active_agent_tasks.add(task)
+                    self._active_agent_by_chat[key] = task
+                    self._active_agent_clients[key] = client
+                    task.add_done_callback(
+                        lambda done, chat=key: self._agent_task_done(chat, done)
+                    )
+                else:
+                    await self._handle(record)
             except Exception as exc:  # 兜底：单条异常不影响消费循环
                 self._log("error", f"处理消息异常：{exc}")
             finally:
                 self._queue.task_done()
+
+    def _agent_task_done(self, chat_key: str, task: asyncio.Task) -> None:
+        self._active_agent_tasks.discard(task)
+        if self._active_agent_by_chat.get(chat_key) is task:
+            self._active_agent_by_chat.pop(chat_key, None)
+            self._active_agent_clients.pop(chat_key, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            self._log("error", f"Codex 触发任务异常 [{chat_key}]：{error}")
 
     # ------------------------------------------------------------------ 历史
 
@@ -319,6 +370,7 @@ class BotEngine:
                 content=record.content,
                 is_group=record.is_group,
                 image_path=record.image_path,
+                voice_path=record.voice_path,
             )
         )
         # 记住最近一条入站消息，供主动参与挑选目标会话。
@@ -414,7 +466,9 @@ class BotEngine:
 
     # ------------------------------------------------------------------ 处理
 
-    async def _handle(self, record: MessageRecord) -> None:
+    async def _handle(
+        self, record: MessageRecord, agent_client: CodexAgentClient | None = None
+    ) -> None:
         self._roll_day()
 
         if record.message_id and record.message_id in self._processed_ids:
@@ -422,12 +476,40 @@ class BotEngine:
 
         # 撤回指令最先处理：违规内容越早撤掉越好，不能被链接服务、冷却或
         # 「拟人化概率」这些挡在前面。
-        if await self._handle_recall(record):
+        self_reply = self._config.agent_enabled and self._config.agent_self_reply
+        if self_reply:
+            if not record.content and not record.image_path:
+                return
+            if record.message_id:
+                self._processed_ids.append(record.message_id)
+            chat_key = self._chat_key(record)
+            try:
+                client = agent_client or CodexAgentClient(
+                    self._config, session_key=chat_key
+                )
+                self._active_agent_by_chat[chat_key] = asyncio.current_task()
+                self._active_agent_clients[chat_key] = client
+                await client.chat(
+                    self._build_messages(chat_key), image_path=record.image_path,
+                    chat_name=record.chat, sender=record.sender, is_group=record.is_group,
+                    voice_path=record.voice_path,
+                )
+            except LLMError as exc:
+                self._log("error", f"Codex 触发失败：{exc.message}")
+                return
+            finally:
+                current = asyncio.current_task()
+                if self._active_agent_by_chat.get(chat_key) is current:
+                    self._active_agent_by_chat.pop(chat_key, None)
+                    self._active_agent_clients.pop(chat_key, None)
+            self._log("info", f"Codex 会话处理完成 [{record.chat}]；发送由 Codex 负责。")
+            return
+        if not self_reply and await self._handle_recall(record):
             return
 
         # 链接服务：与「这条消息要不要回」无关。群里没 @ 机器人也该解析，
         # 因为这是确定性动作，不是「接话」。放在 _should_reply 之前。
-        acked = await self._handle_links(record)
+        acked = False if self_reply else await self._handle_links(record)
 
         if not self._should_reply(record):
             self._explain_no_reply(record)
@@ -486,11 +568,26 @@ class BotEngine:
             await self._prefetch_links(chat_key)
         messages = self._build_messages(chat_key)
         try:
-            client = self._llm_factory(self._config)
-            reply = await client.chat(messages)
+            client = (
+                CodexAgentClient(self._config, session_key=chat_key)
+                if self._config.agent_enabled
+                else self._llm_factory(self._config)
+            )
+            if self._config.agent_enabled:
+                reply = await client.chat(
+                    messages, image_path=record.image_path, chat_name=record.chat,
+                    sender=record.sender, is_group=record.is_group,
+                    voice_path=record.voice_path,
+                )
+            else:
+                reply = await client.chat(messages)
         except LLMError as exc:
             # 不回滚冷却：Key 缺失/无效时避免每条消息都重试报错。
             self._log("error", f"模型调用失败：{exc.message}")
+            return
+
+        if self_reply:
+            self._log("info", f"Codex 会话处理完成 [{record.chat}]；发送由 Codex 负责。")
             return
 
         if not await self._send_reply(record.chat, reply):
@@ -1365,6 +1462,8 @@ class BotEngine:
 
     async def _proactive_tick(self) -> None:
         """一次主动参与检查：至多让一个群发言。"""
+        if self._config.agent_enabled and self._config.agent_self_reply:
+            return
         now = time.time()
         if self._in_quiet_hours(now):
             return

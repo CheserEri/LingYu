@@ -11,6 +11,10 @@ from mcp.server.mcpserver import MCPServer
 
 from .logging_config import configure_logging
 from .service import WeChatService
+from .bridge import BridgeService, bridge_port_closed
+import os
+import json
+from pathlib import Path
 
 SERVER_NAME = "lingyu"
 SERVER_VERSION = "0.8.19"
@@ -26,7 +30,18 @@ def build_server(service: WeChatService | None = None) -> MCPServer:
             "无法确认成功时不要重复发送；发送文件前需确认文件位于允许目录内。"
         ),
     )
-    svc = service or WeChatService()
+    bridge_url = os.environ.get("LINGYU_GUI_BRIDGE_URL", "")
+    bridge_token = os.environ.get("LINGYU_GUI_BRIDGE_TOKEN", "")
+    if not (bridge_url and bridge_token):
+        path = Path(os.environ.get("APPDATA", str(Path.home()))) / "lingyu" / "gui-bridge.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            bridge_url, bridge_token = data.get("url", ""), data.get("token", "")
+        except (OSError, ValueError, TypeError):
+            pass
+    if bridge_url and bridge_port_closed(bridge_url):
+        bridge_url = bridge_token = ""
+    svc = service or (BridgeService(bridge_url, bridge_token) if bridge_url and bridge_token else WeChatService())
 
     @server.tool(
         name="get_wechat_status",
@@ -112,6 +127,23 @@ def build_server(service: WeChatService | None = None) -> MCPServer:
         )
 
     @server.tool(
+        name="send_voice",
+        description=(
+            "发送语音/音频文件。注意：wechatauto 通过剪贴板粘贴发送，音频文件会以"
+            "附件形式发送（非语音消息气泡）。如需真正语音气泡需微信 UI 流程。"
+        ),
+    )
+    async def send_voice(
+        recipient: str,
+        file_path: str,
+        dry_run: bool = False,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        return await svc.send_voice(
+            recipient, file_path, dry_run=dry_run, confirm=confirm
+        )
+
+    @server.tool(
         name="get_recent_messages",
         description=(
             "增量读取监听缓冲区中新增的消息。传入上次返回的 next_seq 作为 after_seq，"
@@ -153,3 +185,28 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ======================================================================
+# HTTP Webhook 集成
+# ======================================================================
+# Webhook 作为 MCP 的替代/补充接口：
+# - MCP: 进程内协议，需要 tool calling 支持（适合 Codex 内置模型）
+# - HTTP: 通用接口，任何模型都能调（适合 Qwen 等自定义模型）
+#
+# 启动方式：
+#   from lingyu.webhook import start_webhook
+#   from lingyu.server import build_server
+#   from lingyu.service import WeChatService
+#   from lingyu.config import AdapterConfig
+#
+#   svc = WeChatService()
+#   server = build_server(svc)
+#   server.run(transport='stdio')  # MCP 主进程
+#   webhook = start_webhook(svc, port=18765)  # HTTP 补充
+#
+# 模型调用示例（任何支持 HTTP 的模型）：
+#   curl -X POST http://127.0.0.1:18765/webhook \\
+#     -H 'Authorization: Bearer <token>' \\
+#     -H 'Content-Type: application/json' \\
+#     -d '{"action":"send_message","recipient":"张三","content":"Hello!"}'

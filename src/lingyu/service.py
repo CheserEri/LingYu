@@ -238,3 +238,15 @@ class WeChatService:
             dry_run=dry_run,
         )
         return payload
+
+    async def send_voice(
+        self,
+        recipient: str,
+        file_path: str,
+        dry_run: bool = False,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """发送语音/音频文件；当前后端按附件发送。"""
+        return await self.send_file(
+            recipient, file_path, dry_run=dry_run, confirm=confirm
+        )

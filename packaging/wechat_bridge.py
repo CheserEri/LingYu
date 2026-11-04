@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import threading
+import traceback
 from ctypes import wintypes
 from typing import Callable, Awaitable
 from dataclasses import dataclass
@@ -776,6 +777,12 @@ def _user32():
         lib.ShowWindow.restype = wintypes.BOOL
         lib.SetForegroundWindow.argtypes = [wintypes.HWND]
         lib.SetForegroundWindow.restype = wintypes.BOOL
+        lib.GetForegroundWindow.argtypes = []
+        lib.GetForegroundWindow.restype = wintypes.HWND
+        lib.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        lib.GetAncestor.restype = wintypes.HWND
+        lib.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        lib.GetWindowThreadProcessId.restype = wintypes.DWORD
         lib.SetWindowPos.argtypes = [
             wintypes.HWND,
             wintypes.HWND,
@@ -879,6 +886,56 @@ def _ensure_wechat_visible(gui) -> bool:
         return True
 
 
+def _ensure_wechat_foreground(gui, timeout: float = 1.5) -> bool:
+    """确认微信主窗是实际前台窗口，避免全局键盘落到其他程序。"""
+    try:
+        hwnd = _wechat_main_hwnd(gui)
+        if not hwnd:
+            logger.error("无法取得微信主窗口句柄，拒绝执行键盘发送")
+            return False
+        u32 = _user32()
+        handle = wintypes.HWND(hwnd)
+        if not u32.IsWindowVisible(handle):
+            logger.warning("微信主窗口不可见，拒绝执行键盘发送")
+            return False
+        deadline = time.monotonic() + max(0.1, timeout)
+        while True:
+            foreground = int(u32.GetForegroundWindow() or 0)
+            if _window_process_is_foreground(hwnd):
+                logger.info(f"微信进程窗口已确认在前台 main={hwnd} foreground={foreground}")
+                return True
+            _force_show_window(hwnd)
+            if time.monotonic() >= deadline:
+                logger.error(
+                    f"微信窗口无法置前，拒绝发送 hwnd={hwnd} foreground={foreground}"
+                )
+                return False
+            time.sleep(0.05)
+    except Exception as exc:
+        logger.error(f"确认微信前台窗口失败，拒绝发送: {exc}")
+        return False
+
+
+def _window_process_is_foreground(hwnd: int) -> bool:
+    """前台窗可以是微信主窗的子窗；按所属进程验证。"""
+    if not hwnd:
+        return False
+    u32 = _user32()
+    foreground = int(u32.GetForegroundWindow() or 0)
+    if not foreground:
+        return False
+    foreground_root = int(
+        u32.GetAncestor(wintypes.HWND(foreground), 2) or foreground
+    )
+    if foreground_root == int(hwnd):
+        return True
+    foreground_pid = wintypes.DWORD()
+    window_pid = wintypes.DWORD()
+    u32.GetWindowThreadProcessId(wintypes.HWND(foreground), ctypes.byref(foreground_pid))
+    u32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(window_pid))
+    return bool(foreground_pid.value and foreground_pid.value == window_pid.value)
+
+
 def _install_wechatauto_uia_compat() -> None:
     """Keep UIA usable when Windows blocks third-party module enumeration.
 
@@ -901,6 +958,66 @@ def _install_wechatauto_uia_compat() -> None:
 
     if getattr(WeChatUIA, "_wechatbot_safe_hwnds", False):
         return
+
+    try:
+        import uiautomation as auto
+
+        def paste_into_without_setfocus(self, ctrl, text: str, clear: bool = True) -> None:
+            started = time.monotonic()
+            try:
+                clicked = self._click_ctrl(ctrl)
+            except Exception as exc:
+                raise RuntimeError(f"send_uncertain: 输入框点击异常: {exc}") from exc
+            if not clicked:
+                raise RuntimeError("send_uncertain: 鼠标点击微信输入框未确认成功")
+            hwnd = int(getattr(self._win, "NativeWindowHandle", 0) or 0)
+            if not _window_process_is_foreground(hwnd):
+                foreground = int(_user32().GetForegroundWindow() or 0)
+                raise RuntimeError(
+                    f"鼠标点击后微信不在前台，拒绝发送按键 foreground={foreground}"
+                )
+            logger.info(
+                f"UIA 输入框已用鼠标聚焦 [{threading.get_ident()}] "
+                f"elapsed={time.monotonic() - started:.2f}s"
+            )
+            try:
+                if clear:
+                    auto.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+                self._clip_set(text)
+                auto.SendKeys("{Ctrl}v", waitTime=0.05)
+            except Exception as exc:
+                # 已点击输入框，后续状态不可判定；禁止回退重发。
+                raise RuntimeError(f"send_uncertain: 粘贴阶段异常: {exc}") from exc
+            logger.info(
+                f"UIA 全局键盘粘贴完成 elapsed={time.monotonic() - started:.2f}s"
+            )
+
+        WeChatUIA._paste_into = paste_into_without_setfocus
+        def send_text_without_setfocus(self, text: str) -> bool:
+            """输入并回车全程绕开 Control.SendKeys/Element.SetFocus。"""
+            if not self.ensure_window():
+                return False
+            ctrl = self._chat_input()
+            if ctrl is None:
+                return False
+            self._paste_into(ctrl, text, clear=True)
+            time.sleep(0.2)
+            if not _window_process_is_foreground(
+                int(getattr(self._win, "NativeWindowHandle", 0) or 0)
+            ):
+                raise RuntimeError("send_uncertain: 微信在回车前失去前台")
+            try:
+                auto.SendKeys("{Enter}", waitTime=0.05)
+            except Exception as exc:
+                # 粘贴已经发生，回车结果未知；禁止外层回退重发。
+                raise RuntimeError(f"send_uncertain: 回车发送异常: {exc}") from exc
+            logger.info("UIA 全局键盘回车完成")
+            return True
+
+        WeChatUIA.send_text = send_text_without_setfocus
+        logger.info("已启用免 Element.SetFocus 的输入方式（鼠标点击 + 全局键盘）")
+    except Exception as exc:
+        logger.warning(f"启用免 SetFocus 输入方式失败，保留原 UIA 输入: {exc}")
 
     original = WeChatUIA._wechat_hwnds
 
@@ -1201,6 +1318,11 @@ class WeChatBridge:
         self._send_backoff_until = 0.0
         self._send_failures = 0
         self._recent_sent: dict[tuple[str, str], float] = {}
+        # 已进入 UI 操作阶段的短期出站指纹。即使发送确认超时，监听回显也应视为自己发出。
+        self._recent_outbound: dict[tuple[str, str], float] = {}
+        self._pending_outbound: dict[tuple[str, str], float] = {}
+        self._outbound_events: dict[tuple[str, str], threading.Event] = {}
+        self._outbound_lock = threading.Lock()
         self._send_inflight: dict[tuple[str, str], float] = {}
         self._send_inflight_lock = threading.Lock()
         self._seen_message_ids: dict[str, float] = {}
@@ -1426,6 +1548,8 @@ class WeChatBridge:
         self._sender_thread = None
         self._sender_busy = threading.Event()
         self._sender_busy_since = 0.0
+        with self._send_inflight_lock:
+            self._send_inflight.clear()
 
         try:
             from wechatauto.utils.lock import LockManager
@@ -2013,6 +2137,20 @@ class WeChatBridge:
                 sender=sender,
                 content=content,
             )
+            if is_self and content and room_name:
+                key = self._sent_key(room_name, content)
+                with self._outbound_lock:
+                    started = self._pending_outbound.get(key)
+                    if started and time.monotonic() >= started:
+                        self._recent_sent[key] = time.monotonic()
+                        self._pending_outbound.pop(key, None)
+                        event = self._outbound_events.get(key)
+                        if event:
+                            event.set()
+                        logger.info(
+                            f"出站回流确认发送成功 [{room_name}] "
+                            f"age={time.monotonic() - started:.2f}s"
+                        )
             if is_self:
                 logger.debug(
                     f"已忽略机器人自己发出的消息 [{room_name}]: "
@@ -2245,14 +2383,8 @@ class WeChatBridge:
 
         # 微信 4.x 的监听回调偶尔丢失 attr/is_self，机器人刚发出的内容
         # 很快又会作为新消息回调回来。短时间内容指纹是最可靠兜底。
-        return bool(
-            content
-            and room_name
-            and self._was_recently_sent(
-                room_name,
-                content,
-                max_age=15.0,
-            )
+        return bool(content and room_name and self._was_recently_sent(room_name, content, max_age=15.0)) or bool(
+            content and room_name and self._was_recent_outbound(room_name, content, max_age=120.0)
         )
 
     def _is_duplicate_delivery(self, message_id: str) -> bool:
@@ -2587,15 +2719,38 @@ class WeChatBridge:
                 if self.reply_delay > 0:
                     await asyncio.sleep(self.reply_delay)
 
-                success = await asyncio.wait_for(
+                sent = await asyncio.wait_for(
                     self._enqueue_send(room_name, content),
                     timeout=self.SEND_TIMEOUT_SECONDS,
                 )
+                if not sent:
+                    return False
+                try:
+                    # Wait on the event loop so incoming WeChat callbacks can set
+                    # the echo event. The sender thread must keep that event alive
+                    # until this window ends; otherwise this would return
+                    # immediately instead of waiting three seconds.
+                    if await self._wait_outbound_echo_async(
+                        room_name, content, timeout=3.0
+                    ):
+                        self._remember_sent(room_name, content)
+                        logger.info(f"发送后收到自身消息回流，确认成功 [{room_name}]")
+                        return True
+                    logger.warning(
+                        f"已调用发送但 3 秒内未收到自身消息回流，按结果不确定处理，不重发 [{room_name}]"
+                    )
+                    return False
+                finally:
+                    self._end_outbound(room_name, content)
         except asyncio.TimeoutError:
             logger.error(
                 f"发送消息超时（超过 {self.SEND_TIMEOUT_SECONDS:.1f} 秒），"
-                f"已跳过本次卡住的发送: [{room_name}]"
+                f"底层仍在执行，暂停后续发送以避免冲突: [{room_name}]"
             )
+            sender = self._sender_thread
+            frame = sys._current_frames().get(sender.ident) if sender and sender.ident else None
+            if frame is not None:
+                logger.error("发送线程调用栈:\n" + "".join(traceback.format_stack(frame)))
             self._note_send_failure("发送超时")
             return False
         except Exception as e:
@@ -2622,6 +2777,21 @@ class WeChatBridge:
             await asyncio.sleep(0.2)
         return not self._sender_busy.is_set()
 
+    async def _wait_outbound_echo_async(
+        self, room_name: str, content: str, timeout: float
+    ) -> bool:
+        key = self._sent_key(room_name, content)
+        with self._outbound_lock:
+            event = self._outbound_events.get(key)
+        if event is None:
+            return False
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if event.is_set():
+                return True
+            await asyncio.sleep(0.05)
+        return event.is_set()
+
     def _sent_key(self, room_name: str, content: str) -> tuple[str, str]:
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return room_name, digest
@@ -2636,6 +2806,52 @@ class WeChatBridge:
                 for key, stamp in self._recent_sent.items()
                 if stamp >= cutoff
             }
+
+    def _remember_outbound(self, room_name: str, content: str) -> None:
+        now = time.monotonic()
+        self._recent_outbound[self._sent_key(room_name, content)] = now
+        if len(self._recent_outbound) > 500:
+            cutoff = now - 120.0
+            self._recent_outbound = {
+                key: stamp for key, stamp in self._recent_outbound.items()
+                if stamp >= cutoff
+            }
+
+    def _begin_outbound(self, room_name: str, content: str) -> None:
+        key = self._sent_key(room_name, content)
+        with self._outbound_lock:
+            self._pending_outbound[key] = time.monotonic()
+            self._outbound_events[key] = threading.Event()
+
+    def _prepare_outbound_attempt(self, room_name: str, content: str) -> None:
+        """Reset echo confirmation immediately before each physical send attempt."""
+        key = self._sent_key(room_name, content)
+        with self._outbound_lock:
+            self._pending_outbound[key] = time.monotonic()
+            event = self._outbound_events.get(key)
+            if event:
+                event.clear()
+
+    def _wait_outbound_echo(self, room_name: str, content: str, timeout: float) -> bool:
+        key = self._sent_key(room_name, content)
+        with self._outbound_lock:
+            event = self._outbound_events.get(key)
+        return bool(event and event.wait(timeout))
+
+    def _end_outbound(self, room_name: str, content: str) -> None:
+        key = self._sent_key(room_name, content)
+        with self._outbound_lock:
+            self._pending_outbound.pop(key, None)
+            self._outbound_events.pop(key, None)
+
+    def _outbound_confirmed(self, room_name: str, content: str) -> bool:
+        return self._was_recently_sent(room_name, content, max_age=120.0)
+
+    def _was_recent_outbound(
+        self, room_name: str, content: str, max_age: float = 120.0
+    ) -> bool:
+        stamp = self._recent_outbound.get(self._sent_key(room_name, content), 0.0)
+        return bool(stamp and time.monotonic() - stamp <= max_age)
 
     def _mark_send_inflight(self, room_name: str, content: str) -> bool:
         """标记内容正在发送，阻止超时后的同内容重复投递。"""
@@ -2695,9 +2911,14 @@ class WeChatBridge:
         if not self._accepting_sends:
             logger.debug(f"机器人正在停止，忽略发送任务: [{room_name}]")
             return False
+        self._remember_outbound(room_name, content)
         if not self._mark_send_inflight(room_name, content):
             logger.debug(f"同内容发送已在处理中，忽略重复入队: [{room_name}]")
             return True
+        # Create the confirmation event before the sender thread can perform the
+        # physical send. The async caller waits on this event after the sender
+        # reports that the UI action completed.
+        self._begin_outbound(room_name, content)
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         item = (
@@ -2710,6 +2931,7 @@ class WeChatBridge:
         try:
             self._send_queue.put_nowait(item)
         except queue.Full:
+            self._end_outbound(room_name, content)
             self._clear_send_inflight(room_name, content)
             logger.warning(f"发送队列已满，丢弃本次发送: [{room_name}]")
             return False
@@ -2739,6 +2961,7 @@ class WeChatBridge:
                 return
             room_name, content, deadline, loop, future = item
             if time.monotonic() > deadline:
+                self._end_outbound(room_name, content)
                 self._clear_send_inflight(room_name, content)
                 logger.warning(f"发送任务已过期，丢弃: [{room_name}]")
                 self._set_send_result(loop, future, False)
@@ -2747,15 +2970,32 @@ class WeChatBridge:
             busy_event.set()
             if busy_event is self._sender_busy:
                 self._sender_busy_since = time.monotonic()
+            ok = False
             try:
-                ok = bool(self._send_text_sync(room_name, content))
-            except Exception as e:
-                if busy_event is self._sender_busy:
-                    logger.error(f"发送消息失败: {e}")
-                else:
-                    logger.debug(f"已隔离的旧发送线程结束: {e}")
-                ok = False
+                for attempt in (1, 2):
+                    self._prepare_outbound_attempt(room_name, content)
+                    try:
+                        sent = self._send_text_sync(room_name, content)
+                    except Exception as e:
+                        logger.error(f"发送调用异常 attempt={attempt}: {e}")
+                        sent = False
+                    # Only retry when the UI path explicitly reports that no send
+                    # action was attempted. A completed or uncertain send is final.
+                    if sent:
+                        logger.info(f"底层发送动作已完成 [{room_name}] attempt={attempt}")
+                        ok = True
+                        break
+                    if attempt == 1:
+                        logger.warning(
+                            f"发送后 3 秒未观察到自身消息回流，重试一次 [{room_name}]"
+                        )
             finally:
+                # A successful physical send still needs its event while the
+                # async caller waits for outbound echo confirmation. Failed
+                # attempts have no caller-side confirmation wait, so clean them
+                # up here.
+                if not ok:
+                    self._end_outbound(room_name, content)
                 busy_event.clear()
                 if busy_event is self._sender_busy:
                     self._sender_busy_since = 0.0
@@ -2784,19 +3024,49 @@ class WeChatBridge:
             self.SEND_BACKOFF_MAX_SECONDS,
         )
         self._send_backoff_until = time.monotonic() + backoff
-        logger.warning(
-            f"微信发送异常（{reason}），{backoff:.0f} 秒后恢复重试"
-        )
+        logger.warning(f"微信发送异常（{reason}），冷却 {backoff:.0f} 秒")
 
     def _send_text_sync(self, room_name: str, content: str) -> bool:
         """在线程中执行同步发送，避免阻塞 asyncio 事件循环。"""
+        self._prepare_outbound_attempt(room_name, content)
+        logger.info(f"发送阶段开始 [{room_name}] thread={threading.get_ident()} backend={self._backend}")
         if self._backend == "wechatauto":
             try:
                 from wechatauto.utils.lock import LockManager
 
+                process_available = LockManager.process_lock.acquire(timeout=0.1)
+                if process_available:
+                    LockManager.process_lock.release()
+                thread_available = LockManager.thread_lock.acquire(timeout=0.1)
+                if thread_available:
+                    LockManager.thread_lock.release()
+                logger.info(
+                    f"发送锁探测 [{room_name}] process_available={process_available} "
+                    f"thread_available={thread_available}"
+                )
                 with LockManager.acquire():
-                    if self._send_text_with_uia(room_name, content):
+                    logger.debug(f"发送已获取 UI 锁 [{room_name}]")
+                    gui = getattr(self._wx, "_gui", None)
+                    if gui is None or not _ensure_wechat_foreground(gui):
+                        return False
+                    uia_result = self._send_text_with_uia(room_name, content)
+                    if uia_result is True:
+                        logger.info(f"UIA 发送成功 [{room_name}]")
                         return True
+                    if uia_result is None:
+                        logger.error(f"微信前台状态丢失，拒绝继续回退发送 [{room_name}]")
+                        return False
+                    if self._uia_available:
+                        # UIA 已可用但未确认成功时，禁止回退到 wechatauto.SendMsg。
+                        # SendMsg 内部有三次输入框重试；远程桌面下可能已实际发出，
+                        # 只是清空检测失败，回退会造成同一正文重复发送。
+                        gui = getattr(self._wx, "_gui", None)
+                        uia = gui._get_uia() if gui else None
+                        if uia is None:
+                            logger.error(f"UIA 快路径不可用：未取得 UIA 对象 [{room_name}]")
+                            return False
+                        logger.info(f"UIA 快路径未发送，开始一次单次调用回退 [{room_name}]")
+                    logger.debug(f"UIA 快路径未成功，回退 SendMsg [{room_name}]")
                     if not self.has_usable_uia():
                         logger.debug(
                             "微信 UIA 不可用，使用 OCR 兼容发送路径"
@@ -2807,6 +3077,11 @@ class WeChatBridge:
                         exact=True,
                     )
                     if not result:
+                        if self._outbound_confirmed(room_name, content):
+                            logger.warning(
+                                f"SendMsg 返回失败但已收到时效内出站回流，按成功处理 [{room_name}]"
+                            )
+                            return True
                         logger.error(f"发送消息失败: {result}")
                         return False
                     return True
@@ -2824,7 +3099,7 @@ class WeChatBridge:
         self._wx.SendMsg(content, who=room_name)
         return True
 
-    def _send_text_with_uia(self, room_name: str, content: str) -> bool:
+    def _send_text_with_uia(self, room_name: str, content: str) -> bool | None:
         """优先走纯 UIA 输入发送，绕开截图检测导致的偶发卡死。"""
         if not self._uia_available:
             return False
@@ -2837,18 +3112,40 @@ class WeChatBridge:
             return False
 
         try:
+            if not _ensure_wechat_foreground(gui):
+                return None
             current_chat = uia.current_chat() or ""
-            # Only use the fast path when the target is already open. Calling
-            # send_text_to here performs a second full search/open flow when
-            # the regular SendMsg path will do the same work and is faster.
+            logger.debug(
+                f"UIA 发送上下文 [{room_name}] current_chat={current_chat!r} "
+                f"thread={threading.get_ident()}"
+            )
             if not self._uia_chat_is_current(current_chat, room_name):
-                return False
+                logger.info(
+                    f"UIA 当前会话不匹配 [{room_name}] current={current_chat!r}，尝试打开目标会话"
+                )
+                if not uia.open_chat(room_name):
+                    logger.error(f"UIA 打开目标会话失败 [{room_name}]")
+                    return False
+                current_chat = uia.current_chat() or ""
+                logger.info(
+                    f"UIA 打开目标会话完成 [{room_name}] current={current_chat!r}"
+                )
             if hasattr(uia, "ensure_window") and not uia.ensure_window():
+                logger.warning(f"UIA 窗口激活失败 [{room_name}]")
                 return False
+            if not _ensure_wechat_foreground(gui):
+                return None
+            logger.debug(f"UIA 窗口已激活，开始输入发送 [{room_name}]")
             sent = bool(uia.send_text(content))
             if sent:
                 logger.debug(f"已通过 UIA 快路径发送到 [{room_name}]")
             return sent
+        except RuntimeError as e:
+            if "不在前台" in str(e) or "前台" in str(e) or "send_uncertain" in str(e):
+                logger.error(f"UIA 输入聚焦校验失败 [{room_name}]: {e}")
+                return None
+            logger.debug(f"UIA 快路径发送失败，将回退完整发送流程: {e}")
+            return False
         except Exception as e:
             logger.debug(f"UIA 快路径发送失败，将回退完整发送流程: {e}")
             return False

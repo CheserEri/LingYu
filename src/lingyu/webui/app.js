@@ -1,6 +1,7 @@
 /* 灵语 - 前端逻辑（pywebview JS API） */
 
 let draft = null;       // 当前编辑中的配置
+let lastSavedConfig = null;
 let lastLogSeq = 0;
 
 const $ = (sel) => document.querySelector(sel);
@@ -32,6 +33,7 @@ function bindDraftToControls() {
   $$("[data-key]").forEach((el) => {
     const key = el.dataset.key;
     if (el.type === "checkbox") el.checked = !!draft[key];
+    else if (key === "allow_send_dirs") el.value = (draft[key] || []).join("\n");
     else el.value = draft[key] ?? "";
     if (el.type === "range") {
       const label = rangeLabel(el);
@@ -44,7 +46,8 @@ function bindDraftToControls() {
         draft[key] = parseFloat(el.value);
         const label = rangeLabel(el);
         if (label) label.textContent = fmtRange(el.value);
-      } else draft[key] = el.value;
+      } else if (key === "allow_send_dirs") draft[key] = el.value.split("\n").map((s) => s.trim()).filter(Boolean);
+      else draft[key] = el.value;
     };
     el.addEventListener("input", onEdit);
     // <select> 在部分 WebView 上不派发 input，补一个 change 兜住。
@@ -87,11 +90,14 @@ $$(".seg").forEach((b) => {
 // ---------------- 保存 ----------------
 async function saveAll() {
   collectDraft();
+  const restartFields = ["agent_workspace", "agent_session_file", "agent_reply_transport", "agent_sandbox_mode", "webhook_port", "webhook_token", "allow_send_dirs"];
+  const restartNeeded = restartFields.some((key) => draft[key] !== lastSavedConfig?.[key]);
   const state = await window.pywebview.api.save_config(draft);
   draft = state.config;
+  lastSavedConfig = { ...state.config };
   bindDraftToControls();
   renderStatus(state);
-  toast("设置已保存");
+  toast(restartNeeded ? "设置已保存，建议重启；已有会话可能仍使用原工作区" : "设置已保存");
 }
 $("#save-chats").addEventListener("click", saveAll);
 $("#save-human").addEventListener("click", saveAll);
@@ -107,6 +113,7 @@ $("#btn-toggle").addEventListener("click", async () => {
   draft.enabled = !draft.enabled;
   const state = await window.pywebview.api.save_config(draft);
   draft = state.config;
+  lastSavedConfig = { ...state.config };
   bindDraftToControls();
   renderStatus(state);
   toast(draft.enabled ? "自动回复已开启" : "自动回复已停止");
@@ -145,10 +152,12 @@ function fmtTime(ts) {
 function renderStatus(state) {
   const engine = state.engine;
   const w = engine.wechat;
+  const triggerOnly = state.config.agent_enabled && state.config.agent_self_reply;
+  $("#bot-mode-label").textContent = triggerOnly ? "Codex 触发模式" : "自动回复";
 
   $("#s-wx").textContent = w.ok ? "已连接" : "未连接";
   $("#s-listen").textContent = w.listening ? "监听中" : "未监听";
-  $("#s-bot").textContent = engine.running ? "运行中" : "已停止";
+  $("#s-bot").textContent = engine.running ? (triggerOnly ? "监听并触发 Codex" : "运行中") : "已停止";
   const btn = $("#btn-toggle");
   btn.textContent = engine.running ? "停止" : "开启";
   btn.classList.toggle("primary", !engine.running);
@@ -211,6 +220,7 @@ function toast(msg, kind) {
 async function init() {
   const state = await window.pywebview.api.get_state();
   draft = state.config;
+  lastSavedConfig = { ...state.config };
   bindDraftToControls();
   renderStatus(state);
   lastLogSeq = 0;

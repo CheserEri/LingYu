@@ -111,6 +111,16 @@ class ValidateSendPathTests(unittest.TestCase):
             resolved = validate_send_path(target, [allowed])
             self.assertEqual(resolved, target.resolve())
 
+    def test_allows_nested_file_inside_whitelist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / "allowed"
+            nested = allowed / "images" / "generated"
+            nested.mkdir(parents=True)
+            target = nested / "image.png"
+            target.write_bytes(b"image")
+            resolved = validate_send_path(target, [allowed])
+            self.assertEqual(resolved, target.resolve())
+
     def test_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             allowed = Path(tmp) / "allowed"

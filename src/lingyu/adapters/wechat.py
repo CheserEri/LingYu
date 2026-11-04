@@ -1074,6 +1074,7 @@ class WeChatAdapter:
             is_at_me=bool(getattr(message, "is_at_me", False)),
             reply_to_name=str(getattr(message, "reply_to_name", "") or ""),
             image_path=str(getattr(message, "image_path", "") or ""),
+            voice_path=str(getattr(message, "voice_path", "") or ""),
         )
 
     def _snapshot(self) -> list[MessageRecord]:

@@ -77,6 +77,7 @@ class MessageRecord:
     chat_id: str = ""
     # 已提取到本地的图片文件路径；非图片消息为空串。
     image_path: str = ""
+    voice_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(asdict(self))

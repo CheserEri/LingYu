@@ -54,6 +54,28 @@ class BotConfig:
     max_tokens: int = 300
     timeout_seconds: float = 30.0
 
+    # ---- 本地 Codex Agent（默认关闭）----
+    # 开启后，普通回复请求交给本机 Codex CLI，可在指定工作区内使用工具。
+    agent_enabled: bool = False
+    agent_self_reply: bool = False
+    agent_workspace: str = ""
+    agent_command: str = "codex"
+    agent_timeout_seconds: float = 180.0
+    agent_session_file: str = ""
+    # Codex 子进程的命令执行沙箱；full-access 由用户显式启用。
+    agent_sandbox_mode: str = "danger-full-access"
+    # 纯触发模式下由 Agent 发送微信消息的协议：mcp 或 http。
+    agent_reply_transport: str = "mcp"
+    # ---- HTTP Webhook（通用模型发送接口）----
+    # 开启后，引擎会自动启动本地 HTTP webhook 服务
+    # 任何模型都能通过 HTTP POST 主动发送消息
+    webhook_enabled: bool = False
+    webhook_port: int = 18765
+    webhook_token: str = ''
+    # 允许 Agent 通过微信发送文件的根目录；其所有子目录也允许。
+    allow_send_dirs: list[str] = field(default_factory=list)
+
+
     # ---- 上下文与节流 ----
     context_messages: int = 20       # 送给模型的最近消息条数
     cooldown_seconds: float = 3.0    # 同一会话同一发送者的冷却秒数
@@ -223,6 +245,31 @@ class BotConfig:
         config.temperature = float(config.temperature)
         config.max_tokens = max(1, int(config.max_tokens))
         config.timeout_seconds = max(1.0, float(config.timeout_seconds))
+        config.agent_enabled = bool(config.agent_enabled)
+        config.agent_workspace = str(config.agent_workspace or "").strip()
+        config.agent_command = str(config.agent_command or "codex").strip()
+        config.agent_timeout_seconds = max(10.0, float(config.agent_timeout_seconds))
+        config.agent_session_file = str(config.agent_session_file or "").strip()
+        config.agent_sandbox_mode = str(
+            config.agent_sandbox_mode or "danger-full-access"
+        ).strip().lower()
+        if config.agent_sandbox_mode not in {
+            "read-only", "workspace-write", "danger-full-access"
+        }:
+            config.agent_sandbox_mode = "workspace-write"
+        config.agent_reply_transport = str(config.agent_reply_transport or "mcp").strip().lower()
+        if config.agent_reply_transport not in {"mcp", "http"}:
+            config.agent_reply_transport = "mcp"
+        config.webhook_enabled = bool(config.webhook_enabled)
+        config.webhook_port = max(1, min(65535, int(config.webhook_port or 18765)))
+        config.webhook_token = str(config.webhook_token or "").strip()
+        raw_send_dirs = config.allow_send_dirs or []
+        if isinstance(raw_send_dirs, str):
+            raw_send_dirs = raw_send_dirs.splitlines()
+        config.allow_send_dirs = [
+            str(item).strip() for item in raw_send_dirs if str(item).strip()
+        ]
+
         # 拟人化参数：概率钳制到 [0,1]，条数与间隔取合法范围。
         config.humanize = bool(config.humanize)
         config.reply_probability = min(

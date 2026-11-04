@@ -87,7 +87,7 @@
           </div>
 
           <div class="card status-card">
-            <div class="card-label">自动回复</div>
+            <div class="card-label" id="bot-mode-label">自动回复</div>
             <div class="big-toggle">
               <div class="card-value" id="s-bot">已停止</div>
               <button class="btn primary lg" id="btn-toggle">开启</button>
@@ -458,6 +458,54 @@
             <label>同一人冷却（秒）</label>
             <input type="number" min="0" max="60" step="0.5" data-key="cooldown_seconds"/>
           </div>
+        </div>
+
+        <div class="card form">
+          <div class="card-label">本地 Codex Agent</div>
+          <label class="switch-row"><span>使用本机 Codex 处理回复</span>
+            <input type="checkbox" class="switch" data-key="agent_enabled"/></label>
+          <label class="switch-row"><span>纯触发模式：由 Codex 自行发送</span>
+            <input type="checkbox" class="switch" data-key="agent_self_reply"/></label>
+          <div class="field">
+            <label>Codex 子进程沙箱</label>
+            <select data-key="agent_sandbox_mode">
+              <option value="danger-full-access">完全访问（当前启用）</option>
+              <option value="workspace-write">仅工作区可写</option>
+              <option value="read-only">只读</option>
+            </select>
+          </div>
+          <p class="hint">完全访问允许 Codex 子进程访问工作区以外的本机资源，例如 Windows SAPI；这不会提升 Windows 管理员权限。降低权限后需重启 LingYu。</p>
+          <div class="field">
+            <label>Agent 发送方式</label>
+            <select data-key="agent_reply_transport">
+              <option value="mcp">LingYu MCP</option>
+              <option value="http">本地 HTTP Webhook</option>
+            </select>
+          </div>
+          <p class="hint">纯触发模式下 LingYu 只负责监听并唤起 Agent。MCP 适合支持工具调用的模型；HTTP Webhook 适合 Qwen 等通用模型。切换发送方式后请重启 LingYu。</p>
+          <div class="field">
+            <label>额外可发送文件目录（每行一个，包含所有子目录）</label>
+            <textarea data-key="allow_send_dirs" rows="3" placeholder="例如 C:\\Users\\iaiui\\Documents\\Works\\LingYuAgent\\out"></textarea>
+          </div>
+          <p class="hint">Agent 工作区及其子目录默认允许发送；此处可增加其他目录。修改后请重启 LingYu。</p>
+          <div class="field">
+            <label>工作区路径</label>
+            <input type="text" data-key="agent_workspace" placeholder="例如 C:\\Users\\me\\Documents\\Works"/>
+          </div>
+          <div class="field">
+            <label>Codex 命令</label>
+            <input type="text" data-key="agent_command" placeholder="codex"/>
+          </div>
+          <div class="field">
+            <label>会话映射文件（留空使用默认位置）</label>
+            <input type="text" data-key="agent_session_file" placeholder="可选 JSON 文件路径"/>
+          </div>
+          <div class="field">
+            <label>Agent 超时（秒）</label>
+            <input type="number" min="10" max="1800" data-key="agent_timeout_seconds"/>
+          </div>
+          <p class="hint">启用后，每个微信会话会复用自己的 Codex 对话线程。请只填写你愿意让 Agent 访问的工作区。</p>
+          <p class="hint">工作区或会话映射路径更改后建议重启；已存在的 Codex 会话可能仍使用原工作区，需另用新的会话映射文件才能建立新会话。</p>
         </div>
 
         <div class="card">
