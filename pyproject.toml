@@ -1,6 +1,6 @@
 [project]
 name = "lingyu"
-version = "0.9.2"
+version = "0.9.3"
 description = "灵语（LingYu）- 面向通用 AI Agent 的微信 / QQ 机器人桌面自动化工具服务"
 readme = "README.md"
 requires-python = ">=3.10"

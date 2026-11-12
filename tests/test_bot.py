@@ -1415,6 +1415,61 @@ class BridgeAtDetectionTests(EngineTestCase):
         self.assertEqual(bridge._bot_names, {"群助手", "wxid_new"})
         self.assertEqual(bridge._self_wxid, "wxid_new")
 
+    def test_load_reads_wechat_id_alias(self):
+        """别人常按微信号（老名字）@ 机器人，只认昵称会漏掉。"""
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
+
+        class _Cursor:
+            @staticmethod
+            def fetchone():
+                return ("老名字",)
+
+        class _Conn:
+            def execute(self, sql, params):
+                return _Cursor()
+
+            def close(self):
+                pass
+
+        class _FakeDb:
+            @staticmethod
+            def get_self_info():
+                return {"nick_name": "小助手", "username": "wxid_self"}
+
+            @staticmethod
+            def _contact_conn():
+                return _Conn()
+
+        class _FakeWx:
+            nickname = "小助手"
+
+        _FakeWx._db = _FakeDb
+        bridge._wx = _FakeWx()
+        bridge._load_bot_identity()
+        self.assertEqual(bridge._bot_names, {"小助手", "wxid_self", "老名字"})
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@老名字\u2005在吗"))
+
+    def test_alias_read_failure_keeps_nickname(self):
+        """读联系人库失败时只少一个别名，不能把已有昵称清空。"""
+        bridge = self._bridge(names={"小助手"}, loaded_at=0.0)
+
+        class _FakeDb:
+            @staticmethod
+            def get_self_info():
+                return {"nick_name": "小助手", "username": "wxid_self"}
+
+            @staticmethod
+            def _contact_conn():
+                raise RuntimeError("库被占用")
+
+        class _FakeWx:
+            nickname = "小助手"
+
+        _FakeWx._db = _FakeDb
+        bridge._wx = _FakeWx()
+        bridge._load_bot_identity()
+        self.assertEqual(bridge._bot_names, {"小助手", "wxid_self"})
+
 
 class BridgeRoomNameTests(EngineTestCase):
     """无名群（微信里没设群名称）的显示名兜底。

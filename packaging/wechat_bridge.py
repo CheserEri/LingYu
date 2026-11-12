@@ -1536,6 +1536,13 @@ class WeChatBridge:
         except Exception:
             pass
 
+        # 群里 @ 人显示的是成员在该群的名字，不一定等于账号昵称：昵称改过之后，
+        # 别人（和群里成员列表）仍可能用老名字——也就是账号的微信号（contact.alias）
+        # 来 @。只认昵称会漏掉这类 @，表现就是「别人艾特不回应」。
+        alias = self._read_self_alias(wx, self._self_wxid)
+        if alias:
+            names.add(alias)
+
         self._identity_loaded_at = time.monotonic()
         collected = {name for name in names if name}
         if not collected:
@@ -1543,6 +1550,38 @@ class WeChatBridge:
         if collected != self._bot_names:
             logger.info(f"已识别机器人微信昵称: {', '.join(sorted(collected))}")
         self._bot_names = collected
+
+    def _read_self_alias(self, wx, self_wxid: str) -> str:
+        """读取本账号的微信号（``contact.alias``）。
+
+        群里 @ 人用的是成员在该群的显示名；账号改过昵称后，群里仍可能按老名字
+        （= 微信号）@ 机器人。``get_self_info`` 不返回 alias，这里直接读联系人库；
+        读不到就返回空串，不影响原有昵称判定。
+        """
+        if not self_wxid:
+            return ""
+        db = getattr(wx, "_db", None)
+        opener = getattr(db, "_contact_conn", None)
+        if opener is None:
+            return ""
+        conn = None
+        try:
+            conn = opener()
+            if conn is None:
+                return ""
+            row = conn.execute(
+                "SELECT alias FROM contact WHERE username=? LIMIT 1",
+                (self_wxid,),
+            ).fetchone()
+            return str(row[0] or "").strip() if row else ""
+        except Exception:
+            return ""
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _refresh_bot_identity(self) -> bool:
         """按冷却时间重读机器人昵称；昵称发生变化时返回 ``True``。
