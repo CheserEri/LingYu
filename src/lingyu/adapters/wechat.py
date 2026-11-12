@@ -172,6 +172,8 @@ def _apply_send_attempts(bridge: Any, attempts: int) -> None:
 class WeChatAdapter:
     """独立的微信适配层，可脱离任何业务逻辑直接调用。"""
 
+    platform = "wechat"
+
     def __init__(
         self,
         config: AdapterConfig | None = None,

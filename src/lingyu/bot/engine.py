@@ -1,22 +1,28 @@
 """实时自动回复引擎。
 
 与「MCP 被动工具 + Agent 轮询」不同，引擎直接订阅适配层的实时消息：
-每条入站消息到达瞬间入会话历史；当消息满足触发条件（群里 @我 / 引用回复我、
-刚回复过的人继续发言 / 私聊）且过了冷却，就取最近 N 条上下文 + 人设送给大模型，
-并把回复发回同一会话。触发消息会被标记为「[待回复]」，避免模型答错对象。
+每条入站消息到达瞬间入会话历史；当消息满足触发条件（群里 @我 / 引用回复我 /
+刚跟它说过话的人继续发言 / 私聊）就交给**混合人格内核**处理——身份、心境、
+情节记忆与人格札记算出这一刻「我是什么心情、该不该说话、说到什么程度」。
 
-在此之上还有「降低存在感」与「偶发参与」两层：
-- 静默时段与群级节流：命中时保持安静，不回复任何人。
-- 主动参与：周期性检查群聊，小概率主动接一句；模型可回 ``[SILENT]`` 选择不发言。
+宿主**不配置任何行为**：
+- **多久回**：由心境决定。调节策略 ``delay``（高烦躁 + 负效价）时先停几秒再回，
+  ``share`` 时几乎立刻回；停顿上限 8 秒——再久就该是「沉默」而不是「延迟」。
+- **怎么表达**：由心境决定。高唤醒且强度够 → 拆成几条连发，低唤醒 → 一整段说完
+  （见 ``emotion/pacing.py``）。没有「最多拆几条」「间隔多少秒」这类开关。
+- **人设**：身份文件（原则 / 边界 / 说话方式 / 第一人称自述）是只读内核；
+  长期变化只通过可修订、可撤回的人格札记发生，没有「自定义人设」输入框。
+- **几点不说话**：内核按本地钟点判断深夜、按 ``energy`` 决定收着说，
+  没有「静默时段」起止时间要填。
+
+「不回」仍是一等结果：自发周期里已表达过、调节要求收着时，这一轮就不发声。
+保留的只有工程底线：消息去重、连发合并、发送重试、撤回、链接解析。
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import math
-import random
-import re
 import threading
 import time
 from collections import deque
@@ -24,12 +30,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ..adapters.wechat import WeChatAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
 from . import recall as recall_mod
 from . import storage, tweet, xiaohongshu
 from .card import note_to_card
+from .emotion import EmotionBridge, EmotionDecision, SessionStore
 from .links import (
     DownloadOutcome,
     LinkResolver,
@@ -39,46 +45,45 @@ from .links import (
     usable_cookies_file,
 )
 from .llm import LLMClient, LLMError
-from .persona import get_persona
 
 # 每个会话在引擎内保留的历史条数上限（上下文窗口之外的环形缓冲）。
 PER_CHAT_HISTORY = 200
+
+#: 送给情绪引擎的「最近对话」条数。比 context_messages 小得多：
+#: 内核要的是指代与语气，不是把整段聊天记录塞进提示词。
+RECENT_CONTEXT_LINES = 8
+
+#: 连发合并窗口（秒）：**同一个人**在这个窗口内连发，算同一句话的补充，
+#: 不再起一轮新周期。这是工程防抖（有人一口气发五条「在吗」），
+#: 不是「回复间隔」——后者由情绪决定。不同人说话互不影响。
+BURST_WINDOW_SECONDS = 1.5
+
+# 对话闭合语：同一人以简短确认/致谢结束当前轮时，不再把它当作自动续聊触发。
+# 若消息还包含问题或明确的新话题，则仍允许继续。
+CONVERSATION_CLOSURES = ("好的", "好吧", "好哒", "收到", "知道了", "明白了",
+                        "谢谢", "谢啦", "感谢", "嗯嗯", "行", "可以", "晚安")
+
+#: 重新开口的评估节拍（秒）。只决定「多久看一次有没有该开口的会话」，
+#: 不决定「说不说」；说不说在内核里（沉默时长 + 是否已重开过 + 是否深夜）。
+REOPEN_TICK_SECONDS = 300.0
+
+#: 同一个会话两次「重新开口」评估之间的最小间隔（秒）。防抖用：同一段沉默
+#: 不必每 5 分钟问一遍内核「要不要开口」，答案不会变。
+REOPEN_EVAL_GAP_SECONDS = 1800.0
 
 # 下载失败重试之间的退避（秒）。首次立刻重试意义不大——yt-dlp 偶发的
 # 「Unable to extract initial state」往往要等对面接口缓过来，隔一两秒再撞。
 _RETRY_DELAYS = (1.5, 3.0, 6.0, 10.0)
 
-# 分条发送时的句子边界：中英文句末标点之后，或换行处（保留标点，不丢内容）。
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;…])|\n+")
+async def _sleep(seconds: float) -> None:
+    """发送节奏用的等待。
 
-# 固定行为约束（不是角色人设）：明确本次要回应哪条消息，并要求口语化。
-# 群里历史消息里往往有更抢眼的话题，不加约束时模型容易答错对象。
-BEHAVIOR_HINT = (
-    "你是自动回复助手。只针对最后一条标记「[待回复]」的消息作答，"
-    "它是刚刚 @ 你或引用你的那条消息；更早的消息仅用于理解指代和语境，"
-    "不要改变本次要回答的话题。"
-    "像真人用微信聊天那样回复：口语化、简短自然，多用短句，"
-    "可以自然地用「嗯」「哈哈」「好呀」这类语气词，"
-    "不要像客服或 AI 那样一本正经地长篇大论；"
-    "一般两三句话以内，对方明确要求详细说明时才展开。"
-    "回复必须是微信可直接发送的纯文本：禁止使用任何 Markdown 标记，"
-    "例如 **加粗**、*斜体*、# 标题、- 列表符号、``` 代码块或表格；"
-    "需要分点时用「1. 2. 3.」或分号自然叙述，不要出现这些符号。"
-)
+    单独抽出来是为了**可替换**：情绪决定的停顿最长 8 秒，一套用例若真等，
+    跑一次要好几分钟。测试把这里换成「不等」，停顿的**数值**由
+    ``emotion/pacing.py`` 的单元测试与一条流程用例（断言调用参数）覆盖。
+    """
+    await asyncio.sleep(seconds)
 
-# 主动参与（水群）时的行为约束：允许模型自己判断「这次不发言」。
-SILENT_SENTINEL = "[SILENT]"
-PROACTIVE_HINT = (
-    "你正在一个微信群里潜水。以下是最近的群聊记录，"
-    "你可以像普通群成员一样自然地接一句，也可以选择不发言。"
-    "只有在确实有话可说、能自然融入当前话题时才发言；"
-    "如果话题与你无关、或没有合适的话，必须只回复 "
-    f"{SILENT_SENTINEL} 这一串字符，不要输出任何其它内容。"
-    "发言时口语化、随意，一般一句话以内，像真人水群那样，不要长篇大论。"
-    "回复必须是微信可直接发送的纯文本：禁止使用任何 Markdown 标记"
-    "（如 **加粗**、# 标题、- 列表、``` 代码块或表格）；"
-    "需要分点时用「1. 2. 3.」或分号自然叙述。"
-)
 
 # 可交给视觉模型的图片类型与单张体积上限（超过则跳过，避免请求体过大）。
 _IMAGE_MIME = {
@@ -142,15 +147,24 @@ class BotEngine:
 
     def __init__(
         self,
-        adapter: WeChatAdapter,
+        adapter: Any,
         config: BotConfig | None = None,
         llm_factory: Callable[[BotConfig], Any] | None = None,
+        emotion_store: SessionStore | None = None,
+        *,
+        adapters: list[Any] | None = None,
     ):
-        self._adapter = adapter
+        # 多端并行：adapters 里的每个适配器都会订阅消息，回复回到消息来源那一端。
+        self._adapters: list[Any] = list(adapters) if adapters else [adapter]
+        self._adapter = self._adapters[0]
+        # 适配器 → 监听回调。必须保留同一个回调对象，stop 时才能摘干净。
+        self._listeners: dict[int, Callable[[MessageRecord], None]] = {}
+        # 会话显示名 / 会话 ID → 来源适配器，用于把回复路由回正确的一端。
+        self._chat_sources: dict[str, Any] = {}
         self._config = config or BotConfig.load()
         self._llm_factory = llm_factory or (lambda cfg: LLMClient(cfg))
 
-        self._queue: asyncio.Queue[MessageRecord] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[MessageRecord, Any]] = asyncio.Queue()
         self._history: dict[str, deque[HistoryItem]] = {}
         self._log_lines: deque[LogLine] = deque(maxlen=500)
         self._log_seq = 0
@@ -158,8 +172,9 @@ class BotEngine:
         # 而 get_logs 会整体遍历该 deque——并发追加会触发
         # 「deque mutated during iteration」，故读写都加同一把锁。
         self._log_lock = threading.Lock()
-        self._cooldown_until: dict[str, float] = {}
         self._processed_ids: deque[str] = deque(maxlen=1000)
+        # 「会话::发送者」→ 上一次跑完情绪周期的时刻，用于连发合并（工程防抖）。
+        self._last_cycle_at: dict[str, float] = {}
         # 已做过「链接服务」的消息 ID。与 _processed_ids 分开：链接服务独立于
         # 是否触发大模型回复，同一条消息可能既发固定提示、又触发一次模型回复。
         self._link_handled_ids: deque[str] = deque(maxlen=1000)
@@ -167,10 +182,10 @@ class BotEngine:
         self._last_reply_to: dict[str, tuple[str, float]] = {}
         # 会话键 → 最近一条入站消息，供主动参与挑选目标。
         self._last_inbound: dict[str, MessageRecord] = {}
-        # 会话键 → 最近的回复时间戳，用于群级节流。
-        self._reply_times: dict[str, deque[float]] = {}
-        # 会话键 → 该群下次允许主动发言的时间，避免连续冒泡。
+        # 会话键 → 下一次允许「重新开口」评估的时刻（防抖，不参与判断）。
         self._proactive_cooldown_until: dict[str, float] = {}
+        # 最近成功发言与入站事件落在情绪状态分片的元数据中，供重启恢复。
+        self._reopen_meta: dict[str, dict[str, Any]] = {}
 
         self._consume_task: asyncio.Task | None = None
         self._proactive_task: asyncio.Task | None = None
@@ -201,6 +216,15 @@ class BotEngine:
         # 会话 → 上次执行撤回的时间，避免连点/重复投递把后续消息也撤了。
         self._last_recall_at: dict[str, float] = {}
 
+        # 情绪引擎：回复由九个 Agent 共同决定，状态按会话分片落盘。
+        # 必须在 _log 可用之后构造——它在出错时要写运行日志。
+        self._emotion = EmotionBridge(
+            self._config,
+            store=emotion_store or SessionStore(self._config.emotion_dir()),
+            logger=self._log,
+            llm_factory=self._llm_factory,
+        )
+
         # 桌面壳可注入：新日志产生时回调（用于推送到前端）。
         self.on_log: Callable[[LogLine], Any] | None = None
 
@@ -222,6 +246,8 @@ class BotEngine:
     def update_config(self, config: BotConfig) -> None:
         """界面保存配置后热替换（下次处理即生效）。"""
         self._config = config
+        # 情绪引擎同步拿到新配置：身份、模型参与程度、轮次上限都要立刻生效。
+        self._emotion.update_config(config)
         # 解析超时随配置热更新；缓存保留，避免重复解析。
         self._links.timeout = config.link_parse_timeout
         # 发送重试次数同样热更新，不必重启。
@@ -238,35 +264,74 @@ class BotEngine:
                 self._log("info", "已停用链接解析 Cookie（cookies.txt 未设置或不可读）。")
 
     def _push_send_attempts(self) -> None:
-        """把「附件没发成功时最多再试几次」推给适配层。
+        """把「附件没发成功时最多再试几次」推给每个适配层。
 
         适配层是可注入的接口，测试里的假适配器不一定实现这个方法，取不到就
         安静跳过——重试次数推不过去不该拖垮启动或配置保存。
         """
-        apply = getattr(self._adapter, "apply_send_attempts", None)
-        if apply is None:
-            return
-        try:
-            apply(self._config.link_send_attempts)
-        except Exception as exc:  # noqa: BLE001 - 尽力而为
-            self._log("warning", f"应用「发送失败后重试次数」失败：{exc}")
+        for adapter in self._adapters:
+            apply = getattr(adapter, "apply_send_attempts", None)
+            if apply is None:
+                continue
+            try:
+                apply(self._config.link_send_attempts)
+            except Exception as exc:  # noqa: BLE001 - 尽力而为
+                self._log("warning", f"应用「发送失败后重试次数」失败：{exc}")
 
     # ------------------------------------------------------------------ 启停
+
+    def _adapter_for(self, chat: str) -> Any:
+        """按会话找来源适配器；找不到（如主动发送）回退到主适配器。"""
+        return self._chat_sources.get(chat) or self._adapter
+
+    def _listener_for(self, adapter: Any) -> Callable[[MessageRecord], None]:
+        def listener(record: MessageRecord) -> None:
+            self._chat_sources[record.chat] = adapter
+            if record.chat_id:
+                self._chat_sources[record.chat_id] = adapter
+            self._enqueue(record, adapter)
+
+        return listener
 
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._adapter.add_message_listener(self._enqueue)
+        for adapter in self._adapters:
+            listener = self._listener_for(adapter)
+            self._listeners[id(adapter)] = listener
+            adapter.add_message_listener(listener)
         self._consume_task = asyncio.create_task(self._consume())
         self._proactive_task = asyncio.create_task(self._proactive_loop())
         self._log("info", "自动回复已开启。")
+
+    async def set_adapters(self, adapters: list[Any]) -> None:
+        """替换全部适配器（多端并行 / 平台或凭据变更），保留会话与人格状态。
+
+        旧适配器应先由调用方 ``disconnect``，避免多条监听同时存活。
+        """
+        was_running = self._running
+        if was_running:
+            await self.stop()
+        self._adapters = list(adapters)
+        self._adapter = self._adapters[0]
+        self._listeners.clear()
+        self._chat_sources.clear()
+        if was_running:
+            await self.start()
+
+    async def swap_adapter(self, adapter: Any) -> None:
+        """单适配器热切换，等价于 ``set_adapters([adapter])``。"""
+        await self.set_adapters([adapter])
 
     async def stop(self) -> None:
         if not self._running:
             return
         self._running = False
-        self._adapter.remove_message_listener(self._enqueue)
+        for adapter in self._adapters:
+            listener = self._listeners.pop(id(adapter), None)
+            if listener is not None:
+                adapter.remove_message_listener(listener)
         for attr in ("_consume_task", "_proactive_task"):
             task = getattr(self, attr)
             if task is not None:
@@ -282,13 +347,19 @@ class BotEngine:
         self._downloading_urls.clear()
         self._log("info", "自动回复已停止。")
 
-    def _enqueue(self, record: MessageRecord) -> None:
+    def _enqueue(self, record: MessageRecord, adapter: Any = None) -> None:
         # 适配层回调在事件循环线程中同步调用，put_nowait 安全。
-        self._queue.put_nowait(record)
+        self._queue.put_nowait((record, adapter))
 
     async def _consume(self) -> None:
         while self._running:
-            record = await self._queue.get()
+            record, source = await self._queue.get()
+            # 两端可能碰巧用同一个显示名：处理这一条前按入队时记录重新钉一次来源，
+            # 保证本条回复不会因为另一端的同名会话先入队而串到对面。
+            if source is not None:
+                self._chat_sources[record.chat] = source
+                if record.chat_id:
+                    self._chat_sources[record.chat_id] = source
             self._record_inbound(record)
             try:
                 await self._handle(record)
@@ -309,6 +380,14 @@ class BotEngine:
         """会话稳定标识：优先用会话 ID，显示名可能是解析失败的退化值。"""
         return record.chat_id or record.chat
 
+    @classmethod
+    def _emotion_key(cls, record: MessageRecord) -> str:
+        """情绪关系按人隔离；群聊历史仍按群共享。"""
+        chat_key = cls._chat_key(record)
+        if record.is_group:
+            return f"{chat_key}::sender::{record.sender.strip()}"
+        return chat_key
+
     def _record_inbound(self, record: MessageRecord) -> None:
         key = self._chat_key(record)
         self._bucket(key).append(
@@ -323,8 +402,15 @@ class BotEngine:
         )
         # 记住最近一条入站消息，供主动参与挑选目标会话。
         self._last_inbound[key] = record
+        emotion_key = self._emotion_key(record)
+        meta = self._reopen_meta.setdefault(emotion_key, {})
+        meta.update({"chat": record.chat, "sender": record.sender,
+                     "is_group": record.is_group, "chat_id": key,
+                     "last_inbound_at": record.timestamp or time.time(),
+                     "pending": bool(meta.get("last_outbound_at"))})
+        self._emotion.store.touch(emotion_key, reopen_meta=meta)
 
-    def _record_assistant(self, chat: str, content: str) -> None:
+    def _record_assistant(self, chat: str, content: str, *, record: MessageRecord | None = None) -> None:
         self._bucket(chat).append(
             HistoryItem(
                 timestamp=time.time(),
@@ -333,6 +419,13 @@ class BotEngine:
                 content=content,
             )
         )
+        if record is not None:
+            emotion_key = self._emotion_key(record)
+            meta = self._reopen_meta.setdefault(emotion_key, {})
+            meta.update({"chat": record.chat, "sender": record.sender,
+                         "is_group": record.is_group, "chat_id": self._chat_key(record),
+                         "last_outbound_at": time.time(), "pending": True})
+            self._emotion.store.touch(emotion_key, reopen_meta=meta)
 
     # ------------------------------------------------------------------ 触发
 
@@ -347,7 +440,18 @@ class BotEngine:
         )
 
     def _should_reply(self, record: MessageRecord) -> bool:
+        """这条消息算不算「在跟我说话」——只判断**是不是对我说的**，不判断多久回。
+
+        「隔了三个小时才回上一句」这种事交给内核：它拿到 ``elapsed_hours``
+        与关系、需求受阻程度，自己决定该不该接、该用什么强度接。宿主设时间窗
+        只会把它变成「过点就不理人」的机器。
+        """
         if not record.content:
+            return False
+        if self._is_conversation_closure(record.content):
+            # 礼貌收尾同时清掉续聊资格；之后同一个人发新话题仍可重新触发。
+            self._last_reply_to.pop(self._chat_key(record), None)
+            self._log("debug", f"识别到对话收尾，结束本轮续聊 [{record.chat}] {record.sender}。")
             return False
         if not record.is_group:
             return self._config.reply_private
@@ -360,21 +464,32 @@ class BotEngine:
         return self._is_continuation(record)
 
     def _is_continuation(self, record: MessageRecord) -> bool:
-        """会话延续：刚被回复过的发送者在窗口内继续发言，接着回复他。"""
-        window = self._config.continuation_seconds
-        if window <= 0:
-            return False
+        """会话延续：上一次对话里被回的就是这个人，他接着说，就接着听。
+
+        不设时间窗：只要「最后被回的是他」且中间没有别人插进来，他说的每句话
+        都进内核。是否真的接话由情绪决定（可能一句话都不回），而不是被
+        「超过 120 秒就不理」这种规则挡在门外。
+        """
         last = self._last_reply_to.get(self._chat_key(record))
         if not last:
             return False
-        sender, ts = last
-        return sender == record.sender and (time.time() - ts) <= window
+        sender, _ts = last
+        return sender == record.sender
+
+    @staticmethod
+    def _is_conversation_closure(text: str) -> bool:
+        """识别无新问题的简短收尾语，避免礼貌确认被续成无限问答。"""
+        body = str(text or "").strip()
+        if not body or any(mark in body for mark in ("?", "？", "吗", "怎么", "什么", "为什么")):
+            return False
+        normalized = body.strip("。.!！~～… ")
+        return normalized in CONVERSATION_CLOSURES
 
     def _is_reply_to_me(self, record: MessageRecord) -> bool:
         target = record.reply_to_name.strip()
         if not target:
             return False
-        names = self._adapter.self_names()
+        names = self._adapter_for(record.chat).self_names()
         if not names:
             # 上游尚未记录到自身昵称时，非空引用目标按「回复本人」处理。
             return True
@@ -400,17 +515,12 @@ class BotEngine:
                 f"群消息未命中触发条件（「@我」触发已关闭），已忽略 [{record.chat}]。",
             )
             return
-        names = "、".join(sorted(self._adapter.self_names())) or "（未识别到昵称）"
+        names = "、".join(sorted(self._adapter_for(record.chat).self_names())) or "（未识别到昵称）"
         self._log(
             "debug",
             f"群消息未 @ 机器人，已忽略 [{record.chat}] {record.sender}："
             f"{record.content[:30]}｜机器人昵称：{names}",
         )
-
-    @classmethod
-    def _cooldown_key(cls, record: MessageRecord) -> str:
-        key = cls._chat_key(record)
-        return key if not record.is_group else f"{key}::{record.sender}"
 
     # ------------------------------------------------------------------ 处理
 
@@ -442,72 +552,67 @@ class BotEngine:
             return
 
         now = time.time()
-        key = self._cooldown_key(record)
-        if now < self._cooldown_until.get(key, 0.0):
-            self._log("debug", f"冷却中，跳过 [{record.sender}]。")
-            return
-
-        # 静默时段：任何人（含 @我）都不回复。
-        if self._in_quiet_hours(now):
-            self._log("info", f"静默时段，跳过 [{record.chat}] {record.sender}。")
-            return
-
-        # 群级节流：同一群在窗口内回复过多时保持静默。
-        if record.is_group and self._rate_limited(self._chat_key(record), now):
-            self._log(
-                "info",
-                f"群级节流中（{self._config.group_rate_window_minutes:.0f} 分钟内"
-                f"已达 {self._config.group_rate_max_replies} 条），跳过 "
-                f"[{record.chat}]。",
-            )
+        chat_key = self._chat_key(record)
+        # 连发合并：同一个人刚跑完一轮，紧接着又发一条，算同一句话的补充。
+        # 只按「同一个人」算：群里张三李四先后 @ 它，是两件事，都要处理。
+        burst_key = f"{chat_key}::{record.sender}"
+        if now - self._last_cycle_at.get(burst_key, 0.0) < BURST_WINDOW_SECONDS:
+            self._log("debug", f"连发合并，跳过 [{record.sender}]。")
             return
 
         if record.message_id:
             self._processed_ids.append(record.message_id)
-        self._cooldown_until[key] = now + self._config.cooldown_seconds
         self.last_trigger_at = now
-
-        # 拟人化：按概率决定这次到底回不回，避免「有求必应」的机械感。
-        if self._config.humanize and random.random() > self._config.reply_probability:
-            self._log(
-                "info",
-                f"拟人化：本次不回复 [{record.chat}] {record.sender}。",
-            )
-            return
 
         self._log(
             "info",
             f"触发 [{record.chat}] {record.sender}：{record.content[:40]}",
         )
 
-        chat_key = self._chat_key(record)
         # 先把上下文里的链接解析好，模型才能在下面看到「[链接] …」信息。
         if self._config.link_parse_enabled:
             await self._prefetch_links(chat_key)
-        messages = self._build_messages(chat_key)
+
+        # 「这次回不回」不再掷骰子：交给情绪引擎判断（沉默是一等结果）。
+        recent = self._recent_lines(chat_key)
+        # 触发消息里若带媒体链接，已解析的标题/作者要一起进去，
+        # 否则内核只看到一串 URL，评估不出这条消息对「我」意味着什么。
+        block = self._trigger_link_block(chat_key)
+        if block:
+            recent.append(block)
         try:
-            client = self._llm_factory(self._config)
-            reply = await client.chat(messages)
-        except LLMError as exc:
-            # 不回滚冷却：Key 缺失/无效时避免每条消息都重试报错。
-            self._log("error", f"模型调用失败：{exc.message}")
+            decision = await self._emotion.respond(
+                chat_key=self._emotion_key(record),
+                chat_name=record.chat,
+                text=record.content,
+                sender=record.sender,
+                is_group=record.is_group,
+                recent=recent,
+                images=self._image_uris(chat_key),
+            )
+        finally:
+            # 无论成败都记时刻：失败的周期也算「刚跑过」，避免异常时被连发刷屏。
+            self._last_cycle_at[burst_key] = time.time()
+        self._log(
+            "info", decision.log_line(f"情绪 [{record.chat}] {record.sender}")
+        )
+        if decision.silent:
             return
 
-        if not await self._send_reply(record.chat, reply):
+        if not await self._send_reply(record.chat, decision):
             return
 
-        self._record_assistant(chat_key, reply)
+        self._record_assistant(chat_key, decision.text, record=record)
         self._last_reply_to[chat_key] = (record.sender, time.time())
-        self._note_reply(chat_key)
         self.reply_count_today += 1
-        parts = self._split_reply(reply)
-        if len(parts) > 1:
+        if decision.pacing.count > 1:
             self._log(
                 "info",
-                f"已回复 [{record.chat}]（{len(parts)} 条）：{reply[:40]}",
+                f"已回复 [{record.chat}]（{decision.pacing.count} 条，"
+                f"先停 {decision.pacing.lead:.1f}s）：{decision.text[:40]}",
             )
         else:
-            self._log("info", f"已回复 [{record.chat}]：{reply[:40]}")
+            self._log("info", f"已回复 [{record.chat}]：{decision.text[:40]}")
 
         # 链接内容的「下载并回发」已由 _handle_links 统一调度（无论这条消息
         # 是否触发模型回复），这里不再重复调度，避免同一链接被下载两次。
@@ -631,12 +736,12 @@ class BotEngine:
         if config.recall_notice_enabled:
             text = config.recall_ok_text if recalled else config.recall_fail_text
             if text:
-                await self._send_reply(chat, text)
+                await self._send_plain(chat, text)
         return True
 
     async def _recall_one(self, chat: str) -> bool:
         """让适配层撤回该会话最新一条机器人消息；成功返回 True。"""
-        action = getattr(self._adapter, "recall_last_message", None)
+        action = getattr(self._adapter_for(chat), "recall_last_message", None)
         if action is None:
             self._log("warning", "适配层不支持撤回，已跳过。")
             return False
@@ -652,185 +757,97 @@ class BotEngine:
 
     # ------------------------------------------------------------------ 发送
 
-    async def _send_reply(self, chat_display: str, reply: str) -> bool:
-        """按拟人化规则分条发送回复；任一条失败即停止并返回 False。"""
-        parts = self._split_reply(reply)
+    async def _send_reply(
+        self, chat_display: str, decision: "EmotionDecision"
+    ) -> bool:
+        """按情绪定下的节奏发送：先停 ``lead``，再逐条发，条间按 ``gaps`` 停。
+
+        节奏来自 ``emotion/pacing.py``（唤醒度 + 强度 + 调节策略），不是配置项。
+        任一条失败即停止并返回 False——半句话比不发更糟。
+        """
+        pacing = decision.pacing
+        parts = list(pacing.parts) or [decision.text]
+        if pacing.lead > 0:
+            # 「缓缓再回」：delay 策略下这是「先降低反应强度」在时间上的表现。
+            # 上限 8 秒（pacing.MAX_LEAD），再长会堵住消息队列，那该用沉默表达。
+            await _sleep(pacing.lead)
         for index, part in enumerate(parts):
             # 发送目标用显示名；适配层会把「退化成的会话 ID」反查成可搜索名。
-            result = await self._adapter.send_message(chat_display, part)
+            result = await self._adapter_for(chat_display).send_message(chat_display, part)
             if not result.ok:
                 message = (result.error or {}).get("message", "结果未确认")
                 self._log("error", f"回复发送失败：{message}")
                 return False
             # 记账：撤回指令要能定位到「机器人最新发了什么」。
             self._recall_book.record_text(chat_display, part)
-            if index < len(parts) - 1:
-                await asyncio.sleep(
-                    random.uniform(
-                        self._config.split_delay_min,
-                        self._config.split_delay_max,
-                    )
-                )
+            if index < len(pacing.gaps):
+                await _sleep(pacing.gaps[index])
         return True
 
-    # ------------------------------------------------------------------ 静默 / 节流
+    async def _send_plain(self, chat_display: str, text: str) -> bool:
+        """发一条**不带情绪节奏**的固定文案（链接提示、撤回回执）。
 
-    @staticmethod
-    def _parse_hm(value: str) -> int | None:
-        """把 ``HH:MM`` 解析成当天分钟数；非法返回 None。"""
-        text = str(value or "").strip()
-        match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
-        if not match:
-            return None
-        hour, minute = int(match.group(1)), int(match.group(2))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            return None
-        return hour * 60 + minute
-
-    def _in_quiet_hours(self, now: float | None = None) -> bool:
-        """当前是否处于静默时段（支持跨零点，如 23:00-08:00）。"""
-        config = self._config
-        if not config.quiet_hours_enabled:
-            return False
-        start = self._parse_hm(config.quiet_hours_start)
-        end = self._parse_hm(config.quiet_hours_end)
-        if start is None or end is None or start == end:
-            return False
-        local = time.localtime(now if now is not None else time.time())
-        current = local.tm_hour * 60 + local.tm_min
-        if start < end:
-            return start <= current < end
-        # 跨零点：如 23:00-08:00，命中条件是「已过 start」或「未到 end」。
-        return current >= start or current < end
-
-    def _rate_limited(self, chat_key: str, now: float) -> bool:
-        """该会话在节流窗口内是否已达回复上限。"""
-        config = self._config
-        if not config.group_rate_enabled:
-            return False
-        window = max(0.0, config.group_rate_window_minutes) * 60.0
-        limit = max(0, config.group_rate_max_replies)
-        if window <= 0 or limit <= 0:
-            return False
-        times = self._reply_times.get(chat_key)
-        if not times:
-            return False
-        while times and now - times[0] > window:
-            times.popleft()
-        return len(times) >= limit
-
-    def _note_reply(self, chat_key: str, now: float | None = None) -> None:
-        """记录一次成功回复，供群级节流统计。"""
-        limit = max(1, int(self._config.group_rate_max_replies))
-        bucket = self._reply_times.setdefault(chat_key, deque(maxlen=limit))
-        bucket.append(now if now is not None else time.time())
-
-    def _split_reply(self, reply: str) -> list[str]:
-        """把较长回复拆成多条短消息，模拟真人分句连发。
-
-        关闭拟人化 / 分条、回复不够长、或拆不出多句时，原样返回单条。
-        拆分只切分不丢内容：拼接各条应能还原原文（空白除外）。
+        这些是机械通知，不是「我想说点什么」：不排队、不拆条、不等停顿。
         """
-        text = str(reply or "").strip()
-        if not text:
-            return []
-        config = self._config
-        if not (config.humanize and config.split_replies):
-            return [text]
-        if len(text) < config.split_min_length:
-            return [text]
+        result = await self._adapter_for(chat_display).send_message(chat_display, text)
+        if not result.ok:
+            message = (result.error or {}).get("message", "结果未确认")
+            self._log("error", f"发送失败：{message}")
+            return False
+        self._recall_book.record_text(chat_display, text)
+        return True
 
-        sentences = [
-            segment.strip()
-            for segment in _SENTENCE_SPLIT_RE.split(text)
-            if segment.strip()
-        ]
-        if len(sentences) <= 1:
-            return [text]
+    def _recent_lines(self, chat: str) -> list[str]:
+        """送给情绪引擎的「最近几轮对话」。
 
-        max_parts = max(1, config.split_max_parts)
-        if len(sentences) <= max_parts:
-            return sentences
-
-        # 句子数超过上限：按长度均衡地合并成 max_parts 条。
-        target = math.ceil(len(text) / max_parts)
-        parts: list[str] = []
-        buffer = ""
-        for sentence in sentences:
-            if (
-                buffer
-                and len(buffer) + len(sentence) > target
-                and len(parts) < max_parts - 1
-            ):
-                parts.append(buffer)
-                buffer = sentence
-            else:
-                buffer += sentence
-        if buffer:
-            parts.append(buffer)
-        return parts
-
-    def _build_messages(self, chat: str) -> list[dict[str, Any]]:
-        recent = self._context_items(chat)
-        if not recent:
-            return []
-        # 触发消息是本会话最后一条入站消息，标记出来避免被更早的话题带偏。
-        mark_index = len(recent) - 1 if recent[-1].role == "user" else -1
-        return self._render_context(recent, mark_index, BEHAVIOR_HINT)
-
-    def _render_context(
-        self, recent: list[HistoryItem], mark_index: int, hint: str
-    ) -> list[dict[str, Any]]:
-        """把最近上下文渲染成模型消息；开启视觉时把图片附到对应 user 消息。"""
-        parts = [hint]
-        persona = get_persona(self._config).strip()
-        if persona:
-            parts.append(persona)
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": "\n\n".join(parts)}
-        ]
-        image_slots = self._image_slots(recent)
-        for idx, item in enumerate(recent):
-            prefix = "[待回复] " if idx == mark_index else ""
+        不含当前这条触发消息（它本身就是事件文本）；群聊带发言人前缀，
+        这样内核才能分清「谁在说话」——它默认面对的是一对一。
+        """
+        items = self._context_items(chat)
+        if items and items[-1].role == "user":
+            # 触发消息已经被 _record_inbound 追加进历史了，别重复给。
+            items = items[:-1]
+        lines: list[str] = []
+        for item in items[-RECENT_CONTEXT_LINES:]:
             if item.role == "assistant":
-                messages.append({"role": "assistant", "content": item.content})
-                continue
-            if item.is_group and item.sender:
-                text = f"{prefix}{item.sender}: {item.content}"
+                lines.append(f"我: {item.content}")
+            elif item.is_group and item.sender:
+                lines.append(f"{item.sender}: {item.content}")
             else:
-                text = f"{prefix}{item.content}"
-            # 已解析的链接信息附在该条消息后，模型据此回应链接内容。
-            link_block = self._link_block(item)
-            if link_block:
-                text = f"{text}\n{link_block}"
-            uri = _image_data_uri(item.image_path) if idx in image_slots else None
-            if uri:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": text},
-                            {"type": "image_url", "image_url": {"url": uri}},
-                        ],
-                    }
-                )
-            else:
-                messages.append({"role": "user", "content": text})
-        return messages
+                lines.append(item.content)
+        return lines
 
-    def _image_slots(self, recent: list[HistoryItem]) -> set[int]:
-        """挑出允许带图的位置：从最新往前取，最多 vision_max_images 张。"""
+    def _trigger_link_block(self, chat: str) -> str:
+        """触发消息里已解析链接的上下文块；没有则空串。"""
+        items = self._history.get(chat)
+        if not items:
+            return ""
+        last = items[-1]
+        if last.role != "user":
+            return ""
+        return self._link_block(last)
+
+    def _image_uris(self, chat: str) -> list[str]:
+        """按视觉范围选取图片（data URI），仅在开启视觉时给出。
+
+        内核把图片交给「感知」模块：看到的是什么，比文字描述更可靠。
+        """
         config = self._config
         if not config.vision_enabled or config.vision_max_images <= 0:
-            return set()
-        slots: set[int] = set()
-        for idx in range(len(recent) - 1, -1, -1):
-            item = recent[idx]
-            if item.role == "user" and item.image_path:
-                slots.add(idx)
-                if len(slots) >= config.vision_max_images:
+            return []
+        uris: list[str] = []
+        items = self._context_items(chat)
+        if config.vision_scope == "current_message":
+            items = items[-1:]
+        for item in reversed(items):
+            if item.role != "user" or not item.image_path:
+                continue
+            uri = _image_data_uri(item.image_path)
+            if uri:
+                uris.append(uri)
+                if len(uris) >= config.vision_max_images:
                     break
-        return slots
+        return uris
 
     # ------------------------------------------------------------------ 链接解析
 
@@ -909,11 +926,6 @@ class BotEngine:
                 return False
             self._link_handled_ids.append(record.message_id)
 
-        # 静默时段：不往聊天里发任何东西（解析本身照旧，供上下文使用）。
-        if self._in_quiet_hours():
-            self._log("info", f"静默时段，跳过链接提示 [{record.chat}]。")
-            return False
-
         ack = config.link_ack_text.strip()
         if not (config.link_ack_enabled and ack):
             # 提示关掉时仍要把链接内容回发，否则这个功能就完全没动作了。
@@ -921,7 +933,7 @@ class BotEngine:
                 self._schedule_download(record)
             return False
 
-        if await self._send_reply(record.chat, ack):
+        if await self._send_plain(record.chat, ack):
             self._log("info", f"已发送链接提示 [{record.chat}]：{ack}")
             sent = True
         else:
@@ -1245,8 +1257,7 @@ class BotEngine:
     ) -> None:
         """下载最终失败时告诉用户一声，免得链接发出去像石沉大海。
 
-        文案保持**单行**：``_send_reply`` 会按句号/换行分条，多行会让一次
-        失败提示拆成两条消息发出去。
+        走 ``_send_plain``：这是机械通知，不该被情绪节奏拆条或延迟。
         """
         if not self._config.link_download_fail_notice:
             return
@@ -1255,7 +1266,7 @@ class BotEngine:
         if used > 1:
             head += f"（重试 {used - 1} 次仍不行）"
         text = f"{head}：{reason}，先不发了。" if reason else f"{head}，先不发了。"
-        if await self._send_reply(record.chat, text):
+        if await self._send_plain(record.chat, text):
             self._log("info", f"已发送{label}下载失败提示 [{record.chat}]：{text}")
         else:
             self._log("warning", f"{label}下载失败提示发送失败 [{record.chat}]。")
@@ -1278,7 +1289,7 @@ class BotEngine:
     async def _send_file(self, chat: str, path: str | Path, label: str) -> bool:
         """把文件发回聊天；成功返回 True。"""
         try:
-            result = await self._adapter.send_file(chat, str(path))
+            result = await self._adapter_for(chat).send_file(chat, str(path))
         except Exception as exc:
             self._log("warning", f"{label} 发送异常：{exc}")
             return False
@@ -1291,141 +1302,215 @@ class BotEngine:
         return False
 
     def _ensure_download_dir_allowed(self, outdir: Path) -> None:
-        """把下载目录纳入发送白名单。
+        """把下载目录纳入每个适配器的发送白名单。
 
         该目录由本程序创建、内容可控，故可安全放行；不这样做的话，适配层的
         「未配置允许目录即拒发」会让自动回发永远失败。
         """
-        config = getattr(self._adapter, "config", None)
-        if config is None:
-            return
         try:
             resolved = Path(outdir).expanduser().resolve()
         except OSError:
             return
-        existing = tuple(getattr(config, "allow_send_dirs", ()) or ())
-        for item in existing:
-            try:
-                if Path(str(item)).expanduser().resolve() == resolved:
-                    return
-            except OSError:
+        for adapter in self._adapters:
+            config = getattr(adapter, "config", None)
+            if config is None:
                 continue
-        try:
-            config.allow_send_dirs = existing + (resolved,)
-        except Exception:  # 配置不可写时静默：发送时会给出明确错误
-            pass
+            existing = tuple(getattr(config, "allow_send_dirs", ()) or ())
+            for item in existing:
+                try:
+                    if Path(str(item)).expanduser().resolve() == resolved:
+                        break
+                except OSError:
+                    continue
+            else:
+                try:
+                    config.allow_send_dirs = existing + (resolved,)
+                except Exception:  # 配置不可写时静默：发送时会给出明确错误
+                    pass
 
-    # ------------------------------------------------------------------ 主动参与
+    # ------------------------------------------------------------------ 重新开口
 
     async def _proactive_loop(self) -> None:
-        """周期性检查群聊，偶发主动接一句（水群）。
+        """周期性检查「我说过话、对方一直没回」的会话，由情绪决定要不要开口。
 
-        循环常驻：即使当前未开启也会轮询配置，便于界面热开热关。
+        宿主在这里只提供**一个时钟**：多久看一次由 ``REOPEN_TICK_SECONDS`` 决定，
+        而说不说完全在内核里（沉默够不够久、是否已经重开过、是否深夜）。
+        这里刻意没有「允不允许主动开口」的开关——设计文档里「是否保持沉默」
+        是表达 Agent 的职责（§3.7），把它做成宿主配置就等于让用户替她决定。
+        唯一的闸门是总开关 ``enabled``：机器人停用时不该有任何外发。
         """
         while self._running:
-            if not self._config.proactive_enabled:
-                await asyncio.sleep(5)
-                continue
-            delay = random.uniform(
-                self._config.proactive_interval_min,
-                self._config.proactive_interval_max,
-            )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(REOPEN_TICK_SECONDS)
             if not self._running:
                 break
-            if not self._config.proactive_enabled:
+            if not self._config.enabled:
                 continue
             try:
-                await self._proactive_tick()
+                await self._reopen_tick()
             except Exception as exc:  # 兜底：单次异常不影响循环
-                self._log("error", f"主动参与检查异常：{exc}")
+                self._log("error", f"重新开口检查异常：{exc}")
 
-    def _proactive_candidates(self, now: float) -> list[tuple[str, MessageRecord]]:
-        """筛选出当前可以考虑主动发言的群。"""
-        config = self._config
+    def _reopen_candidates(self, now: float) -> list[tuple[str, MessageRecord]]:
+        """筛选出「可以评估一次要不要重新开口」的会话。
+
+        条件只有两个：最后一条是**我说的话**、且不在评估冷却里。沉默够不够久
+        由内核判断（``silence_reopen_hours`` 在身份文件里），深夜不开口也是
+        内核的规则——宿主不再用「安静几小时」「这个群回过几条」去挡。
+        """
         candidates: list[tuple[str, MessageRecord]] = []
-        for key, record in list(self._last_inbound.items()):
-            if not record.is_group or not self._in_group_scope(record):
+        entries = dict(self._reopen_meta)
+        for item in self._emotion.store.list_chats():
+            emotion_key = item["key"]
+            payload = self._emotion.store.load(emotion_key)
+            meta = payload.get("reopen_meta")
+            if isinstance(meta, dict):
+                entries.setdefault(emotion_key, dict(meta))
+        for emotion_key, meta in entries.items():
+            if not meta.get("pending"):
                 continue
-            items = self._history.get(key)
-            if not items:
+            chat = str(meta.get("chat") or "")
+            record = next((r for r in self._last_inbound.values()
+                           if self._emotion_key(r) == emotion_key), None)
+            if record is None:
+                record = MessageRecord(chat=chat, sender=str(meta.get("sender") or ""),
+                                       content="", is_group=bool(meta.get("is_group")),
+                                       chat_id=str(meta.get("chat_id") or ""))
+            if record.is_group and not self._in_group_scope(record):
                 continue
-            last = items[-1]
-            # 只有「别人刚说过话」时才考虑接话，自己刚说过就安静。
-            if last.role != "user":
+            inbound_at = float(meta.get("last_inbound_at") or 0.0)
+            outbound_at = float(meta.get("last_outbound_at") or 0.0)
+            if inbound_at > outbound_at:
                 continue
-            if now - (last.timestamp or 0.0) > config.proactive_recent_seconds:
+            if now < self._proactive_cooldown_until.get(emotion_key, 0.0):
                 continue
-            if now < self._proactive_cooldown_until.get(key, 0.0):
-                continue
-            if self._rate_limited(key, now):
-                continue
-            candidates.append((key, record))
+            candidates.append((emotion_key, record))
+        candidates.sort(key=lambda item: float(entries[item[0]].get("last_outbound_at") or 0.0))
         return candidates
 
-    async def _proactive_tick(self) -> None:
-        """一次主动参与检查：至多让一个群发言。"""
+    async def _reopen_tick(self) -> None:
+        """一次检查：至多让一个会话重新开口。"""
         now = time.time()
-        if self._in_quiet_hours(now):
-            return
-        candidates = self._proactive_candidates(now)
-        if not candidates:
-            return
-        # 先掷一次骰子，再随机挑一个群，避免「群越多越爱说话」。
-        if random.random() > self._config.proactive_probability:
-            return
-        key, record = random.choice(candidates)
-        await self._speak_proactively(key, record, now)
+        candidates = self._reopen_candidates(now)
+        for emotion_key, record in candidates:
+            await self._reopen_one(emotion_key, record, now)
 
-    async def _speak_proactively(
+    def _hours_since_last(self, key: str, now: float | None = None) -> float:
+        """该会话「最后一条消息距今多少小时」；没有历史时返回 0。"""
+        meta = self._reopen_meta.get(key)
+        if meta is None:
+            payload = self._emotion.store.load(key)
+            meta = payload.get("reopen_meta") or {}
+        last = float(meta.get("last_outbound_at") or 0.0)
+        if last <= 0:
+            return 0.0
+        moment = now if now is not None else time.time()
+        return max(0.0, min(168.0, (moment - last) / 3600.0))
+
+    async def _reopen_one(
         self, key: str, record: MessageRecord, now: float
     ) -> None:
-        if self._config.link_parse_enabled:
-            await self._prefetch_links(key)
-        messages = self._build_proactive_messages(key)
-        if not messages:
-            return
-        try:
-            client = self._llm_factory(self._config)
-            reply = await client.chat(messages)
-        except LLMError as exc:
-            self._log("error", f"主动参与模型调用失败：{exc.message}")
-            return
+        """让情绪引擎跑一轮自发周期：说，或者不说。
 
-        # 模型判断此刻没有合适的话要说：不发言，并进入该群的主动冷却。
-        if not reply or reply.strip() == SILENT_SENTINEL:
-            self._log("debug", f"主动参与：本次不发言 [{record.chat}]。")
-            self._proactive_cooldown_until[key] = (
-                now + self._config.proactive_per_group_cooldown
-            )
-            return
-
-        if not await self._send_reply(record.chat, reply):
-            return
-        self._record_assistant(key, reply)
-        self._note_reply(key)
-        self._proactive_cooldown_until[key] = (
-            time.time() + self._config.proactive_per_group_cooldown
+        说不说由沉默时长、需求受阻程度与上一次的表达共同决定；说过一次之后
+        内核会记住 ``reopen_done``，不会反复追问。深夜内核自己会 hold。
+        """
+        decision = await self._emotion.reopen(
+            chat_key=self._emotion_key(record),
+            chat_name=record.chat,
+            # 宿主比状态文件更清楚「安静了多久」：按最后一条消息的时间算，
+            # 而不是按上一次跑周期的时刻算（两者可能差好几个小时）。
+            elapsed_hours=self._hours_since_last(key, now),
         )
-        self.reply_count_today += 1
-        self._log("info", f"主动参与 [{record.chat}]：{reply[:40]}")
+        self._log("info", decision.log_line(f"重新开口 [{record.chat}]"))
+        # 无论说没说都推后下一次评估：既避免刚说完又冒一句，也避免每 5 分钟
+        # 拿同一段沉默反复问内核（答案不会变）。
+        self._proactive_cooldown_until[key] = now + REOPEN_EVAL_GAP_SECONDS
+        if decision.silent:
+            return
 
-    def _build_proactive_messages(self, chat: str) -> list[dict[str, Any]]:
-        """为主动参与构造上下文：不加「[待回复]」标记，改用 PROACTIVE_HINT。"""
-        recent = self._context_items(chat)
-        if not recent:
-            return []
-        return self._render_context(recent, -1, PROACTIVE_HINT)
+        if not await self._send_reply(record.chat, decision):
+            return
+        self._record_assistant(self._chat_key(record), decision.text, record=record)
+        meta = self._reopen_meta.get(key)
+        if meta is not None:
+            meta["pending"] = False
+            self._emotion.store.touch(key, reopen_meta=meta)
+        self.reply_count_today += 1
+        self._log("info", f"主动开口 [{record.chat}]：{decision.text[:40]}")
 
     # ------------------------------------------------------------------ 观测
 
     def status_snapshot(self) -> dict[str, Any]:
+        snapshots = [adapter.get_status().to_dict() for adapter in self._adapters]
+        platforms = {
+            str(getattr(adapter, "platform", "wechat") or "wechat")
+            for adapter in self._adapters
+        }
+        platform = platforms.pop() if len(platforms) == 1 else "both"
         return {
             "running": self._running,
             "reply_count_today": self.reply_count_today,
             "last_trigger_at": self.last_trigger_at,
-            "wechat": self._adapter.get_status().to_dict(),
+            "platform": platform,
+            "adapter": snapshots[0] if snapshots else {},
+            "adapters": snapshots,
+            "emotion": self._emotion.stats(),
         }
+
+    # ------------------------------------------------------------------ 情绪观测
+
+    def emotion_state(self, chat: str | None = None) -> dict[str, Any]:
+        """某个会话（或全部会话）的情绪状态摘要，供界面与诊断使用。"""
+        if chat:
+            key = self._resolve_chat_key(chat)
+            return self._emotion.state(key)
+        return {
+            "stats": self._emotion.stats(),
+            "chats": self._emotion.recent_states(limit=30),
+        }
+
+    def identities(self) -> list[dict[str, str]]:
+        """可选身份清单（内置 + 用户目录覆盖），供界面下拉框使用。"""
+        return self._emotion.identities()
+
+    def persona_state(self, identity_id: str | None = None) -> dict[str, Any]:
+        """人格札记账本，供界面查看与人工修订。"""
+        return self._emotion.persona_state(identity_id)
+
+    def revise_persona(
+        self, entry_id: str, text: str, identity_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """修订一条札记：生成新条目，旧条目转为 superseded。"""
+        return self._emotion.revise_persona(entry_id, text, identity_id)
+
+    def retract_persona(
+        self, entry_id: str, reason: str = "", identity_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """撤回一条札记：保留历史，但不再进入表达 prompt。"""
+        return self._emotion.retract_persona(entry_id, reason, identity_id)
+
+    def reset_persona(self, identity_id: str | None = None) -> bool:
+        """清空当前身份的人格札记；不影响会话心境。"""
+        return self._emotion.reset_persona(identity_id)
+
+    def reset_emotion(self, chat: str | None = None) -> int:
+        """清空情绪状态：指定会话则只清那一个，否则全部清空。"""
+        key = self._resolve_chat_key(chat) if chat else None
+        removed = self._emotion.reset(key)
+        self._log(
+            "info",
+            f"已清空情绪状态：{'全部会话' if key is None else chat}"
+            f"（{removed} 个）",
+        )
+        return removed
+
+    def _resolve_chat_key(self, chat: str) -> str:
+        """界面传的是显示名，状态是按会话 ID 存的，这里做一次反查。"""
+        target = str(chat or "").strip()
+        for key, record in self._last_inbound.items():
+            if record.chat == target or key == target:
+                return key
+        return target
 
     def get_logs(self, after_seq: int = 0) -> list[dict[str, Any]]:
         with self._log_lock:

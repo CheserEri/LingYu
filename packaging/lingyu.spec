@@ -45,6 +45,10 @@ if not (VENDOR / "yt_dlp" / "__init__.py").is_file():
 datas = [
     (str(BRIDGE), "."),
     (str(WEBUI), "webui"),
+    # 情绪引擎的内置身份（身份文件是回复的主契约：原则、边界、说话方式）。
+    # 目标路径必须与 core/paths.py 的 resource_dir() 一致，否则冻结后
+    # load_identity 会静默回落成中性身份——表现是「人设莫名其妙没了」。
+    (str(ROOT / "src" / "lingyu" / "bot" / "emotion" / "identity"), "lingyu/bot/emotion/identity"),
     # 窗口图标：桌面端启动时显式传给 pywebview（与 exe 内嵌图标同一文件）。
     (str(ICON), "."),
 ]
@@ -67,6 +71,11 @@ hiddenimports = [
     "webview.platforms.edgechromium",
     # 链接下载的 ffmpeg 定位（links.py 内部惰性导入，静态分析扫不到）
     "imageio_ffmpeg",
+    # QQ 机器人网关长连接：qq.py 里是函数内惰性导入；websockets 13+ 的
+    # connect 又转发到 websockets.asyncio.client，静态分析容易漏。
+    "websockets",
+    "websockets.asyncio",
+    "websockets.asyncio.client",
     # 内置 yt-dlp（链接解析）。显式声明后 PyInstaller 会真正分析 yt_dlp，
     # 自动收集它用到的全部标准库子模块（html.parser / urllib.request …）与
     # 940 个提取器；其官方 hook 另在下方 hookspath 中启用。

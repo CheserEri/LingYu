@@ -26,6 +26,11 @@ def default_config_path() -> Path:
     return base / "lingyu" / "bot.json"
 
 
+def _env_platform() -> str:
+    value = os.environ.get("LINGYU_PLATFORM", "").strip().lower()
+    return value if value in ("wechat", "qq") else "wechat"
+
+
 @dataclass
 class BotConfig:
     """自动回复运行参数（均可在桌面界面修改）。"""
@@ -33,13 +38,26 @@ class BotConfig:
     # 自动回复总开关。
     enabled: bool = False
 
-    # ---- 触发条件 ----
-    reply_private: bool = True   # 私聊：每条入站消息都回复
-    trigger_at: bool = True     # 群聊：@我 时回复
-    trigger_reply: bool = True  # 群聊：引用/回复我的消息时回复
-    # 会话延续：刚被回复过的发送者在该窗口内再次发言也回复（0=关闭）。
-    # 用于「回复 A 之后 A 继续补充，机器人接着回」的连续对话。
-    continuation_seconds: float = 120.0
+    # ---- 接入平台 ----
+    # wechat：桌面微信；qq：QQ 机器人官方 API v2（AppID / AppSecret）。
+    # 桌面端可以同时启用多个终端（两个开关都打开即并行运行）；
+    # platform 只作为环境变量 / 旧配置的默认值与 MCP 的默认终端。
+    # 切换平台后由桌面端重建适配器（保存并应用，无需重启）。
+    # 首次运行（还没有 bot.json）时从环境变量读取；保存后以界面配置为准。
+    platform: str = field(default_factory=_env_platform)
+    wechat_enabled: bool = True
+    qq_enabled: bool = False
+    qq_app_id: str = field(
+        default_factory=lambda: os.environ.get("QQ_BOT_APP_ID", "").strip()
+    )
+    qq_app_secret: str = field(
+        default_factory=lambda: os.environ.get("QQ_BOT_APP_SECRET", "").strip()
+    )
+
+    # ---- 触发条件（什么算「在跟我说话」，不是「多久回一次」）----
+    reply_private: bool = True   # 私聊：每条入站消息都交给情绪引擎判断
+    trigger_at: bool = True      # 群聊：@我 时交给情绪引擎
+    trigger_reply: bool = True   # 群聊：引用/回复我的消息时交给情绪引擎
 
     # ---- 作用范围 ----
     # True=所有群；False=仅 groups 白名单内的群。
@@ -54,57 +72,43 @@ class BotConfig:
     max_tokens: int = 300
     timeout_seconds: float = 30.0
 
-    # ---- 上下文与节流 ----
-    context_messages: int = 20       # 送给模型的最近消息条数
-    cooldown_seconds: float = 3.0    # 同一会话同一发送者的冷却秒数
+    # ---- 上下文 ----
+    # 链接解析要回看多少条消息（不是「模型看多少」，那是内核自己的记忆）。
+    context_messages: int = 20
 
-    # ---- 人设 ----
-    # 用户自定义人设；空串（默认）表示不注入任何人设。
-    persona_custom: str = ""
+    # ---- 情绪引擎（混合人格内核）----
+    # 四层结构：身份内核 / 心境 / 关系与情节记忆 / 人格札记。
+    # 不再是十个 Agent 分阶段协作。
+    emotion_enabled: bool = True
+    # 身份 id：内置 violet，用户可放 %APPDATA%\lingyu\identity\<id>.json 覆盖。
+    emotion_identity: str = "violet"
+    # 大模型参与程度：
+    #   expression 只有表达调模型，人格札记走规则（一轮 1 次，快且便宜）
+    #   all        表达 + 每天最多一次札记 LLM
+    #   none       全部走规则（没有 Key 时的默认降级路径）
+    emotion_llm_mode: str = "expression"
+    # 人格札记目录；空串表示 %APPDATA%\lingyu\persona。
+    emotion_persona_dir: str = ""
+    # 是否启用全局人格札记；关闭后只保留身份 + 心境 + 情节记忆。
+    emotion_persona_enabled: bool = True
+    # 情绪状态目录；空串表示 %APPDATA%\lingyu\emotion。
+    emotion_state_dir: str = ""
 
-    # ---- 拟人化：让自动回复更像真人 ----
-    # 总开关；关闭后恢复「收到即整段回复」的旧行为。
-    humanize: bool = True
-    # 触发后实际回复的概率（0~1）。1 = 每条都回；越小越像真人（会漏回）。
-    reply_probability: float = 0.85
-    # 把较长回复拆成多条短消息发出，模拟真人分句连发。
-    split_replies: bool = True
-    # 单次最多拆成几条。
-    split_max_parts: int = 3
-    # 仅当回复长度超过该字数才分条（避免把一句短话也拆开）。
-    split_min_length: int = 40
-    # 分条之间的间隔区间（秒）。
-    split_delay_min: float = 0.4
-    split_delay_max: float = 1.2
-
-    # ---- 静默：降低存在感，避免打扰 ----
-    # 静默时段内不回复任何人（含主动参与）。支持跨零点，如 23:00-08:00。
-    quiet_hours_enabled: bool = False
-    quiet_hours_start: str = "23:00"
-    quiet_hours_end: str = "08:00"
-    # 群级节流：每个群在窗口内最多回复多少条，超出则静默（0 = 不限制）。
-    group_rate_enabled: bool = True
-    group_rate_window_minutes: float = 30.0
-    group_rate_max_replies: int = 5
-
-    # ---- 偶发参与（主动水群）----
-    # 默认关闭：开启后引擎会周期性检查群聊，偶发主动接一句。
-    proactive_enabled: bool = False
-    # 检查间隔区间（秒）：每隔这个随机时间检查一次。
-    proactive_interval_min: float = 300.0
-    proactive_interval_max: float = 900.0
-    # 单次检查中实际主动发言的概率。
-    proactive_probability: float = 0.1
-    # 仅当群里最近这段时间（秒）内有过新消息才考虑主动发言。
-    proactive_recent_seconds: float = 600.0
-    # 同一群两次主动发言之间的最小间隔（秒）。
-    proactive_per_group_cooldown: float = 1800.0
+    # ---- 重新开口（自己起头说话）----
+    # 这里**没有开关**。说不说、隔多久说全在内核里：
+    #   · 沉默时长 ≥ 身份文件的 silence_reopen_hours 才够格；
+    #   · 同一个「没被回应」的沉默只开口一次（regulation.reopen_done）；
+    #   · 深夜不主动开口（regulation 的夜间规则）。
+    # 设计文档里「是否保持沉默」是表达 Agent 的职责（§3.7），不是宿主配置项，
+    # 所以宿主只提供一个时钟，不提供「允不允许开口」的开关。
 
     # ---- 图像识别（需模型支持视觉）----
     # 关闭时图片只以「[图片]」文本形式进入上下文，不发送图片数据。
     vision_enabled: bool = False
     # 单次请求最多附带几张上下文图片（0 = 不带图）。
     vision_max_images: int = 3
+    # current_message=只看触发本轮的消息图片；conversation=回看当前会话上下文图片。
+    vision_scope: str = "conversation"
 
     # ---- 链接解析（检测到链接时自动解析并喂给模型）----
     # 开启后，上下文里出现的链接会被解析（标题/作者/时长/简介），
@@ -215,51 +219,44 @@ class BotConfig:
         config = cls(**clean)
         # 类型纠正，避免坏配置导致后续崩溃。
         config.groups = [str(item) for item in config.groups if str(item).strip()]
+        # 接入平台与 QQ 凭据。
+        platform = str(config.platform or "").strip().lower()
+        config.platform = platform if platform in ("wechat", "qq") else "wechat"
+        # 旧配置没有这两个开关：按 platform 推导，避免升级后突然双端同时上线。
+        if "wechat_enabled" not in data and "qq_enabled" not in data:
+            config.wechat_enabled = config.platform == "wechat"
+            config.qq_enabled = config.platform == "qq"
+        config.wechat_enabled = bool(config.wechat_enabled)
+        config.qq_enabled = bool(config.qq_enabled)
+        if not config.wechat_enabled and not config.qq_enabled:
+            # 至少保留一个终端；界面也会阻止把最后一个关掉。
+            config.wechat_enabled = config.platform != "qq"
+            config.qq_enabled = config.platform == "qq"
+        config.qq_app_id = str(config.qq_app_id or "").strip()
+        config.qq_app_secret = str(config.qq_app_secret or "").strip()
         config.context_messages = max(1, int(config.context_messages))
-        config.cooldown_seconds = max(0.0, float(config.cooldown_seconds))
-        config.continuation_seconds = max(
-            0.0, float(config.continuation_seconds)
-        )
         config.temperature = float(config.temperature)
         config.max_tokens = max(1, int(config.max_tokens))
         config.timeout_seconds = max(1.0, float(config.timeout_seconds))
-        # 拟人化参数：概率钳制到 [0,1]，条数与间隔取合法范围。
-        config.humanize = bool(config.humanize)
-        config.reply_probability = min(
-            1.0, max(0.0, float(config.reply_probability))
+        # 情绪引擎参数。
+        config.emotion_enabled = bool(config.emotion_enabled)
+        config.emotion_identity = (
+            str(config.emotion_identity or "").strip() or "violet"
         )
-        config.split_replies = bool(config.split_replies)
-        config.split_max_parts = max(1, int(config.split_max_parts))
-        config.split_min_length = max(0, int(config.split_min_length))
-        config.split_delay_min = max(0.0, float(config.split_delay_min))
-        config.split_delay_max = max(
-            config.split_delay_min, float(config.split_delay_max)
-        )
-        # 静默 / 节流 / 主动参与参数。
-        config.quiet_hours_enabled = bool(config.quiet_hours_enabled)
-        config.quiet_hours_start = str(config.quiet_hours_start or "").strip()
-        config.quiet_hours_end = str(config.quiet_hours_end or "").strip()
-        config.group_rate_enabled = bool(config.group_rate_enabled)
-        config.group_rate_window_minutes = max(
-            0.0, float(config.group_rate_window_minutes)
-        )
-        config.group_rate_max_replies = max(0, int(config.group_rate_max_replies))
-        config.proactive_enabled = bool(config.proactive_enabled)
-        config.proactive_interval_min = max(1.0, float(config.proactive_interval_min))
-        config.proactive_interval_max = max(
-            config.proactive_interval_min, float(config.proactive_interval_max)
-        )
-        config.proactive_probability = min(
-            1.0, max(0.0, float(config.proactive_probability))
-        )
-        config.proactive_recent_seconds = max(
-            0.0, float(config.proactive_recent_seconds)
-        )
-        config.proactive_per_group_cooldown = max(
-            0.0, float(config.proactive_per_group_cooldown)
-        )
+        # 兼容旧配置：旧身份 id 继续指向改名后的内置身份。
+        if config.emotion_identity == "song_nuan":
+            config.emotion_identity = "violet"
+        mode = str(config.emotion_llm_mode or "").strip().lower()
+        # 未知取值按「只让表达走模型」处理：默认省 token，也不静默退化成纯规则。
+        config.emotion_llm_mode = mode if mode in ("all", "expression", "none") else "expression"
+        config.emotion_persona_dir = str(config.emotion_persona_dir or "").strip()
+        config.emotion_persona_enabled = bool(config.emotion_persona_enabled)
+        config.emotion_state_dir = str(config.emotion_state_dir or "").strip()
         config.vision_enabled = bool(config.vision_enabled)
         config.vision_max_images = max(0, int(config.vision_max_images))
+        config.vision_scope = str(config.vision_scope or "conversation").strip().lower()
+        if config.vision_scope not in ("current_message", "conversation"):
+            config.vision_scope = "conversation"
         # 链接解析参数。
         config.link_parse_enabled = bool(config.link_parse_enabled)
         config.link_parse_max = max(0, int(config.link_parse_max))
@@ -339,6 +336,19 @@ class BotConfig:
     def download_quota_bytes(self) -> int:
         """下载目录总占用上限（字节）；0 表示不限制。"""
         return max(0, int(self.link_download_quota_mb)) * 1024 * 1024
+
+    def emotion_dir(self) -> Path:
+        """情绪状态目录：显式配置优先，否则 %APPDATA%\\lingyu\\emotion。
+
+        导入放在函数里：``bot.config`` 被 ``bot.emotion`` 的宿主侧依赖，
+        模块级互相导入会绕成环。
+        """
+        raw = self.emotion_state_dir.strip()
+        if raw:
+            return Path(raw).expanduser()
+        from .emotion.session import default_state_dir
+
+        return default_state_dir()
 
     def save(self, path: Path | None = None) -> Path:
         target = path or default_config_path()

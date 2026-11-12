@@ -21,17 +21,13 @@
           <svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
           <span>运行状态</span>
         </button>
+        <button class="nav-item" data-page="emotion">
+          <svg viewBox="0 0 24 24"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z"/></svg>
+          <span>情绪</span>
+        </button>
         <button class="nav-item" data-page="chats">
           <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.5A8 8 0 1 1 21 12z"/></svg>
           <span>群聊设置</span>
-        </button>
-        <button class="nav-item" data-page="human">
-          <svg viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 20c0-3.3 3.6-6 8-6s8 2.7 8 6"/></svg>
-          <span>拟人化</span>
-        </button>
-        <button class="nav-item" data-page="quiet">
-          <svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></svg>
-          <span>静默与水群</span>
         </button>
         <button class="nav-item" data-page="links">
           <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l2.4-2.4a5 5 0 0 0-7.1-7.1L11.5 4.4"/><path d="M14 11a5 5 0 0 0-7.1 0L4.5 13.4a5 5 0 0 0 7.1 7.1l.9-.9"/></svg>
@@ -45,10 +41,6 @@
           <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg>
           <span>模型设置</span>
         </button>
-        <button class="nav-item" data-page="persona">
-          <svg viewBox="0 0 24 24"><path d="M12 3l2.2 4.5 5 .7-3.6 3.5.9 5L12 14.4 7.5 16.7l.9-5L4.8 8.2l5-.7z"/></svg>
-          <span>人设</span>
-        </button>
         <button class="nav-item" data-page="logs">
           <svg viewBox="0 0 24 24"><path d="M4 5h16M4 10h16M4 15h10M4 20h7"/></svg>
           <span>运行日志</span>
@@ -58,7 +50,7 @@
       <div class="sidebar-bottom">
         <span class="status-dot" id="wx-dot"></span>
         <div class="sidebar-bottom-text">
-          <div class="sb-title" id="wx-title">未连接微信</div>
+          <div class="sb-title" id="wx-title">未连接</div>
           <div class="sb-sub" id="wx-sub">—</div>
         </div>
       </div>
@@ -73,10 +65,10 @@
           <div class="card status-card">
             <div class="status-row">
               <div>
-                <div class="card-label">微信连接</div>
+                <div class="card-label">连接状态</div>
                 <div class="card-value" id="s-wx">检测中…</div>
               </div>
-              <button class="btn ghost" id="btn-connect">连接微信</button>
+              <button class="btn ghost" id="btn-connect">重新连接</button>
             </div>
             <div class="status-row">
               <div>
@@ -98,7 +90,120 @@
             </div>
           </div>
         </div>
-        <p class="hint">提示：自动回复在本程序运行期间有效。微信 PC 客户端需已登录且主窗口可见。</p>
+
+        <div class="card form" id="platform-card">
+          <div class="card-label">接入终端（可同时启用）</div>
+          <label class="switch-row"><span>微信（桌面客户端）</span>
+            <input type="checkbox" class="switch" data-key="wechat_enabled"/></label>
+          <label class="switch-row"><span>QQ 机器人（官方 API v2）</span>
+            <input type="checkbox" class="switch" data-key="qq_enabled"/></label>
+          <div id="qq-fields">
+            <div class="field">
+              <label>QQ 机器人 AppID</label>
+              <input data-key="qq_app_id" placeholder="在 q.qq.com 开放平台「开发设置」中获取" />
+            </div>
+            <div class="field">
+              <label>QQ 机器人 AppSecret</label>
+              <input data-key="qq_app_secret" type="password" placeholder="只保存在本机配置文件中" />
+            </div>
+          </div>
+          <div class="status-row">
+            <div>
+              <div class="card-label">绑定状态</div>
+              <div class="card-value" id="s-binding">—</div>
+            </div>
+          </div>
+          <p class="hint">
+            两个开关可以同时打开：微信与 QQ 各自订阅消息，回复会回到消息来源的那一端。
+            勾选或取消终端会<b>立即保存并连接</b>，不需要再点按钮；其余设置改完点
+            <b>保存并应用</b>即可生效。可先用「测试连接」验证 AppID / AppSecret。
+            QQ 走官方机器人 API：先在
+            <a href="https://q.qq.com/" target="_blank">q.qq.com</a> 注册机器人，
+            再把它添加到群聊 / 频道，或让用户直接私聊。群聊里需要 @机器人 才会触发。
+          </p>
+          <div class="actions">
+            <button class="btn ghost" id="test-qq">测试连接</button>
+            <button class="btn primary" id="save-platform">保存并应用</button>
+          </div>
+        </div>
+
+        <p class="hint">提示：自动回复在本程序运行期间有效。微信模式需要 PC 客户端已登录且主窗口可见；QQ 模式需要机器人保持在线。</p>
+      </section>
+
+      <!-- 情绪 -->
+      <section class="page" id="page-emotion">
+        <h1 class="page-title">情绪</h1>
+
+        <div class="card">
+          <label class="switch-row"><span>启用混合人格内核（身份 · 心境 · 情节记忆 · 人格札记）</span>
+            <input type="checkbox" class="switch" data-key="emotion_enabled"/></label>
+          <p class="hint">关闭后回到「收到消息就整段回复」：不再有心境累积，也不会因为心境而选择沉默。<b>回不回不是掷骰子</b>——它由当前心境、与对方的关系、话题兴趣，以及长期人格札记共同决定，所以有时候她真的不说话。</p>
+        </div>
+
+        <div class="card form">
+          <div class="field">
+            <label>身份（L0：内核，只读契约）</label>
+            <select data-key="emotion_identity" id="identity-select"></select>
+          </div>
+          <p class="hint">身份文件写死「她是谁、什么不做、怎么说话」，模型不可改写。这里<b>没有</b>手写人设的输入框。想换一套原则，把 <code>&lt;id&gt;.json</code> 放进 <code>%APPDATA%\lingyu\identity\</code>，同名会覆盖内置身份。身份里还可以写 <code>self_narrative</code>（第一人称自述）与 <code>style_samples</code>（表达样例）。</p>
+
+          <div class="field">
+            <label>大模型参与程度</label>
+            <select data-key="emotion_llm_mode">
+              <option value="expression">只参与表达（默认，一轮至多 1 次，快）</option>
+              <option value="all">表达 + 每天至多一次人格札记（更慢，更贴近长期成长）</option>
+              <option value="none">全部走规则（不调模型，最省）</option>
+            </select>
+          </div>
+          <p class="hint">微信里等 10 秒是不可接受的，所以默认只在「表达」这一步调模型；心境更新、情节记忆、札记筛选都有确定性规则实现。切成「表达 + 札记」时，模型每天最多写一条人格札记，且必须带来源或反例，校验不过就回退规则。</p>
+
+          <label class="switch-row"><span>启用人格札记（L3：跨会话长期人格）</span>
+            <input type="checkbox" class="switch" data-key="emotion_persona_enabled"/></label>
+          <p class="hint">札记是全局的（不分会话），每天最多写一条，可修订、可撤回。它只保存来源引用与会话哈希，不重复存聊天原文；撤回或超过有效期的条目不会再进表达提示词。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">兴趣（她愿意聊什么）</div>
+          <p class="hint">兴趣回答的不是「我现在什么感受」，而是「我一直对什么有兴趣」。它分两层，<b>没有可以填的输入框</b>：<br/>
+          · <b>根源</b>：身份文件里 <code>interests.roots</code> 写死的底色——软件 / 艺术 / 工程机械 / 历史 / 情绪关系…，每一格都带一句「我为什么一开始就在意这个」。任何机制都改不了它。<br/>
+          · <b>演化值</b>：聊得开心就朝上走，聊得难受就朝下走，但每次只走一小步，而且永远朝根源回归。上限是「根源 ± 可塑性的一半」——所以再喜欢也变不成另一个人。<br/>
+          兴趣只调制<b>注意度</b>：高的时候更愿意接话、话也说得更放开、回得更快；低的时候收着说；低到极端且关系还不近时，它可以只是听着不回。下面每个会话显示的是它现在的前三名兴趣。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">沉默与开口（也是她的决定）</div>
+          <p class="hint">这里<b>没有</b>「静默时段」「群级节流」「回复间隔」「允不允许主动开口」这些选项。是否追问、<b>是否保持沉默</b>由表达层（L4）判断，延迟反应、降低强度、暂时回避由心境（L1）推导——做成设置项就等于让你替她决定。<br/>
+          · <b>隔多久回</b>：被激到时先压住反应、停几秒再回；心境为正时几乎立刻回，停顿上限 8 秒；<br/>
+          · <b>要不要接话</b>：话题正对她胃口就更愿意开口，提不起劲就收着说，极端情况下可以不接；<br/>
+          · <b>几点不说话</b>：深夜会收着说，也不会主动找人（按本机时间判断，不用你填起止时间）；<br/>
+          · <b>要不要重新开口</b>：沉默超过身份文件里的 <code>silence_reopen_hours</code> 才够格，同一段沉默只开口一次。<br/>
+          这些判断的<b>理由</b>都会写进「运行日志」，例如「情绪 [张三] 第 7 轮：想念 0.52｜话题对胃口，先停 1.6s（share）｜2 条，间隔 0.9s」。</p>
+        </div>
+
+        <div class="card">
+          <div class="log-toolbar">
+            <div class="card-label" style="margin:0">当前各会话心境</div>
+            <button class="btn ghost xs" id="btn-refresh-emotion">刷新</button>
+          </div>
+          <div class="emotion-list" id="emotion-list"></div>
+          <p class="hint" id="emotion-dir">—</p>
+        </div>
+
+        <div class="card">
+          <div class="log-toolbar">
+            <div class="card-label" style="margin:0">人格札记（全局，每天至多一条）</div>
+            <button class="btn ghost xs" id="btn-refresh-persona">刷新</button>
+          </div>
+          <div class="emotion-list" id="persona-list"></div>
+          <p class="hint" id="persona-stats">—</p>
+          <p class="hint">修订会生成一条新条目并把旧条归档；撤回后该条不再进入表达提示词。若模型给出的文本校验不过（含数字、超长、空泛），会回退到规则模板，或当天直接跳过。</p>
+        </div>
+
+        <div class="actions">
+          <button class="btn ghost" id="btn-reset-emotion">清空所有会话心境</button>
+          <button class="btn ghost" id="btn-reset-persona">清空人格札记</button>
+          <button class="btn primary" id="save-emotion">保存设置</button>
+        </div>
       </section>
 
       <!-- 群聊设置 -->
@@ -112,10 +217,6 @@
             <input type="checkbox" class="switch" data-key="trigger_reply"/></label>
           <label class="switch-row"><span>私聊消息也回复</span>
             <input type="checkbox" class="switch" data-key="reply_private"/></label>
-          <div class="field">
-            <label>会话延续（秒）：刚回复过的人在此时间内继续发言也接着回，0 = 关闭</label>
-            <input type="number" min="0" max="3600" step="10" data-key="continuation_seconds"/>
-          </div>
         </div>
 
         <div class="card">
@@ -130,120 +231,6 @@
           </div>
         </div>
         <div class="actions"><button class="btn primary" id="save-chats">保存设置</button></div>
-      </section>
-
-      <!-- 拟人化 -->
-      <section class="page" id="page-human">
-        <h1 class="page-title">拟人化</h1>
-        <div class="card">
-          <label class="switch-row"><span>启用拟人化（关闭后收到消息即整段回复）</span>
-            <input type="checkbox" class="switch" data-key="humanize"/></label>
-          <p class="hint">开启后：按概率决定是否回复、较长回复拆成多条短消息发出，并让措辞更口语化。</p>
-        </div>
-
-        <div class="card form">
-          <div class="field">
-            <label>回复概率 <span class="val" id="prob-val"></span>（1 = 每条都回，越小越会「漏回」）</label>
-            <input type="range" min="0" max="1" step="0.05" data-key="reply_probability" data-val="prob-val"/>
-          </div>
-        </div>
-
-        <div class="card">
-          <label class="switch-row"><span>长回复拆成多条短消息</span>
-            <input type="checkbox" class="switch" data-key="split_replies"/></label>
-          <div class="grid-2">
-            <div class="field">
-              <label>最多拆几条</label>
-              <input type="number" min="1" max="6" data-key="split_max_parts"/>
-            </div>
-            <div class="field">
-              <label>超过多少字才拆</label>
-              <input type="number" min="0" max="500" data-key="split_min_length"/>
-            </div>
-          </div>
-          <div class="grid-2">
-            <div class="field">
-              <label>分条间隔下限（秒）</label>
-              <input type="number" min="0" max="30" step="0.1" data-key="split_delay_min"/>
-            </div>
-            <div class="field">
-              <label>分条间隔上限（秒）</label>
-              <input type="number" min="0" max="30" step="0.1" data-key="split_delay_max"/>
-            </div>
-          </div>
-        </div>
-        <div class="actions"><button class="btn primary" id="save-human">保存设置</button></div>
-      </section>
-
-      <!-- 静默与水群 -->
-      <section class="page" id="page-quiet">
-        <h1 class="page-title">静默与水群</h1>
-
-        <div class="card">
-          <div class="card-label">静默时段</div>
-          <label class="switch-row"><span>在静默时段内不回复任何人（含 @我）</span>
-            <input type="checkbox" class="switch" data-key="quiet_hours_enabled"/></label>
-          <div class="grid-2">
-            <div class="field">
-              <label>开始时间</label>
-              <input type="time" data-key="quiet_hours_start"/>
-            </div>
-            <div class="field">
-              <label>结束时间</label>
-              <input type="time" data-key="quiet_hours_end"/>
-            </div>
-          </div>
-          <p class="hint">支持跨零点，例如 23:00 → 08:00。留空或起止相同则不生效。</p>
-        </div>
-
-        <div class="card">
-          <div class="card-label">群级节流（降低存在感）</div>
-          <label class="switch-row"><span>限制每个群的回复频率</span>
-            <input type="checkbox" class="switch" data-key="group_rate_enabled"/></label>
-          <div class="grid-2">
-            <div class="field">
-              <label>统计窗口（分钟）</label>
-              <input type="number" min="0" max="1440" data-key="group_rate_window_minutes"/>
-            </div>
-            <div class="field">
-              <label>窗口内最多回复（条）</label>
-              <input type="number" min="0" max="100" data-key="group_rate_max_replies"/>
-            </div>
-          </div>
-          <p class="hint">超出上限的群消息会被静默跳过；0 表示不限制。私聊不受此项影响。</p>
-        </div>
-
-        <div class="card">
-          <div class="card-label">偶发参与（主动水群）</div>
-          <label class="switch-row"><span>允许它偶尔主动在群里接话（默认关闭）</span>
-            <input type="checkbox" class="switch" data-key="proactive_enabled"/></label>
-          <p class="hint">开启后会往真实群聊发消息。仅当群里最近有人说话、且模型认为有话可说时才发言，否则保持安静。</p>
-          <div class="grid-2">
-            <div class="field">
-              <label>检查间隔下限（秒）</label>
-              <input type="number" min="10" max="86400" data-key="proactive_interval_min"/>
-            </div>
-            <div class="field">
-              <label>检查间隔上限（秒）</label>
-              <input type="number" min="10" max="86400" data-key="proactive_interval_max"/>
-            </div>
-          </div>
-          <div class="field">
-            <label>单次发言概率 <span class="val" id="proactive-val"></span></label>
-            <input type="range" min="0" max="1" step="0.05" data-key="proactive_probability" data-val="proactive-val"/>
-          </div>
-          <div class="grid-2">
-            <div class="field">
-              <label>仅最近多久有消息才考虑（秒）</label>
-              <input type="number" min="0" max="86400" data-key="proactive_recent_seconds"/>
-            </div>
-            <div class="field">
-              <label>同群两次主动发言最小间隔（秒）</label>
-              <input type="number" min="0" max="86400" data-key="proactive_per_group_cooldown"/>
-            </div>
-          </div>
-        </div>
-        <div class="actions"><button class="btn primary" id="save-quiet">保存设置</button></div>
       </section>
 
       <!-- 链接解析 -->
@@ -444,6 +431,7 @@
               <input type="number" min="1" max="4096" data-key="max_tokens"/>
             </div>
           </div>
+          <p class="hint">这里的 Temperature 只影响模型的随机程度，<b>不是</b>「它说话的风格」——语气、长短、分几条、隔多久，都由情绪引擎与身份文件决定。</p>
           <div class="grid-2">
             <div class="field">
               <label>上下文条数</label>
@@ -453,10 +441,6 @@
               <label>请求超时（秒）</label>
               <input type="number" min="1" max="300" data-key="timeout_seconds"/>
             </div>
-          </div>
-          <div class="field">
-            <label>同一人冷却（秒）</label>
-            <input type="number" min="0" max="60" step="0.5" data-key="cooldown_seconds"/>
           </div>
         </div>
 
@@ -468,25 +452,18 @@
             <label>单次最多附带图片数</label>
             <input type="number" min="0" max="10" data-key="vision_max_images"/>
           </div>
+          <div class="field">
+            <label>图片范围</label>
+            <select data-key="vision_scope">
+              <option value="current_message">只看本条消息中的图片</option>
+              <option value="conversation">查看当前对话中的图片</option>
+            </select>
+          </div>
           <p class="hint">关闭时图片只以「[图片]」文本进入上下文。开启前请确认上面的模型支持图片输入（如 qwen-vl-max、glm-4v、gpt-4o）；DeepSeek 的 deepseek-chat 不支持。</p>
         </div>
         <div class="actions">
           <button class="btn ghost" id="btn-test">测试连接</button>
           <button class="btn primary" id="save-model">保存设置</button>
-        </div>
-      </section>
-
-      <!-- 人设 -->
-      <section class="page" id="page-persona">
-        <h1 class="page-title">人设</h1>
-        <div class="card">
-          <div class="card-label">系统提示词（System Prompt）</div>
-          <textarea id="persona-input" class="persona-editor" rows="20" spellcheck="false"></textarea>
-          <p class="hint">编辑内容会作为角色人设追加到 system 提示词；留空（默认）则只保留内置的「只回应待回复消息」行为约束。</p>
-        </div>
-        <div class="actions">
-          <button class="btn ghost" id="btn-reset-persona">清空人设</button>
-          <button class="btn primary" id="save-persona">保存人设</button>
         </div>
       </section>
 

@@ -1,6 +1,7 @@
 """灵语（LingYu）启动与工具注册。
 
-通过 stdio 传输向本地 Agent 客户端暴露微信工具（P0 + P1）。
+通过 stdio 传输向本地 Agent 客户端暴露消息工具（P0 + P1）。
+平台由 ``AdapterConfig.platform`` 决定：桌面微信，或 QQ 机器人（官方 API v2）。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from .logging_config import configure_logging
 from .service import WeChatService
 
 SERVER_NAME = "lingyu"
-SERVER_VERSION = "0.8.19"
+SERVER_VERSION = "0.9.0"
 
 
 def build_server(service: WeChatService | None = None) -> MCPServer:
@@ -22,7 +23,7 @@ def build_server(service: WeChatService | None = None) -> MCPServer:
         name=SERVER_NAME,
         version=SERVER_VERSION,
         instructions=(
-            "操作本机已登录的微信桌面客户端。发送前请确认目标名称唯一；"
+            "操作本机已登录的微信桌面客户端，或已配置的 QQ 机器人。发送前请确认目标名称唯一；"
             "无法确认成功时不要重复发送；发送文件前需确认文件位于允许目录内。"
         ),
     )
@@ -30,7 +31,7 @@ def build_server(service: WeChatService | None = None) -> MCPServer:
 
     @server.tool(
         name="get_wechat_status",
-        description="检查微信客户端连接状态、窗口可见性与自动化后端是否可用。",
+        description="检查消息平台连接状态（微信窗口 / 自动化后端，或 QQ 网关会话）。",
     )
     async def get_wechat_status() -> dict[str, Any]:
         return await svc.get_status()
@@ -39,7 +40,7 @@ def build_server(service: WeChatService | None = None) -> MCPServer:
         name="get_chat_list",
         description=(
             "返回当前可读取的会话列表。基于监听期间被动接收到的消息，"
-            "不是微信完整会话列表。"
+            "不是微信/QQ 的完整会话列表。"
         ),
     )
     async def get_chat_list(

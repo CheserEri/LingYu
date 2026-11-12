@@ -24,8 +24,12 @@ def _split_list(raw: str) -> tuple[str, ...]:
 
 @dataclass
 class AdapterConfig:
-    """微信适配层运行参数。"""
+    """适配层运行参数（微信 / QQ 机器人共用）。"""
 
+    # wechat / qq —— 决定使用哪个适配器。
+    platform: str = "wechat"
+
+    # ---- 微信 ----
     # auto / wechatauto / wxauto4 / wxauto
     backend: str = "auto"
     # 读取能力依赖监听回调，故连接后默认启动监听。
@@ -55,8 +59,27 @@ class AdapterConfig:
     monitor_allow: tuple[str, ...] = ()
     monitor_block: tuple[str, ...] = ()
 
+    # ---- QQ 机器人（官方 API v2）----
+    # 开放平台「开发设置」里的 AppID / AppSecret。
+    qq_app_id: str = ""
+    qq_app_secret: str = ""
+    qq_api_base: str = "https://api.bot.qq.com"
+    # 等待网关 READY 的秒数；超时后连接仍在后台重试。
+    qq_connect_timeout: float = 15.0
+    # Intents 位掩码；0 表示使用安全默认组合
+    # （GUILDS | GROUP_AND_C2C_EVENT | PUBLIC_GUILD_MESSAGES）。
+    qq_intents: int = 0
+
+    def is_qq(self) -> bool:
+        return str(self.platform or "").strip().lower() == "qq"
+
     @classmethod
     def from_env(cls) -> "AdapterConfig":
+        platform = (
+            os.environ.get("LINGYU_PLATFORM", "wechat").strip().lower() or "wechat"
+        )
+        if platform not in ("wechat", "qq"):
+            platform = "wechat"
         backend = os.environ.get("WECHAT_BACKEND", "auto").strip() or "auto"
         listen = (
             os.environ.get("WECHAT_LISTEN_ON_CONNECT", "1").strip().lower()
@@ -90,7 +113,22 @@ class AdapterConfig:
         if monitor_mode not in ("allow", "block"):
             monitor_mode = "allow"
 
+        raw_qq_intents = os.environ.get("QQ_BOT_INTENTS", "").strip()
+        try:
+            qq_intents = max(0, int(raw_qq_intents or 0))
+        except ValueError:
+            qq_intents = 0
+        raw_qq_timeout = os.environ.get("QQ_BOT_CONNECT_TIMEOUT", "").strip()
+        try:
+            qq_connect_timeout = float(raw_qq_timeout)
+        except ValueError:
+            qq_connect_timeout = cls.qq_connect_timeout
+        qq_api_base = (
+            os.environ.get("QQ_BOT_API_BASE", "").strip() or cls.qq_api_base
+        )
+
         return cls(
+            platform=platform,
             backend=backend,
             listen_on_connect=listen,
             send_timeout_seconds=send_timeout,
@@ -101,4 +139,9 @@ class AdapterConfig:
             monitor_mode=monitor_mode,
             monitor_allow=_split_list(os.environ.get("WECHAT_MONITOR_ALLOW", "")),
             monitor_block=_split_list(os.environ.get("WECHAT_MONITOR_BLOCK", "")),
+            qq_app_id=os.environ.get("QQ_BOT_APP_ID", "").strip(),
+            qq_app_secret=os.environ.get("QQ_BOT_APP_SECRET", "").strip(),
+            qq_api_base=qq_api_base,
+            qq_connect_timeout=max(3.0, qq_connect_timeout),
+            qq_intents=qq_intents,
         )

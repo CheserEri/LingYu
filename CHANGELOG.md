@@ -2,6 +2,282 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
+## [0.9.2] - 2026-11-12
+
+**新增 QQ 机器人接入（官方 API v2）：同一套 MCP 工具与自动回复引擎可切换微信 / QQ，
+桌面端可让两端同时运行。**
+
+### 新增
+
+- `adapters/qq.py::QQBotAdapter`：AppID / AppSecret 换取 Access Token（自动续期）、
+  `/gateway` WebSocket 网关、Hello / Identify / Heartbeat / Resume / 重连退避。
+- 事件接入：`C2C_MESSAGE_CREATE`、`GROUP_AT_MESSAGE_CREATE`、`AT_MESSAGE_CREATE`、
+  `DIRECT_MESSAGE_CREATE`，统一转换为 `MessageRecord`。
+- 发送：单聊 `/v2/users/{openid}/messages`、群聊 `/v2/groups/{group_openid}/messages`、
+  频道 `/channels/{channel_id}/messages`、频道私信 `/dms/{guild_id}/messages`；
+  自动携带 `msg_id` 被动回复并递增 `msg_seq`，窗口/次数超限时返回结构化错误。
+- `AdapterConfig.platform` 与 `LINGYU_PLATFORM` / `QQ_BOT_APP_ID` /
+  `QQ_BOT_APP_SECRET` / `QQ_BOT_INTENTS` 环境变量；桌面「运行状态 → 接入平台」可切换。
+- 桌面端「QQ 绑定」集成：`QQBotAdapter.probe()` + `DesktopApi.test_qq_binding()`
+  可在保存前验证凭据；`BotEngine.swap_adapter()` 让平台 / 凭据变更**保存即生效**
+  （断开旧连接 → 重建适配器 → 连接，无需重启）。AppSecret 不再回显明文，
+  保存时留空表示沿用原密钥，界面以「已保存」标记。
+- 基础依赖新增 `websockets>=12`。
+- QQ 富媒体发送：`send_file()` 先上传到 `/v2/users|groups/{id}/files`（`file_type`
+  按后缀推断 1 图片 / 2 视频 / 3 语音 / 4 文件，使用 `file_data` base64），再用
+  `msg_type=7` + `media.file_info` 被动回复，与文本共用 `msg_id` / `msg_seq` 窗口与
+  次数限制；频道与频道私信明确返回 `qq_media_scene_unsupported`。
+- **微信 + QQ 同时工作**：`BotConfig` 新增 `wechat_enabled` / `qq_enabled` 两个终端
+  开关（旧配置按 `platform` 推导，至少保留一端）；`BotEngine` 改为持有多适配器，
+  每个适配器各自订阅消息，并按「会话 → 来源适配器」把回复、撤回、附件与自身昵称
+  路由回原端；`set_adapters()` 支持保存后热切换。桌面端「接入终端」改为两个复选框，
+  绑定状态与在线状态分别展示每一端，任一端连接失败不影响另一端。
+- 终端开关改为**勾选即生效**：勾选/取消微信或 QQ 会立刻保存并按新开关重连，不再依赖
+  「保存并应用」；同时修掉了重复绑定事件导致一次改动触发多次保存的问题。
+
+### 说明
+
+- QQ 事件不提供群名/昵称，会话统一以 openid 标识；联系人检索在 QQ 模式下返回
+  明确的 `unsupported_operation`，不伪装成功。
+
+**人格系统整体替换：十 Agent 情绪内核退役，改为「身份 / 心境 / 情节记忆 / 人格札记」
+四层混合人格内核。**
+
+旧内核强在情绪表现，但人格成长只有一层会话级的 `self.addenda`，跨会话不成立；
+新内核把「她现在什么感受」与「她长期认为什么」分开：前者逐会话、纯规则更新，
+后者是全局账本、每天至多一条、可修订可撤回。
+
+### 变更
+
+- **新增四层结构**（`bot/emotion/`）：
+  - L0 身份内核（`core/identity.py` + `identity/violet.json`）：作者写死，模型不可写；
+    新增 `self_narrative`、`style_samples` 与 `persona.policy`。
+  - L1 心境（`affect.py`）：`valence / arousal / longing / irritation / warmth /
+    sharing / security / energy` + 关系，按事件与词表更新、按时间衰减；
+    `memo.py` 把它翻译成不带数字的体感备忘。
+  - L2 情节记忆（`episode.py`）：有界 60 条，记下 `then_belief`，后续事件用
+    `confirmed / refuted / uncertain` 复核，误读会被明确推翻。
+  - L3 人格札记（`persona.py` + `writer.py`）：全局
+    `%APPDATA%\lingyu\persona\persona_<identity>.json`，每天至多一条，带来源、
+    反例、置信；可修订（旧条 `superseded`）、可撤回（`retracted`，不再进提示词）。
+  - L4 表达（`expression.py`）：单次模型调用 + 规则兜底 + wording 闸门；
+    `silent` 与分条节奏继续由内核决定。
+- **模型参与程度重定义**：`expression`（默认，只表达调模型）、`all`（表达 +
+  每天至多一次札记提议）、`none`（全规则）。
+- **重新开口**由身份文件的 `boundaries.silence_reopen_hours` 与
+  `regulation.reopen_done` 控制，不再依赖宿主时间窗。
+- **界面**：情绪页改为四层结构说明；新增人格札记卡片，支持刷新 / 修订 / 撤回 /
+  清空；删除「单轮周期最大轮次」输入框。
+
+### 删除
+
+- `bot/emotion/agents/` 全部十 Agent，以及 `core/` 下的黑板、事件总线、协调器、
+  迭代器、反思、策略、报告等模块。
+- 配置项 `emotion_max_rounds`。
+- 旧会话状态的迁移路径：schema 升到 2，旧 payload 直接忽略（不迁移、不删除文件）。
+
+## [0.9.1] - 2026-11-08
+
+**紧急修复：桌面端启动期并发导入死锁——窗口永不出现，日志停在
+「自动选择微信自动化后端」，多试几次偶尔又能起来。**
+
+### 修复 · 启动期 `win32ui` / `clr` 并发导入死锁
+
+实测现场（僵死进程调用栈抓取确认）：启动时两条线程并发导入重型模块——
+
+| 线程 | 导入路径 | 持有 | 等待 |
+|---|---|---|---|
+| 主线程 | `webview.start()` → `import clr`（pythonnet/clr_loader 经 cffi `LoadLibrary` 加载 .NET 运行时） | GIL | Windows loader lock |
+| bootstrap 线程 | `adapter.connect()` → `import wechatauto` → `import win32ui`（MFC 扩展 DLL 初始化在 loader lock 内调 Python C API，win32ui.pyd 静态链接 python313.dll） | loader lock | GIL |
+
+两把锁互相等待 → 进程僵死：CPU 归零、窗口只有隐藏的控制台、wechatauto 侧
+一行日志都没有（连 `WinInput 初始化` 都没到）。纯竞态——两个 import 错开执行
+就没事，所以表现为「重启几次总有一次能起来」（实测一天 5 次启动成功 1 次）。
+
+**修复**（`desktop.py` 新增 `_prewarm_serial_imports()`）：在 `unblock_bundled_assemblies()`
+之后、bootstrap 线程与 `webview.start()` 之前，主线程串行预热
+`win32ui` / `wechatauto` / `clr` 三个重模块。预热完成后重复导入命中
+`sys.modules` 缓存是空操作，死锁窗口消失。预热失败不阻断启动，只留警告日志。
+
+## [0.9.0] - 2026-10-28
+
+**回复链路由情绪引擎接管：说不说、说什么、隔多久说，全由情绪决定，宿主侧的行为旋钮全部删除。**
+
+上游 `Emotion` 项目（情感多智能体内核：黑板 + 事件总线 + 协调器 + 九个 Agent）
+整体移植进 `bot/emotion/`，成为自动回复的**主链路**，而不是套在模型前面的可选开关。
+
+这一版把「怎么回」也一并交了出去：冷却时间、静默时段、群聊节流、会话延续时间窗、
+分条条数与间隔、人设输入框、重新开口的时间参数，**全部删除**。留下的只有触发条件
+（什么算在跟我说话）和「是否允许往真实聊天主动发消息」——因为那是「要不要动真实
+聊天」的授权，不是表达方式。想让它换个说话的样子，改身份文件或让 Iterator 迭代
+`policy.*`，不是回来加参数。
+
+### 新增
+
+- **情感多智能体内核**（`bot/emotion/core/`、`bot/emotion/agents/`）：感知 / 需求 /
+  记忆 / 评估 / 唤醒 / 情绪 / 他人 / 调节 / 表达九个 Agent（宿主另加「兴趣」，
+  见下）按 stage 0~4 推进，每轮跑完做一次收敛判定与反思迭代。三层写入权限保持原样：
+  `self.*`（人格）只有 reflection 能追加，`policy.*`（可迭代参数）只有 Iterator 能写，
+  其余是本轮状态。
+- **有理由的沉默**：`expression.silent` 是表达阶段的一等结论，取代原来的
+  `reply_probability` 掷骰子。为什么不说会写进运行日志
+  （`情绪 [群名] 发言人 [message] 第 3 轮：不发声（难过 0.42；已表达过，等对方回应）`）。
+- **表达节奏由情绪推导**（`bot/emotion/pacing.py`）：把「什么时候发、分几条、
+  隔多久」变成情绪状态的函数，而不是配置项。
+  - 第一条发出前的停顿 `lead = base + spread × 强度`，`base`/`spread` 按调节策略取
+    （`share` 几乎立刻回，`delay` 先停七秒再回）。上限 8 秒——再久的停顿本来就不该
+    用「延迟」表达，那是「沉默」，归 `expression.silent` 管。
+  - 唤醒度 ≥ 0.62 **且** 情绪强度 ≥ 0.30 才拆条（最多 3 条）；唤醒度 ≤ 0.32 一律
+    整段说完。只有能量没有强度的激动是空转，拆开只会前言不搭后语。
+  - 条间间隔随唤醒度收紧：越激动打得越快。
+  - 拆条保证「拼起来能还原原文」，短于 24 字不拆（拆开像刷屏）。
+- **深夜规则**（`agents/regulation.py`）：本地时间 23:00~07:00 由内核判断，取代
+  「静默时段」配置。深夜 `self_expression` 强制 `hold` 并把强度上限压到 0.20
+  （不主动开口）；对方发来消息则上限压到 0.30（收着说，但不会装死）。
+- **兴趣：第十个 Agent**（`bot/emotion/agents/interest.py` + `bot/emotion/core/interests.py`）。
+  情绪回答「我现在什么感受」，兴趣回答「我一直对什么有兴趣」——前者是几小时的事，
+  后者是几个月的事，混成一个数就会出现「今天心情好所以对历史感兴趣」。
+  - **根源记忆**：身份文件新增 `interests.roots`，给每个类目（软件 / 艺术 /
+    工程机械 / 历史 / 科学 / 情绪关系 / 生活 / 影视动漫 / 游戏 / 工作）一个
+    0~1 的底色，**每一格都带一句 `why`**——不是注释，是她能说出口的来由
+    （「机械的好处是诚实：齿轮咬不咬得上，不取决于我怎么想」）。
+    它写进 `self.interests`，属于受保护前缀，**任何 Agent 都改不了**。
+  - **演化值** `interest.values.*`：每轮朝「根源 ± 可塑性/2」走一小步。
+    聊得开心朝上、聊得难受朝下、心情平平时朝根源回归；单次经历只走十分之一，
+    上限是「根源 ± 0.175」——再喜欢也变不成另一个人。
+  - **聊腻了**：最近 6 轮里同一类目出现过 n 次，注意度乘 `max(0.58, 1 − 0.07n)`。
+    没有这一项，兴趣只会单调上升，连聊二十轮机械它就只会聊机械；
+    但下限是必须的——腻只是「没那么兴奋」，不是「不想说话」。第一版取
+    `1 − 0.15n` 且无下限，结果「兴趣涨到 0.64」和「注意度跌到 0.05」同时发生，
+    表现就是「明明喜欢却装死」。
+  - **注意度** `interest.attention` = 兴趣值 × 命中强度 × 新鲜度。
+    类目识别是确定性的（关键词表，长词权重更高），不调模型——
+    兴趣是长期状态，读错一次会持续影响几十轮。
+- **兴趣决定「何时说话」**（三个接入点，都不改「说什么」）：
+  - `regulation`：注意度 ≥ 0.62 时把「保持观察」抬成「愿意分享」、上限抬到 0.50
+    （但**不抬 delay**——被激到要压住反应，比「我喜不喜欢这话题」更重要）；
+    ≤ 0.22 时把上限压到 0.32，收着说。
+  - `expression`：注意度 ≤ 0.12 **且**亲近度 < 0.62 时可以不接话。
+    门槛定得极严，因为「不回」在聊天里是很重的动作；关系走近之后，
+    就算聊她不懂的东西也该接一句——那是礼貌，不是兴趣。
+    沉默理由会写进 `expression.plan.silent_reason`，日志里能看出是
+    「已表达过」还是「话题提不起兴趣」。
+  - `pacing`（宿主层）：注意度对停顿做 ±30% 缩放，并把「等效唤醒度」抬高
+    `0.18 ×（注意度 − 0.4）`——有兴致时回得更快、也更容易一句一句蹦出来。
+- **没有具体话题时不惩罚**：一句「在吗」「嗯」识别不到类目，注意度按 0.40 中性处理。
+  否则所有寒暄都会因为「没话题 = 不感兴趣」而收不到回复。
+- **逐会话情绪状态**（`bot/emotion/session.py`）：`%APPDATA%\lingyu\emotion\<hash>.json`
+  按会话分片，张三惹它生气不会改变它对李四的语气。单文件超 256 KB 时从最旧的记忆
+  开始裁，会话数超 300 时按活跃时间淘汰；损坏的文件当作「没有状态」重新开始。
+- **微信事件分类**（`bot/emotion/kind.py`）：微信没有 `kind` 字段，这里用确定性词表
+  把消息分成 `message` / `praise` / `criticism` / `rejection` / `reassurance` /
+  `outcome`，各带不同先验（称赞 +0.55，拒绝 −0.35）。不补这一层，所有消息都按
+  `message` 走，情绪曲线就没了。`outcome` 只在上一条是负面事件时成立——它让
+  「当时那样理解，现在还成立吗」有机会被修正。
+- **身份文件**（`bot/emotion/identity/song_nuan.json` + `.md`）：原则、认知纪律、
+  边界、记忆策略、成长策略。用户可在 `%APPDATA%\lingyu\identity\<id>.json` 放同名
+  文件覆盖内置身份。
+- **「情绪」页**：情绪引擎开关、身份选择、大模型参与程度、单轮周期最大轮次，
+  以及各会话当前心情（主导情绪 / 强度 / 轮次 / 关系 / 上一次为什么沉默），
+  可一键清空某个会话或全部会话的情绪。每个会话还显示**本轮话题 + 注意度**
+  与**兴趣前三名**（只读，没有输入框——兴趣不是配置）。
+- **重新开口**：久未回应时由情绪决定要不要轻轻问一句（`bot/engine.py` 的
+  `_reopen_candidates` / `_reopen_tick`）。够不够格看身份文件的 `silence_reopen_hours`，
+  同一段沉默只开口一次（`regulation.reopen_done`），深夜不开口。宿主只保留
+  `proactive_enabled` 一个开关——往真实聊天发消息这件事必须由人明确同意。
+
+### 变更
+
+- **`reply_probability` 删除**：回不回不再掷骰子。`BotConfig` 里该字段已移除，
+  旧配置文件里的残留键会被忽略（`from_dict` 只认已知字段）。
+- **`proactive_probability` / `proactive_recent_seconds` 删除**：主动参与不再
+  「先看有没有人说话，再按概率发一句」，改为「自己说过话、对方一直没回、
+  沉默够久 → 由情绪判断」。原先为省算力加的 `reopen_after_hours` 门槛也一并删掉：
+  评估本身很便宜，而「隔多久才算久」属于情绪判断，不该由配置回答。
+- **`[SILENT]` 哨兵删除**：不再靠模型输出一个标记来决定不发。
+- **`BEHAVIOR_HINT` / `PROACTIVE_HINT` 删除**：不再用硬编码提示词把行为塞给模型，
+  行为来自身份文件与十个 Agent 的状态。
+- **上下文拼装删除**（`_build_messages` / `_render_context` / `_image_slots`）：
+  最近若干轮对话与图片以结构化字段交给感知与表达 Agent（`recent` / `images`），
+  由内核决定怎么用。
+- **`persona_custom` 删除**：主契约是身份文件（`identity/*.json` + `.md`）与内核
+  reflection 对 `self.*` 的自发追加。用户手写一段「人设」与内核的自我成长是两套
+  互相打架的真相来源，只留后者。「人设」页整页移除。
+- **固定文案不再走情绪节奏**：撤回回执、链接提示、下载失败提示这类机械通知改走
+  `_send_plain()`，不拆条、不延迟——它们不是「它想说的话」。
+- **连发合并只做防抖**：同一「会话::发送者」在 1.5 秒内连发多条时只处理第一条，
+  避免一句话被拆成三条输入时触发三次完整周期。这是工程防抖，不是「回复间隔」，
+  也不影响别人——按发送者分别计时。
+- **`emotion_max_rounds` 下限 5**：表达在 stage=4，配成 4 会「情绪算完了但一句话
+  都没有」。`runtime.run_turn` 还会按 Agent 的最大 stage 再兜一次，以后加阶段不会漏改。
+- **模型失败降级**：内核拿不到结构化结果时退回规则版，并在日志里明说
+  「模型失败（bad_content_json），已降级为规则版」——不再静默吞掉。
+
+### 删除
+
+宿主侧所有「行为旋钮」——它们回答的是「它该像什么样」，而这个问题的答案在情绪内核里。
+
+| 已删除 | 原先管的事 | 现在由谁决定 |
+| --- | --- | --- |
+| `cooldown_seconds` | 同一人多久内不重复回 | 情绪强度与唤醒度 |
+| `continuation_seconds` | 上一轮对话多久内算「接着聊」 | 内核记忆（谁刚被回过） |
+| `quiet_hours_*`（3 个） | 几点到几点不说话 | `regulation` 的深夜规则 |
+| `group_rate_*`（3 个） | 群聊每分钟最多回几次 | 调节策略 + 连发合并 |
+| `split_*`（5 个） | 分几条、隔多久、按什么切 | `emotion/pacing.py` |
+| `humanize` | 打字停顿的开关 | 同上（停顿是情绪的副产物） |
+| `persona_custom` | 用户手写的人设 | 身份文件 + reflection |
+| `proactive_interval_min/max` | 主动开口的节拍 | 固定心跳 + 内核判断 |
+| `reopen_after_hours` | 沉默多久才值得重新开口 | 身份文件 `silence_reopen_hours` |
+| `proactive_per_group_cooldown` | 每个群两次主动的间隔 | 同一段沉默只开口一次 |
+
+`src/lingyu/bot/persona.py` 整个文件删除；`bot/__init__.py` 不再导出
+`get_persona` / `reset_persona` / `DEFAULT_PERSONA`；桌面端 `reset_persona` 桥接同步移除。
+
+### 修复
+
+- **`response_format` 兼容性**：宿主模型不支持 `json_object`（HTTP 400/404/422）时
+  自动去掉该字段重试一次；`AsyncLLMAdapter` 遇到不接受该参数的旧客户端也会退回。
+- **JSON 围栏容忍**：模型把 JSON 包在 ```json 里、或前后带一句废话时仍能解析；
+  表达模块允许直接返回一句人话，按 `{"text": ...}` 处理。
+- **状态目录不再是单文件**：上游只有一份 `state/session.json`，多会话下会互相污染。
+
+### 界面
+
+- 导航删掉「表达方式」与「人设」两页——它们调的就是上面那些已删字段。
+- 「静默时段」页改名「沉默与开口」，内容改成一句话说明：沉默是它的决定，不是设置。
+  页面上只剩「允许主动开口」一个开关，其余全部移除。
+- 「群聊」页删掉「会话延续」，「模型」页删掉「同一人冷却」；`Temperature` 补了一句
+  说明——调高只是让它说话更野，不再影响「回不回」。
+- `app.js` 里 `save-human` / `save-persona` / `btn-reset-persona` 三处绑定与对应
+  输入框一并删除。
+
+### 打包
+
+- `packaging/lingyu.spec` 增加 `lingyu/bot/emotion/identity` 数据项。漏了不会报错，
+  只会静默回落成中性身份（表现是「人设莫名其妙没了」），所以同时在
+  `tests/test_emotion.py` 里钉住这一行。
+
+### 测试
+
+- 新增 `tests/test_emotion.py`：事件分类各分支与优先级、状态分片的
+  读写/淘汰/裁剪、模型适配的三种模式与降级、一轮周期的离线冒烟、`persistable`
+  字段过滤、身份回落、打包数据项；`PacingTests`（8 例）钉住节奏推导
+  （高唤醒拆条且能还原原文、低唤醒整段、强度不足不拆、`delay` 停最久、
+  停顿有上限、越激动间隔越短）；`NightRuleTests`（4 例）钉住深夜不主动开口、
+  白天会重新开口、深夜压低强度上限。
+- 新增 `InterestDetectTests`（6 例）、`InterestMathTests`（7 例）、
+  `InterestFlowTests`（6 例）、`InterestRootTests`（5 例）：四个类目的识别、
+  寒暄不归类、兴趣值演化（中性不动 / 正向升但有上限 / 负向降 / 单轮只走一小步 /
+  没谈到会慢回归）、聊腻了降热度、高兴趣抬上限、**高兴趣不抬 delay**、
+  低兴趣压上限、低兴趣可沉默、关系近就不沉默、兴趣值跨轮持久化、
+  根源来自身份文件且每格都有 `why`、没有身份时是平的、Agent 写不了 `self.*`。
+- `tests/test_bot.py` 全面跟进：每个用例一套独立的情绪状态目录（否则上一个用例的
+  心情会影响下一个，表现为「单跑能过、连跑就挂」）；概率相关用例改写为
+  「情绪决定说/不说」；主动参与用例改写为重新开口用例；`SilenceFlowTests` 改写为
+  `NoHostGatesTests`，其中 `test_removed_knobs_are_gone` 逐个断言 20 个已删字段
+  确实不在 `BotConfig` 上——防止以后有人「顺手加回来」。
+- 全量 550 个用例通过。
+
 ## [0.8.19] - 2026-10-26
 
 **链接只认媒体站点，别再给购物链接回「无法解析」；新增「@机器人 撤回」。**

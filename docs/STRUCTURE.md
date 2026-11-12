@@ -9,18 +9,32 @@ lingyu/
 │   ├── config.py            环境变量与路径
 │   ├── security.py          发送白名单、路径穿越校验、审计
 │   ├── logging_config.py    日志配置（控制台 + 文件）
-│   ├── adapters/            微信适配层（wechatauto / wxauto4 / 桥接）
+│   ├── adapters/            平台适配层（微信桌面自动化 / QQ 机器人 API v2）
 │   ├── bot/                 常驻自动回复引擎
 │   │   ├── engine.py        消息消费、触发判断、发送闸门
 │   │   ├── config.py        bot.json 配置（界面可改）
 │   │   ├── llm.py           兼容 OpenAI 的模型客户端
+│   │   ├── emotion/         混合人格内核（回复链路主干）
+│   │   │   ├── core/        身份 / 兴趣 / 措辞闸门 / 模型客户端 / 路径
+│   │   │   ├── affect.py    心境：默认值、衰减、事件评估、主导与策略
+│   │   │   ├── memo.py      体感备忘：数值 → 不带数字的短句
+│   │   │   ├── episode.py   情节记忆：有界 episodes + 事后复核
+│   │   │   ├── persona.py   人格札记账本：全局、可修订、可撤回
+│   │   │   ├── writer.py    札记写入策略：规则优先 + 可选模型提议
+│   │   │   ├── expression.py 表达：单次模型调用 + 规则兜底 + 沉默
+│   │   │   ├── identity/    内置身份（violet.json + .md）
+│   │   │   ├── bridge.py    宿主门面：EmotionBridge + AsyncLLMAdapter
+│   │   │   ├── runtime.py   一轮周期入口（同步，宿主丢线程池跑）
+│   │   │   ├── pacing.py    表达节奏：停顿 / 分条 / 间隔（情绪的副产物，不是配置）
+│   │   │   ├── core/interests.py 兴趣：类目词表、注意度、演化公式
+│   │   │   ├── session.py   逐会话状态分片（有界 + 有上限）
+│   │   │   └── kind.py      微信消息 → 事件类型（微信没有这个字段）
 │   │   ├── links.py         链接解析与下载（分发到下面几个模块）
 │   │   ├── douyin.py        抖音（浏览器桥 + 签名）
 │   │   ├── xiaohongshu.py   小红书（SSR __INITIAL_STATE__）
 │   │   ├── tweet.py         X 推文抓取 + 卡片渲染器
 │   │   ├── card.py          卡片数据结构（推文/小红书共用）
 │   │   ├── browser.py       本机 Chrome/Edge 调试协议桥
-│   │   ├── persona.py       人设与提示词
 │   │   └── storage.py       下载目录配额清理
 │   └── webui/               桌面界面静态资源（index.html / app.js / style.css）
 ├── tests/                   单元测试（unittest，全部基于 mock）
@@ -57,3 +71,14 @@ lingyu/
 - **文档分工**：`README.md` 对外（安装/功能/配置）、`CHANGELOG.md` 按版本记变更、
   `docs/TECHNICAL.md` 记接口与故障排查、`docs/STRUCTURE.md`（本文）记目录与约定。
   新增功能时至少同步 README 与 CHANGELOG。
+- **`bot/emotion/` 是 vendor 进来的内核**：`core/` 与 `agents/` 保持上游形态（相对导入
+  由 `scripts/dev/vendor_emotion.py` 改写），宿主侧的差异都写在 `bridge.py` /
+  `runtime.py` / `session.py` / `kind.py` 这四个文件里。要跟上游同步时重跑那个脚本，
+  **不要**在 `core/` 里散着改——下次覆盖就没了。
+  - `pacing.py` 是**宿主新增**的一层，上游没有对应物（终端程序不需要「分几条、隔多久」），
+    所以同步时不会被覆盖。反过来也别把它塞进 `agents/expression.py`：
+    表达 Agent 只管「说什么」，发送节奏是宿主的事。
+  - `agents/regulation.py` 里有两处**上游没有**的改动：`NIGHT_START` / `NIGHT_END`
+    的深夜规则（按 `local_hour`，宿主传进来而不是读系统时间）与 `reopen_done`。
+    这两处属于「微信场景必需」，同步时要注意保留，否则「静默时段」这类配置就得
+    重新加回宿主。

@@ -25,7 +25,7 @@ from typing import Any
 
 import webview
 
-from .adapters.wechat import WeChatAdapter
+from .adapters import QQBotAdapter, WeChatAdapter, create_adapter
 from .bot import BotConfig, BotEngine, default_config_path
 from .bot.llm import LLMClient, LLMError
 from .config import AdapterConfig
@@ -341,7 +341,8 @@ class DesktopApi:
 
     def __init__(self, hub: _AsyncHub) -> None:
         self._hub = hub
-        self.adapter: WeChatAdapter | None = None
+        self.adapter: Any | None = None
+        self.adapters: list[Any] = []
         self.engine: BotEngine | None = None
         self.config: BotConfig | None = None
         self._ready = threading.Event()
@@ -353,17 +354,54 @@ class DesktopApi:
     # ------------------------------------------------------------------ 初始化
 
     async def _bootstrap_async(self) -> None:
-        self.adapter = WeChatAdapter(AdapterConfig.from_env())
         self.config = BotConfig.load()
-        self.engine = BotEngine(self.adapter, self.config)
+        self.adapters = self._build_adapters(self.config)
+        self.adapter = self.adapters[0]
+        self.engine = BotEngine(self.adapter, self.config, adapters=self.adapters)
         # 引擎就绪后接管控制台输出，连接微信期间的日志即可直接显示到界面。
         UI_LOG.attach(self.engine)
         # 界面那份只在内存里（进程一退就没了），再转发一份给 loguru 才能落盘。
         self.engine.on_log = forward_engine_log
-        # 连接失败不阻塞界面，用户可在状态页重连。
-        await self.adapter.connect()
+        # 多端并行连接：一端失败不影响另一端，界面可单独重连。
+        results = await asyncio.gather(
+            *(adapter.connect() for adapter in self.adapters),
+            return_exceptions=True,
+        )
+        for adapter, result in zip(self.adapters, results):
+            if isinstance(result, BaseException):
+                self.engine.log(
+                    "warning", f"{self._adapter_label(adapter)} 连接失败：{result}"
+                )
         if self.config.enabled:
             await self.engine.start()
+
+    @staticmethod
+    def _adapter_label(adapter: Any) -> str:
+        return "QQ 机器人" if getattr(adapter, "platform", "") == "qq" else "微信"
+
+    def _build_adapters(self, config: BotConfig) -> list[Any]:
+        """按界面开关构建适配器；两个开关都打开即微信 + QQ 并行。"""
+        adapter_config = self._adapter_config(config)
+        adapters: list[Any] = []
+        if config.wechat_enabled:
+            adapters.append(WeChatAdapter(adapter_config))
+        if config.qq_enabled:
+            adapters.append(QQBotAdapter(adapter_config))
+        if not adapters:
+            # 配置异常（两个都关）时回退到单端，避免引擎没有可用适配器。
+            adapters.append(create_adapter(adapter_config))
+        return adapters
+
+    @staticmethod
+    def _adapter_config(config: BotConfig) -> AdapterConfig:
+        """环境变量提供默认值，界面保存的平台与 QQ 凭据优先。"""
+        adapter_config = AdapterConfig.from_env()
+        adapter_config.platform = config.platform
+        if config.qq_app_id:
+            adapter_config.qq_app_id = config.qq_app_id
+        if config.qq_app_secret:
+            adapter_config.qq_app_secret = config.qq_app_secret
+        return adapter_config
 
     def bootstrap(self) -> None:
         try:
@@ -373,10 +411,56 @@ class DesktopApi:
 
     # ------------------------------------------------------------------ 状态
 
+    def _config_view(self) -> dict:
+        """返回给界面的配置：AppSecret 只回「是否已设置」，不回明文。"""
+        data = self.config.to_dict()
+        secret = str(data.get("qq_app_secret") or "")
+        data["qq_app_secret"] = ""
+        data["qq_app_secret_set"] = bool(secret)
+        return data
+
+    def _binding_view(self) -> dict:
+        """接入概览：每个已启用终端的连接状态与机器人身份。"""
+        entries: list[dict] = []
+        for adapter in self.adapters:
+            status = adapter.get_status()
+            detail = dict(getattr(status, "detail", None) or {})
+            state = getattr(status, "state", "")
+            entries.append(
+                {
+                    "platform": str(getattr(adapter, "platform", "wechat") or "wechat"),
+                    "label": self._adapter_label(adapter),
+                    "ok": bool(getattr(status, "ok", False)),
+                    "state": str(getattr(state, "value", "") or ""),
+                    "bot_name": detail.get("bot_name") or "",
+                    "bot_id": detail.get("bot_id") or "",
+                    "error": getattr(status, "error", None),
+                    "backend": detail.get("backend") or "",
+                }
+            )
+        primary = entries[0] if entries else {}
+        return {
+            "platform": "both" if len(entries) > 1 else self.config.platform,
+            "label": "微信 + QQ" if len(entries) > 1 else primary.get("label", "微信"),
+            "app_id": self.config.qq_app_id,
+            "secret_set": bool(self.config.qq_app_secret),
+            "wechat_enabled": bool(self.config.wechat_enabled),
+            "qq_enabled": bool(self.config.qq_enabled),
+            "ok": bool(entries) and all(item["ok"] for item in entries),
+            "state": primary.get("state", ""),
+            "bot_name": primary.get("bot_name", ""),
+            "bot_id": primary.get("bot_id", ""),
+            "error": next(
+                (item["error"] for item in entries if item.get("error")), None
+            ),
+            "entries": entries,
+        }
+
     async def _get_state_async(self) -> dict:
         return {
-            "config": self.config.to_dict(),
+            "config": self._config_view(),
             "engine": self.engine.status_snapshot(),
+            "binding": self._binding_view(),
         }
 
     def get_state(self) -> dict:
@@ -385,14 +469,75 @@ class DesktopApi:
     # ------------------------------------------------------------------ 保存
 
     async def _save_config_async(self, new: BotConfig) -> dict:
-        if new.enabled and not self.engine.running:
-            await self.engine.start()
-        elif not new.enabled and self.engine.running:
-            await self.engine.stop()
+        # 界面不回填密钥：提交空串表示沿用已保存的 AppSecret。
+        if not new.qq_app_secret:
+            new.qq_app_secret = self.config.qq_app_secret
+        binding_changed = (
+            self.config.platform != new.platform
+            or self.config.wechat_enabled != new.wechat_enabled
+            or self.config.qq_enabled != new.qq_enabled
+            or self.config.qq_app_id != new.qq_app_id
+            or self.config.qq_app_secret != new.qq_app_secret
+        )
+        connect_result = None
+        if binding_changed:
+            # 终端开关 / 凭据变了：立刻重建全部适配器并连接，不需要重启程序。
+            connect_result = await self._switch_adapters_async(new)
+        else:
+            if new.enabled and not self.engine.running:
+                await self.engine.start()
+            elif not new.enabled and self.engine.running:
+                await self.engine.stop()
+            # 就地更新共享对象：引擎与本 API 持有同一引用，立即生效。
+            self.config.__dict__.update(new.to_dict())
+            self.config.save()
+        state = await self._get_state_async()
+        state["applied"] = binding_changed
+        state["restart_required"] = False
+        state["connect"] = connect_result
+        return state
+
+    async def _switch_adapters_async(self, new: BotConfig) -> dict:
+        """按终端开关 / 凭据重建全部适配器，保留引擎与人格状态。"""
+        for adapter in self.adapters:
+            try:
+                await adapter.disconnect()
+            except Exception as exc:  # noqa: BLE001 - 旧连接断不开不该挡住新配置
+                self.engine.log(
+                    "warning", f"断开{self._adapter_label(adapter)}失败：{exc}"
+                )
         # 就地更新共享对象：引擎与本 API 持有同一引用，立即生效。
         self.config.__dict__.update(new.to_dict())
         self.config.save()
-        return await self._get_state_async()
+        self.adapters = self._build_adapters(self.config)
+        self.adapter = self.adapters[0]
+        # set_adapters 会按引擎原本的运行状态停/启，监听自动挂到新适配器上。
+        await self.engine.set_adapters(self.adapters)
+        if self.config.enabled and not self.engine.running:
+            await self.engine.start()
+        elif not self.config.enabled and self.engine.running:
+            await self.engine.stop()
+
+        entries: list[dict] = []
+        for adapter in self.adapters:
+            label = self._adapter_label(adapter)
+            try:
+                result = await adapter.connect()
+                entry = result.to_dict()
+            except Exception as exc:  # noqa: BLE001 - 连接失败要回给界面，而不是抛进 JS
+                entry = {
+                    "ok": False,
+                    "error": {"message": str(exc) or exc.__class__.__name__},
+                }
+            entry["platform"] = str(getattr(adapter, "platform", "wechat") or "wechat")
+            entry["label"] = label
+            entries.append(entry)
+        failed = [item for item in entries if not item.get("ok")]
+        return {
+            "ok": not failed,
+            "adapters": entries,
+            "error": failed[0].get("error") if failed else None,
+        }
 
     def save_config(self, data: dict) -> dict:
         return self._call(self._save_config_async(BotConfig.from_dict(data)))
@@ -400,11 +545,53 @@ class DesktopApi:
     # ------------------------------------------------------------------ 连接
 
     async def _connect_async(self) -> dict:
-        result = await self.adapter.connect()
-        return result.to_dict()
+        entries: list[dict] = []
+        for adapter in self.adapters:
+            label = self._adapter_label(adapter)
+            try:
+                entry = (await adapter.connect()).to_dict()
+            except Exception as exc:  # noqa: BLE001 - 单端失败不影响另一端
+                entry = {
+                    "ok": False,
+                    "error": {"message": str(exc) or exc.__class__.__name__},
+                }
+            entry["platform"] = str(getattr(adapter, "platform", "wechat") or "wechat")
+            entry["label"] = label
+            entries.append(entry)
+        failed = [item for item in entries if not item.get("ok")]
+        return {
+            "ok": not failed,
+            "adapters": entries,
+            "error": failed[0].get("error") if failed else None,
+        }
 
     def connect_wechat(self) -> dict:
-        return self._call(self._connect_async(), timeout=60.0)
+        return self._call(self._connect_async(), timeout=90.0)
+
+    def connect_platform(self) -> dict:
+        """重新连接所有已启用终端（界面使用）。"""
+        return self.connect_wechat()
+
+    # ------------------------------------------------------------------ QQ 绑定
+
+    async def _test_qq_binding_async(self, data: dict) -> dict:
+        """用界面上正在编辑的凭据取一次 Token / 网关，不改动运行中的连接。"""
+        merged = {**self.config.to_dict(), **dict(data or {})}
+        candidate = BotConfig.from_dict(merged)
+        # 界面不回填密钥：留空就沿用已保存的那一份。
+        if not candidate.qq_app_secret:
+            candidate.qq_app_secret = self.config.qq_app_secret
+        adapter_config = self._adapter_config(candidate)
+        adapter_config.platform = "qq"
+        adapter = QQBotAdapter(adapter_config)
+        try:
+            return await adapter.probe()
+        finally:
+            await adapter.disconnect()
+
+    def test_qq_binding(self, data: dict) -> dict:
+        """「测试连接」：只校验 AppID / AppSecret 是否可用。"""
+        return self._call(self._test_qq_binding_async(data), timeout=60.0)
 
     # ------------------------------------------------------------------ 日志
 
@@ -429,15 +616,100 @@ class DesktopApi:
     def test_connection(self, data: dict) -> dict:
         return self._call(self._test_connection_async(data), timeout=90.0)
 
-    # ------------------------------------------------------------------ 人设
+    # ------------------------------------------------------------------ 情绪
 
-    async def _reset_persona_async(self) -> str:
-        self.config.persona_custom = ""
-        self.config.save()
-        return ""
+    async def _emotion_state_async(self, chat: str | None) -> dict:
+        return self.engine.emotion_state(chat or None)
 
-    def reset_persona(self) -> str:
-        return self._call(self._reset_persona_async())
+    def get_emotion_state(self, chat: str | None = None) -> dict:
+        """某个会话（传显示名）或全部会话的情绪摘要。"""
+        return self._call(self._emotion_state_async(chat))
+
+    async def _reset_emotion_async(self, chat: str | None) -> dict:
+        removed = self.engine.reset_emotion(chat or None)
+        # 连清空后的最新状态一起返回，前端不必再跑一次往返。
+        return {"removed": removed, "state": self.engine.emotion_state(None)}
+
+    def reset_emotion(self, chat: str | None = None) -> dict:
+        return self._call(self._reset_emotion_async(chat))
+
+    async def _list_identities_async(self) -> list[dict]:
+        return self.engine.identities()
+
+    def list_identities(self) -> list[dict]:
+        """可选身份清单（内置 + 用户目录覆盖），供「情绪」页下拉框使用。"""
+        return self._call(self._list_identities_async())
+
+    async def _persona_state_async(self, identity_id: str | None) -> dict:
+        return self.engine.persona_state(identity_id or None)
+
+    def get_persona(self, identity_id: str | None = None) -> dict:
+        """人格札记：条目、来源、反例、状态与统计。"""
+        return self._call(self._persona_state_async(identity_id))
+
+    async def _revise_persona_async(
+        self, entry_id: str, text: str, identity_id: str | None
+    ) -> dict:
+        entry = self.engine.revise_persona(entry_id, text, identity_id or None)
+        return {"entry": entry, "state": self.engine.persona_state(identity_id or None)}
+
+    def revise_persona(
+        self, entry_id: str, text: str, identity_id: str | None = None
+    ) -> dict:
+        return self._call(self._revise_persona_async(entry_id, text, identity_id))
+
+    async def _retract_persona_async(
+        self, entry_id: str, reason: str, identity_id: str | None
+    ) -> dict:
+        entry = self.engine.retract_persona(entry_id, reason, identity_id or None)
+        return {"entry": entry, "state": self.engine.persona_state(identity_id or None)}
+
+    def retract_persona(
+        self, entry_id: str, reason: str = "", identity_id: str | None = None
+    ) -> dict:
+        return self._call(self._retract_persona_async(entry_id, reason, identity_id))
+
+    async def _reset_persona_async(self, identity_id: str | None) -> dict:
+        ok = self.engine.reset_persona(identity_id or None)
+        return {"ok": ok, "state": self.engine.persona_state(identity_id or None)}
+
+    def reset_persona(self, identity_id: str | None = None) -> dict:
+        return self._call(self._reset_persona_async(identity_id))
+
+
+#: 启动死锁预防：必须串行预热的重模块（详见 :func:`_prewarm_serial_imports`）。
+_PREWARM_MODULES = ("win32ui", "wechatauto", "clr")
+
+
+def _prewarm_serial_imports() -> None:
+    """在主线程串行预热重模块导入，消除启动期的跨线程导入死锁。
+
+    实测死锁（2026-11 抓僵死进程调用栈确认）：``webview.start()``（主线程）走到
+    ``import clr`` 时由 cffi 调 ``LoadLibrary`` 加载 .NET 运行时——**持有 GIL**
+    等 Windows loader lock；与此同时 bootstrap 线程在 ``adapter.connect()`` 里
+    ``from wechatauto import WeChat`` 触发 ``import win32ui``——``LoadLibrary
+    ("win32ui.pyd")`` **持有 loader lock**（MFC 扩展 DLL 的初始化在 loader lock
+    内调 Python C API，win32ui.pyd 静态链接 python313.dll）**等 GIL**。两把锁
+    互相等待，进程僵死：窗口永不出现、日志停在「自动选择微信自动化后端」。
+
+    解法：让这两条导入在**没有任何并发导入**的阶段先行完成（命中 ``sys.modules``
+    缓存后重复导入是空操作），死锁窗口即消失。必须在
+    :func:`unblock_bundled_assemblies` 之后（``import clr`` 要加载 .NET 程序集，
+    带「Internet 区域」标记会拒绝加载）且在 bootstrap 线程与
+    ``webview.start()`` 之前调用。
+
+    预热失败不阻断启动——真用到时会再报一次，这里只留痕便于回溯。
+    """
+    for name in _PREWARM_MODULES:
+        try:
+            __import__(name)
+        except Exception as exc:  # noqa: BLE001 - 预热失败不能挡启动
+            try:
+                from loguru import logger
+
+                logger.warning(f"预热导入 {name} 未成功（不阻断启动）: {exc}")
+            except Exception:  # noqa: BLE001 - 连日志都不可用就静默跳过
+                pass
 
 
 def _show_fatal(message: str) -> None:
@@ -525,6 +797,11 @@ def run() -> None:
     # 从 zip 解压的冻结包会被打上「Internet 区域」标记，.NET 拒绝加载
     # 带标记的程序集 → pythonnet 起不来 → 黑屏。这里先自行清除。
     unblocked = unblock_bundled_assemblies()
+
+    # 串行预热 win32ui / wechatauto / clr：启动期主线程（import clr）与
+    # bootstrap 线程（import win32ui）并发导入会死锁，见函数内注释。
+    # 必须在 unblock 之后、bootstrap 线程与 webview.start() 之前。
+    _prewarm_serial_imports()
 
     hub = _AsyncHub()
     hub.start()

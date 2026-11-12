@@ -2,9 +2,9 @@
 
 设计要点：
 
-- 首次调用时按需连接微信，后续复用同一连接。
+- 首次调用时按需连接（微信桌面客户端 / QQ 机器人），后续复用同一连接。
 - 所有失败都返回结构化错误，不抛出给协议层，便于 Agent 读取与决策。
-- 微信未连接等前置条件不满足时，返回明确错误而非虚报成功。
+- 平台未连接等前置条件不满足时，返回明确错误而非虚报成功。
 - 对外部有影响的操作（发送）记录审计元数据，默认不记录完整正文。
 """
 
@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Any
 
-from .adapters.wechat import WeChatAdapter
+from .adapters import create_adapter
 from .audit import AuditLogger
 from .config import AdapterConfig
 from .errors import LingyuError
@@ -23,25 +23,32 @@ logger = logging.getLogger(__name__)
 
 
 class WeChatService:
-    """面向 MCP 工具的微信服务封装。"""
+    """面向 MCP 工具的消息服务封装（微信 / QQ 由适配器决定）。"""
 
     def __init__(
         self,
-        adapter: WeChatAdapter | None = None,
+        adapter: Any | None = None,
         audit: AuditLogger | None = None,
     ):
-        self._adapter = adapter or WeChatAdapter(AdapterConfig.from_env())
+        self._adapter = adapter or create_adapter(AdapterConfig.from_env())
         config = self._adapter.config
         self._audit = audit or AuditLogger(config.audit_log_path, config.audit_enabled)
         self._connect_lock = asyncio.Lock()
 
     @property
-    def adapter(self) -> WeChatAdapter:
+    def adapter(self) -> Any:
         return self._adapter
 
     @property
     def audit(self) -> AuditLogger:
         return self._audit
+
+    @property
+    def platform(self) -> str:
+        return str(getattr(self._adapter, "platform", "wechat") or "wechat")
+
+    def _platform_label(self) -> str:
+        return "QQ 机器人" if self.platform == "qq" else "微信"
 
     async def _ensure_connected(self) -> dict[str, Any] | None:
         """确保已连接；成功返回 None，失败返回结构化错误。"""
@@ -55,13 +62,17 @@ class WeChatService:
             except LingyuError as exc:
                 return exc.to_dict()
             except Exception as exc:  # 兜底，避免异常穿透到协议层
-                logger.exception("连接微信失败")
+                logger.exception("连接%s失败", self._platform_label())
                 return {"ok": False, "code": "connect_failed", "message": str(exc)}
         if not status.ok:
             return status.error or {
                 "ok": False,
                 "code": "connect_failed",
-                "message": "微信连接失败，请确认微信已登录且主窗口可见",
+                "message": (
+                    "QQ 机器人连接失败，请检查 AppID / AppSecret 与网络"
+                    if self.platform == "qq"
+                    else "微信连接失败，请确认微信已登录且主窗口可见"
+                ),
             }
         return None
 

@@ -16,6 +16,7 @@ MCP 客户端 / 桌面界面
                 service.py    业务层：参数校验、目标消歧、结果封装
                     │
           adapters/wechat.py  适配层：WeChatAdapter
+          adapters/qq.py      QQ 机器人适配层：QQBotAdapter（官方 API v2）
                     │
         packaging/wechat_bridge.py   桥接层（运行期按文件路径加载）
                     │
@@ -23,6 +24,19 @@ MCP 客户端 / 桌面界面
                     │
               Windows 微信桌面客户端
 ```
+
+QQ 模式不经过桥接层：`QQBotAdapter` 直接调用开放平台 HTTP API，并保持一条
+WebSocket 网关长连接（Hello → Identify → Heartbeat → Resume）。
+两个适配器实现同一组方法（`connect / get_status / send_message / get_chat_list /
+get_recent_messages …`），因此 `service.py` 与 `bot/engine.py` 不需要平台分支。
+
+`bot/engine.py` 支持**多端并行**：构造时传入 `adapters=[...]`（桌面端按
+`wechat_enabled` / `qq_enabled` 构建），引擎为每个适配器注册一个监听回调，
+并把「会话显示名 / 会话 ID → 来源适配器」记在 `_chat_sources` 里；发送、撤回、
+自身昵称识别与附件都按来源路由，回复不会串到另一端。`set_adapters()` 用于保存
+配置后的热切换（先停旧监听，再挂到新适配器上），`status_snapshot()` 返回
+`platform`（单端为 `wechat` / `qq`，双端为 `both`）、`adapters`（每端状态）与
+兼容字段 `adapter`（第一端）。
 
 设计要点：
 
@@ -40,7 +54,8 @@ MCP 客户端 / 桌面界面
 | `src/lingyu/server.py` | MCP 服务入口，注册全部工具 |
 | `src/lingyu/service.py` | 业务层，工具与适配层之间的编排 |
 | `src/lingyu/adapters/wechat.py` | 微信适配层，桥接层加载与调用封装 |
-| `src/lingyu/bot/` | 常驻机器人：引擎、模型、人设、链接解析、卡片渲染、存储 |
+| `src/lingyu/adapters/qq.py` | QQ 机器人适配层：Access Token、WebSocket 网关、C2C/群/频道消息、富媒体上传与发送 |
+| `src/lingyu/bot/` | 常驻机器人：引擎、模型、混合人格内核、链接解析、卡片渲染、存储 |
 | `src/lingyu/desktop.py` | 桌面端主程序与 JS API |
 | `src/lingyu/webui/` | 桌面端前端（HTML/CSS/JS） |
 | `packaging/wechat_bridge.py` | 微信 UI 自动化桥接层 |
@@ -235,9 +250,17 @@ MCP 客户端 / 桌面界面
 | `WECHAT_MONITOR_MODE` | `allow` | 关注列表模式 `allow` / `block` |
 | `WECHAT_MONITOR_ALLOW` | 空 | 预设白名单（逗号分隔，空=全部） |
 | `WECHAT_MONITOR_BLOCK` | 空 | 预设黑名单（逗号分隔） |
+| `LINGYU_PLATFORM` | `wechat` | `wechat` / `qq`，决定使用哪个适配器（MCP 方式单端） |
+| `QQ_BOT_APP_ID` | 空 | QQ 开放平台 AppID（`platform=qq` 时必填） |
+| `QQ_BOT_APP_SECRET` | 空 | QQ 开放平台 AppSecret（`platform=qq` 时必填） |
+| `QQ_BOT_API_BASE` | `https://api.bot.qq.com` | QQ 开放平台 API 域名 |
+| `QQ_BOT_INTENTS` | `0` | Intents 位掩码；`0` = GUILDS / GROUP_AND_C2C_EVENT / PUBLIC_GUILD_MESSAGES |
+| `QQ_BOT_CONNECT_TIMEOUT` | `15` | 等待网关注册 READY 的秒数，超时后后台继续重试 |
 
-桌面端的模型、人设、链接解析等配置不读环境变量，统一存在
-`%APPDATA%\lingyu\bot.json`，界面里改即可。
+桌面端的模型、身份、链接解析等配置不读环境变量，统一存在
+`%APPDATA%\lingyu\bot.json`，界面里改即可。接入终端由 `wechat_enabled` /
+`qq_enabled` 两个开关控制，可同时为 `true`（两端并行）；旧配置缺少这两个字段时
+按 `platform` 推导，且保证至少有一个终端开启。
 
 ### 客户端配置示例
 
@@ -275,12 +298,15 @@ MCP 客户端 / 桌面界面
 同一个 exe 加 `--gui` 启动原生窗口，无需 Agent 轮询：
 
 - **触发**：私聊每条；群里 @ 机器人账号的微信昵称，或引用/回复它的消息。
-- **回复**：取最近 N 条上下文 + 人设发给大模型，按配置拟人化（回复概率、
-  长回复分条、口语化措辞）。
-- **静默与水群**：静默时段、群级回复节流、可选的偶发主动参与（默认关闭）。
+- **回复**：交给混合人格内核（第 5.1 节）——身份、心境、情节记忆与人格札记共同决定
+  这一轮说不说、说什么，再说的话由 `pacing` 决定停顿、分几条、隔多久。
+  **回不回不再掷骰子**，沉默是表达层的结论。
+- **没有行为配置**：冷却、静默时段、群级节流、会话延续时间窗、分条参数、
+  人设输入框全部删除。宿主只留触发条件。深夜收着说由心境按本地时间推导；
+  「安静多久才适合重新开口」写在身份文件的 `boundaries.silence_reopen_hours`。
 - **链接解析**：见第 6 节。
 - **应急撤回**：「@机器人 撤回」撤掉最新发出的媒体消息，见第 6.1 节。
-- **图像识别**：开启后（需模型支持视觉）图片随上下文一起送给模型。
+- **图像识别**：开启后（需模型支持视觉）图片随上下文一起送给表达层。
 
 **前置条件**：界面靠 Edge WebView2 渲染，系统缺这个运行时会启动失败并明确提示要装什么
 （见第 7 节「桌面端提示缺少 WebView2 运行时」）。**MCP 模式不需要 WebView2**。
@@ -290,6 +316,126 @@ MCP 客户端 / 桌面界面
 
 > 改配置文件后必须重启程序：`desktop.py` 只在启动时 `BotConfig.load()` 一次。
 > 运行中的实例若在界面里改了任何设置，会把内存里的配置写回磁盘。
+
+### 5.1 混合人格内核（`bot/emotion/`）
+
+回复链路的主干。它融合两套设计的长处：一套强在**角色与情绪表现**（身份 + 心境 +
+体感备忘 + 分条节奏），一套强在**长期人格的证据与治理**（情节记忆 + 可修订的人格
+札记）。它不是套在模型前面的开关：**它决定这一轮要不要说话，以及说什么**。
+
+四层结构，越往下越慢、越难改：
+
+| 层 | 内容 | 写入者 | 生效范围 |
+|---|---|---|---|
+| L0 身份内核 | 她是谁、原则、边界、语气、兴趣根源 | 作者（文件） | 全局，模型不可写 |
+| L1 心境 | 心情 / 唤醒 / 想念 / 烦躁 / 亲近 / 安心 / 分享 / 精力 + 关系 | 规则，每轮小步 | 逐会话 |
+| L2 情节记忆 | 有界 episodes，带当时的读法与后来的复核 | 规则 | 逐会话，最多 60 条 |
+| L3 人格札记 | 跨会话的长期结论，带来源、反例、置信 | 规则或模型，每天至多一条 | 全局，可修订 / 撤回 |
+| L4 表达 | 这一次说什么、分几条、停顿多久 | 单次模型调用，失败回退规则 | 本轮 |
+
+```
+微信消息
+  └─ kind.classify()                事件类型（message/praise/criticism/rejection/reassurance/outcome）
+      └─ EmotionBridge.respond()    逐会话加锁 → 线程池跑 run_turn()
+          └─ run_turn()
+              ├─ affect.update()    L1：先衰减，再按事件与词表更新心境
+              ├─ episode.review()   L2：新事件推翻或证实上一次的读法
+              ├─ episode.append()   L2：够重要的才记，摘录最多 60 字
+              ├─ interests.evolve() 兴趣：话题注意度，只调制接话意愿
+              ├─ writer.consider()  L3：证据够就写一条札记，否则当天跳过
+              ├─ memo.render()      把数值翻译成 1~2 句体感备忘
+              └─ expression.render() L4：说话，或者有理由地沉默
+```
+
+- **状态（会话级）**：`%APPDATA%\lingyu\emotion\<hash>.json`（`WECHAT_BOT_EMOTION_DIR`
+  可覆盖），schema = 2。旧内核的数据**不迁移**：读到旧 payload 当作没有状态，直接
+  重新开始。单文件超 256 KB 从最旧的 episode 开始裁；超 300 个会话按活跃时间淘汰；
+  损坏文件当作「没有状态」。写入走临时文件 + `os.replace` 原子替换。
+- **人格札记（全局）**：`%APPDATA%\lingyu\persona\persona_<identity>.json`
+  （`emotion_persona_dir` 可覆盖），与会话无关。每条含 `text / status / signature /
+  sources / counterexample / uncertainty / confidence / created_day / revision_of /
+  history`；最多 200 条、同时有效 24 条、保留 90 天。修订会生成新条目并把旧条标为
+  `superseded`；撤回标为 `retracted`，**不再进入表达提示词**。账本自带 `RLock` 原子写。
+- **隐私边界**：札记只保存来源引用（会话哈希 + episode id），不重复保存聊天原文；
+  episode 的 `excerpt` 最多 60 字。
+- **心境更新**：`valence / arousal / longing / irritation / warmth / sharing /
+  security / energy` 全部裁剪到 `[0,1]`（`valence` 为 `[-1,1]`）。`arousal` 与
+  `irritation` 半衰期 6 小时，`valence` 12 小时回归 0.1；安静超过 3 小时后 `longing`
+  缓慢上涨；深夜把 `energy` **压到上限 0.42**（只压一次，不会因为连发几条就把精力扣到零）。
+  关系（`familiarity / trust / closeness / tension`）每轮只移动一小步。
+- **事件与词表**：事件类型决定先验（`criticism` 降心情、升烦躁；`praise` 升心情、
+  升亲近；`rejection` 降安心），再叠加「烦 / 累 / 难过 / 害怕 / 太好了」这类具体感受词。
+  两者都不命中时保持中性，**不臆测**。
+- **主导心境与策略**：`dominant_of()` 输出烦躁 / 想念 / 疲惫 / 愉快 / 安心 / 警惕 /
+  低落 / 平静；`strategy_of()` 输出 `delay / hold / share / seek_info / soften`，
+  既影响表达，也影响 `pacing` 的停顿。
+- **体感备忘**（`memo.py`）：把数值翻译成 1~2 句不带数字的短句，例如「心里是松的，
+  愿意多听一会儿」「有点想先开口，又怕打扰」「话不太多」。它进表达提示词，也是界面
+  上最直观的那一行。
+- **情节记忆**（`episode.py`）：重要性低于 0.35 的对话不记。每条记下 `then_belief`
+  （当时的读法）与 `now_review.verdict`（后来的复核）。后续事件可以 `confirmed`、
+  `refuted` 或 `uncertain`——**先前的误读会被明确推翻，而不是一直留在记忆里**。
+- **人格札记写入**（`writer.py`）：按 `(kind, dominant)` 聚合同类证据，至少 3 条才够格；
+  同一天最多写一条，同类读法 30 天内不重复。默认用确定性模板；`all` 模式下允许模型
+  提议，但必须通过严格校验（4~60 字、单行、无数字、不含「系统 / 规则 / 提示词 / 模型 /
+  AI / 用户」，来源必须是候选子集，且必须带反例或 `uncertainty ≥ 0.2`）。校验失败回退
+  规则模板；证据不足或没有新东西时**允许跳过**，不为了「每天一条」硬写。
+- **表达**（`expression.py`）：一次模型调用，失败或为空回退规则短句；然后过 `wording`
+  闸门（允许 / 有风险的说法）并裁剪到身份的 `max_chars`。高烦躁 + 低信任、深夜
+  极低精力、关系紧张时会选择沉默，理由写进日志。
+- **表达节奏**（`bot/emotion/pacing.py`）：「什么时候发、分几条、隔多久」是心境的
+  函数，不是配置。
+  - `lead = base + spread × 强度`，`base`/`spread` 按策略取：`share` (0.2, 0.8)、
+    `hold` (1.0, 1.5)、`soften` (1.6, 2.0)、`seek_info` (1.2, 1.0)、
+    `delay` (7.0, 10.0)。上限 `MAX_LEAD = 8.0`——再久的停顿本来就不该用「延迟」
+    表达，那是「沉默」，归表达层。
+  - 条数：唤醒度 ≥ 0.62 **且** 强度 ≥ 0.30 → 最多 3 条；唤醒度 ≤ 0.32 或强度
+    < 0.30 → 一律 1 条；中间 → 2 条。只有能量没有强度的激动是空转。
+  - 条间间隔 `0.30 + (1 − 唤醒度) × 1.10` 秒：越激动打得越快。
+  - 切分按句末标点，短于 24 字不拆；句子多于上限时按长度均衡合并，保证
+    `"".join(parts)` 能还原原文（`tests/test_emotion.py` 有断言）。
+  - 宿主只负责按 `parts`/`gaps`/`lead` 依次发送，`engine._sleep()` 是唯一等待点，
+    测试里 patch 成不等待。机械通知（撤回回执、链接提示、下载失败）走
+    `_send_plain()`，不掺节奏——它们不是「她想说的话」。
+- **重新开口**：宿主不再用固定时间窗挡人。`EmotionBridge.reopen()` 先看身份文件的
+  `boundaries.silence_reopen_hours`（内置身份是 6 小时），不够久就不进表达；同一段
+  沉默只主动开一次口（`regulation.reopen_done`），对方一旦回话该标记作废。
+- **兴趣**（`core/interests.py`）：回答「我一直对什么有兴趣」，与「我现在什么感受」
+  分开。
+
+  | 层 | 字段 | 谁能改 | 性质 |
+  |---|---|---|---|
+  | 根源 | 身份文件 `interests.roots` | 没人（seed） | 她生来偏向什么 |
+  | 演化 | `interest.values.<cat>` | 规则，每轮小步 | 经历塑形后的实际兴趣 |
+  | 本轮 | `interest.topic` / `.attention` / `.note` | 规则 | 这句话值不值得接 |
+
+  - **类目**：software / art / engineering / history / science / work / life /
+    media / game / emotion，共 10 个。识别是**确定性的关键词表**，按词长加权，
+    `MIN_MATCH = 0.22` 以下算「没聊到具体话题」。不调模型——兴趣是长期状态，
+    读错一次会持续影响几十轮，这种地方必须可复核。
+  - **注意度**：`attention = value × (0.45 + 0.55×match) × satiety`，
+    `satiety = max(0.58, 1 − 0.07×最近 6 轮同类目次数)`。无话题命中时固定 0.40
+    中性——**不惩罚**，否则「在吗」这类寒暄永远收不到回复。
+  - **演化**：`target = 根源 + 可塑性/2 × valence`，`value += 0.10 × (target − value)`。
+    上限是「根源 ± 0.175」，再喜欢也变不成另一个人。
+- **模型参与**（`emotion_llm_mode`）：
+  - `expression`（默认）：只有表达层调模型，一轮至多 1 次；
+  - `all`：表达层 + 每天至多一次人格札记提议（仍受严格校验）；
+  - `none`：全部走规则。
+
+  模型失败自动降级为规则版，并在日志里标出原因。
+- **同步内核 × asyncio 宿主**：内核是同步计算 + 同步 HTTP，宿主把它丢进
+  `loop.run_in_executor()`；内核要调模型时，`AsyncLLMAdapter` 用
+  `run_coroutine_threadsafe()` 把协程交回宿主事件循环。同一会话的读取、轮次计算与
+  写入都在同一把锁内完成，避免并行消息互相覆盖。
+- **身份**：内置 `emotion/identity/violet.json`（薇尔莉特），用户目录
+  `%APPDATA%\lingyu\identity\<id>.json` 同名覆盖。身份文件新增
+  `self_narrative`（第一人称自述）、`style_samples`（表达样例）与 `persona.policy`
+  （是否启用札记、最少证据数、重要度门槛、读取条数、是否允许模型提议）。身份缺失时
+  回落中性身份，绝不抛异常打断回复——**冻结包必须带上这个目录**
+  （`packaging/lingyu.spec` 的 `datas`，`tests/test_emotion.py` 有断言钉住）。
+- **重置**：界面「情绪」页可按会话清空心境，也可以清空人格札记；想让它「重新认识你」
+  就两个一起清。
 
 ---
 
@@ -441,7 +587,7 @@ MCP 客户端 / 桌面界面
   判定方式是看它被吞掉的告警里有没有 `larger than max-filesize`
   （`_QuietLogger.messages` 留了一份原文）。
 - **失败提示**：`link_download_fail_notice`（默认开）控制。文案保持**单行**
-  ——`_send_reply` 会按句号/换行分条，多行会让一次提示拆成两条消息。
+  ——`_send_plain` 只发一段，但多行在聊天里仍会显得像两条消息。
   提示里带失败原因（截断 80 字），方便直接看出是缺 Cookie、网络问题还是站点不支持。
 - **推文视频**：`Tweet.video_url` 直链先按同样次数重试，失败后才退回 yt-dlp；
   这一路**不发**提示，由兜底的 yt-dlp 统一发，避免同一段视频连发两条坏消息。
@@ -513,7 +659,7 @@ MCP 客户端 / 桌面界面
 | 执行 | `adapters/wechat.py` → `wechat_bridge.py::recall_last_message` | 解析目标会话 → 右键自己最新一条 → 点菜单「撤回」 |
 
 `_handle_recall` 在 `_handle` 里**最先**执行（在链接服务与 `_should_reply` 之前）：
-违规内容要尽快撤掉，不能被冷却、拟人化概率这些挡在前面。
+违规内容要尽快撤掉，不能被情绪判断这些挡在前面。
 
 ### 撤回目标怎么选
 
@@ -585,8 +731,8 @@ MCP 客户端 / 桌面界面
 - **手打 `@某某` 只是普通文字**，不会被当成 @ 提醒；正确做法是输入 `@` 后
   **从弹出的成员列表里选中机器人**。想省事就把机器人账号昵称改成你习惯 @ 的名字。
 - 昵称在连接微信时读取，改了不必重启（下一条 @ 消息会自动跟上）。
-- 除 @ 外还有两种触发：**引用/回复机器人的消息**，以及开启「会话延续」后
-  刚被回复过的人继续发言。
+- 除 @ 外还有两种触发：**引用/回复机器人的消息**，以及**它刚回过的那个人的下一条**
+  （没有时间窗——「算不算接着聊」由内核记忆判断，不看隔了多久）。
 
 #### 名字对上了还是不回
 

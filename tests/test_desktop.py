@@ -211,7 +211,7 @@ class EngineLogForwardingTests(unittest.TestCase):
         api = desktop.DesktopApi.__new__(desktop.DesktopApi)
 
         with mock.patch.object(
-            desktop, "WeChatAdapter", lambda *a, **k: fake_adapter
+            desktop, "create_adapter", lambda *a, **k: fake_adapter
         ), mock.patch.object(
             desktop, "BotEngine", lambda *a, **k: fake_engine
         ), mock.patch.object(desktop, "BotConfig") as cfg, mock.patch.object(
@@ -222,6 +222,64 @@ class EngineLogForwardingTests(unittest.TestCase):
 
         self.assertIs(fake_engine.on_log, desktop.forward_engine_log)
         ui_log.attach.assert_called_once_with(fake_engine)
+
+
+class PersonaApiTests(unittest.TestCase):
+    """人格札记 API：参数透传与返回结构。
+
+    界面只读这一层，所以这里不重复测账本逻辑（在 ``test_emotion`` 里），
+    只钉住「JS 调到的名字 → 引擎方法 → JSON 结构」这条线没接错。
+    """
+
+    def _api(self):
+        import asyncio
+
+        calls: list[tuple] = []
+        engine = SimpleNamespace(
+            persona_state=lambda identity=None: (
+                calls.append(("state", identity)) or {"entries": []}
+            ),
+            revise_persona=lambda entry_id, text, identity=None: (
+                calls.append(("revise", entry_id, text, identity))
+                or {"id": entry_id}
+            ),
+            retract_persona=lambda entry_id, reason="", identity=None: (
+                calls.append(("retract", entry_id, reason, identity))
+                or {"id": entry_id}
+            ),
+            reset_persona=lambda identity=None: (
+                calls.append(("reset", identity)) or True
+            ),
+        )
+        api = desktop.DesktopApi.__new__(desktop.DesktopApi)
+        api.engine = engine
+        api._call = lambda coro: asyncio.run(coro)
+        return api, calls
+
+    def test_get_persona_passes_identity(self):
+        api, calls = self._api()
+        self.assertEqual(api.get_persona("violet"), {"entries": []})
+        self.assertEqual(calls, [("state", "violet")])
+
+    def test_revise_returns_entry_and_state(self):
+        api, calls = self._api()
+        out = api.revise_persona("p-0001", "新的说法。", "violet")
+        self.assertEqual(out["entry"], {"id": "p-0001"})
+        self.assertEqual(out["state"], {"entries": []})
+        self.assertIn(("revise", "p-0001", "新的说法。", "violet"), calls)
+
+    def test_retract_passes_reason(self):
+        api, calls = self._api()
+        out = api.retract_persona("p-0001", "证据不够", "violet")
+        self.assertEqual(out["entry"], {"id": "p-0001"})
+        self.assertIn(("retract", "p-0001", "证据不够", "violet"), calls)
+
+    def test_reset_reports_ok_and_state(self):
+        api, calls = self._api()
+        out = api.reset_persona()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], {"entries": []})
+        self.assertIn(("reset", None), calls)
 
 
 class WebView2CheckTests(unittest.TestCase):
@@ -267,6 +325,253 @@ class WebView2CheckTests(unittest.TestCase):
         fake = self._fake_winreg(version="0.0.0.0")
         with mock.patch.dict(sys.modules, {"winreg": fake}):
             self.assertFalse(desktop.webview2_available())
+
+
+class PrewarmSerialImportTests(unittest.TestCase):
+    """启动死锁预防：`win32ui` / `wechatauto` / `clr` 必须在主线程串行预热。
+
+    回归点（2026-11-08 实测）：`webview.start()`（主线程）`import clr` 经 cffi
+    调 `LoadLibrary` 持有 GIL 等 loader lock，与 bootstrap 线程
+    `import win32ui`（MFC DllInit 持有 loader lock 等 GIL）并发时互相等待，
+    进程僵死、窗口永不出现。两者任一先在单线程阶段导完（命中 sys.modules
+    缓存）死锁窗口即消失，所以预热顺序与覆盖面都不能退。
+    """
+
+    def test_prewarms_all_modules(self):
+        seen: list[str] = []
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            seen.append(name)
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            desktop._prewarm_serial_imports()
+
+        # 每个目标模块至少被请求过一次（嵌套导入会重复出现，只看是否覆盖）。
+        for name in desktop._PREWARM_MODULES:
+            self.assertIn(name, seen, f"预热应请求导入 {name}")
+
+    def test_top_level_calls_follow_preload_order(self):
+        """顶层预热调用的顺序就是 _PREWARM_MODULES 的顺序（嵌套导入不算）。"""
+        seen: list[str] = []
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            seen.append(name)
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            desktop._prewarm_serial_imports()
+
+        # 取每个目标模块的首次出现位置，必须与声明顺序一致。
+        firsts = {n: seen.index(n) for n in desktop._PREWARM_MODULES}
+        ordered = sorted(firsts, key=firsts.get)
+        self.assertEqual(ordered, list(desktop._PREWARM_MODULES))
+
+    def test_import_failure_does_not_raise(self):
+        """预热失败不能挡启动——真用到时会再报一次，这里只留痕。"""
+
+        def boom(name, *args, **kwargs):
+            raise ImportError(f"no module named {name}")
+
+        with mock.patch("builtins.__import__", side_effect=boom):
+            desktop._prewarm_serial_imports()  # 不应抛出任何异常
+
+    def test_preload_order_puts_mfc_module_before_clr(self):
+        """win32ui（loader lock 持有者）必须排在 clr（GIL 持有者）之前预热。"""
+        names = list(desktop._PREWARM_MODULES)
+        self.assertLess(names.index("win32ui"), names.index("clr"))
+
+
+class QQBindingApiTests(unittest.TestCase):
+    """QQ 绑定配置集成：脱敏回显、留空保留密钥、切换平台即时生效。"""
+
+    @staticmethod
+    def _status(ok: bool = True, error=None):
+        from lingyu.schemas import ConnectionState
+
+        return SimpleNamespace(
+            ok=ok,
+            state=ConnectionState.CONNECTED if ok else ConnectionState.ERROR,
+            detail={"bot_name": "灵语", "bot_id": "bot-1", "app_id": "appid"},
+            error=error,
+        )
+
+    @staticmethod
+    def _engine(running: bool = False):
+        class _Engine:
+            def __init__(self):
+                self.running = running
+                self.swapped: list = []
+                self.logs: list[tuple[str, str]] = []
+
+            async def start(self):
+                self.running = True
+
+            async def stop(self):
+                self.running = False
+
+            async def swap_adapter(self, adapter):
+                self.swapped.append(adapter)
+
+            async def set_adapters(self, adapters):
+                self.swapped.append(list(adapters))
+
+            @staticmethod
+            def status_snapshot():
+                return {"running": False, "platform": "qq", "adapter": {}, "emotion": {}}
+
+            def log(self, level, message):
+                self.logs.append((level, message))
+
+        return _Engine()
+
+    @staticmethod
+    def _api(config, adapter=None, engine=None, adapters=None):
+        api = desktop.DesktopApi.__new__(desktop.DesktopApi)
+        api.config = config
+        api.adapter = adapter
+        api.engine = engine
+        if adapters is not None:
+            api.adapters = adapters
+        else:
+            api.adapters = [adapter] if adapter is not None else []
+        return api
+
+    def test_state_masks_app_secret(self):
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(platform="qq", qq_app_id="appid", qq_app_secret="secret")
+        api = self._api(cfg, SimpleNamespace(get_status=lambda: self._status()), self._engine())
+
+        state = asyncio.run(api._get_state_async())
+
+        self.assertEqual(state["config"]["qq_app_secret"], "")
+        self.assertTrue(state["config"]["qq_app_secret_set"])
+        self.assertTrue(state["binding"]["secret_set"])
+        self.assertEqual(state["binding"]["bot_name"], "灵语")
+
+    def test_save_keeps_existing_secret_when_blank(self):
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(platform="wechat", qq_app_id="appid", qq_app_secret="saved")
+        api = self._api(cfg, SimpleNamespace(get_status=lambda: self._status()), self._engine())
+        incoming = BotConfig.from_dict({**cfg.to_dict(), "qq_app_secret": ""})
+
+        with mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            asyncio.run(api._save_config_async(incoming))
+
+        self.assertEqual(cfg.qq_app_secret, "saved", "留空的密钥不能被清掉")
+
+    def test_terminal_switch_swaps_adapters_without_restart(self):
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(platform="wechat")
+        old = SimpleNamespace(
+            platform="wechat",
+            get_status=lambda: self._status(),
+            disconnect=mock.AsyncMock(),
+        )
+        engine = self._engine()
+        new_adapter = SimpleNamespace(
+            platform="qq",
+            get_status=lambda: self._status(),
+            connect=mock.AsyncMock(
+                return_value=SimpleNamespace(
+                    to_dict=lambda: {"ok": True, "state": "connected"}
+                )
+            ),
+        )
+        api = self._api(cfg, old, engine)
+        incoming = BotConfig.from_dict(
+            {
+                **cfg.to_dict(),
+                "wechat_enabled": False,
+                "qq_enabled": True,
+                "qq_app_id": "appid",
+                "qq_app_secret": "secret",
+            }
+        )
+
+        with mock.patch.object(
+            desktop.DesktopApi, "_build_adapters", return_value=[new_adapter]
+        ), mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            state = asyncio.run(api._save_config_async(incoming))
+
+        old.disconnect.assert_awaited_once()
+        self.assertEqual(engine.swapped, [[new_adapter]])
+        new_adapter.connect.assert_awaited_once()
+        self.assertIs(api.adapter, new_adapter)
+        self.assertFalse(cfg.wechat_enabled)
+        self.assertTrue(cfg.qq_enabled)
+        self.assertEqual(cfg.qq_app_secret, "secret")
+        self.assertTrue(state["applied"])
+        self.assertFalse(state["restart_required"])
+        self.assertTrue(state["connect"]["ok"])
+        self.assertEqual(state["connect"]["adapters"][0]["platform"], "qq")
+
+    def test_build_adapters_can_enable_both_terminals(self):
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(wechat_enabled=True, qq_enabled=True, qq_app_id="a")
+        api = self._api(cfg, None, self._engine())
+        wechat = SimpleNamespace(platform="wechat")
+        qq = SimpleNamespace(platform="qq")
+
+        with mock.patch.object(desktop, "WeChatAdapter", lambda *a: wechat), \
+             mock.patch.object(desktop, "QQBotAdapter", lambda *a: qq):
+            adapters = api._build_adapters(cfg)
+
+        self.assertEqual([item.platform for item in adapters], ["wechat", "qq"])
+
+    def test_build_adapters_respects_single_terminal(self):
+        from lingyu.bot import BotConfig
+
+        api = self._api(BotConfig(), None, self._engine())
+        qq = SimpleNamespace(platform="qq")
+        with mock.patch.object(desktop, "QQBotAdapter", lambda *a: qq):
+            adapters = api._build_adapters(
+                BotConfig(wechat_enabled=False, qq_enabled=True)
+            )
+        self.assertEqual([item.platform for item in adapters], ["qq"])
+
+    def test_test_binding_uses_saved_secret_when_blank(self):
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(platform="qq", qq_app_id="appid", qq_app_secret="saved")
+        captured: dict = {}
+
+        class _FakeQQ:
+            def __init__(self, adapter_config, **kwargs):
+                captured["config"] = adapter_config
+
+            @staticmethod
+            async def probe():
+                return {"ok": True, "gateway": "wss://api.bot.qq.com/websocket/"}
+
+            @staticmethod
+            async def disconnect():
+                return None
+
+        api = self._api(cfg, None, self._engine())
+        with mock.patch.object(desktop, "QQBotAdapter", _FakeQQ):
+            result = asyncio.run(
+                api._test_qq_binding_async({"qq_app_id": "new-id", "qq_app_secret": ""})
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["config"].platform, "qq")
+        self.assertEqual(captured["config"].qq_app_id, "new-id")
+        self.assertEqual(captured["config"].qq_app_secret, "saved")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from lingyu.adapters.wechat import (
     WeChatAdapter,
     _looks_like_chat_id,
 )
-from lingyu.bot import BotConfig, BotEngine, get_persona, reset_persona
+from lingyu.bot import BotConfig, BotEngine
 from lingyu.bot import browser as browser_mod
 from lingyu.bot import douyin as douyin_mod
 from lingyu.bot import xiaohongshu as xhs_mod
@@ -37,6 +37,43 @@ from lingyu.schemas import (
     SendStatus,
     StatusResult,
 )
+
+
+async def _no_wait(_seconds: float) -> None:
+    """测试用的「不等待」：发送节奏的数值由 pacing 的用例单独覆盖。"""
+    return None
+
+
+class _EmotionIsolation:
+    """每个用例一套独立的情绪状态目录。
+
+    情绪状态是**跨轮持久**的（同一会话越聊越有情绪），共用一个目录会让上一个
+    用例的心情影响下一个用例——表现是「同一个用例单跑能过、连跑就挂」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._emotion_dir = tempfile.mkdtemp(prefix="lingyu-emotion-")
+        os.environ["WECHAT_BOT_EMOTION_DIR"] = self._emotion_dir
+        # 情绪决定的发送停顿最长 8 秒，真等会把用例拖成分钟级。
+        # 换成「不等」，停顿数值另有用例断言（见 EmotionFlowTests）。
+        self._sleep_patch = mock.patch.object(engine_mod, "_sleep", _no_wait)
+        self._sleep_patch.start()
+
+    def tearDown(self):
+        self._sleep_patch.stop()
+        os.environ.pop("WECHAT_BOT_EMOTION_DIR", None)
+        shutil.rmtree(self._emotion_dir, ignore_errors=True)
+        super().tearDown()
+
+
+class EngineTestCase(_EmotionIsolation, unittest.TestCase):
+    """带情绪状态隔离的同步用例基类。"""
+
+
+class AsyncEngineTestCase(_EmotionIsolation, unittest.IsolatedAsyncioTestCase):
+    """带情绪状态隔离的异步用例基类。"""
+
 
 
 # 链接服务默认只放行「媒体站点」链接（购物/新闻等普通网页不解析、不提示），
@@ -146,7 +183,7 @@ class FakeLLM:
         return self.reply
 
 
-class ConfigTests(unittest.TestCase):
+class ConfigTests(EngineTestCase):
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bot.json"
@@ -176,26 +213,9 @@ class ConfigTests(unittest.TestCase):
             self.assertIsInstance(BotConfig.load(path), BotConfig)
 
 
-class PersonaTests(unittest.TestCase):
-    def test_default_is_empty(self):
-        self.assertEqual(get_persona(BotConfig()), "")
-
-    def test_custom(self):
-        cfg = BotConfig(persona_custom="你是一只猫。")
-        self.assertEqual(get_persona(cfg), "你是一只猫。")
-
-    def test_blank_custom_falls_back_to_empty(self):
-        self.assertEqual(get_persona(BotConfig(persona_custom="   ")), "")
-
-    def test_reset(self):
-        cfg = BotConfig(persona_custom="X")
-        reset_persona(cfg)
-        self.assertEqual(cfg.persona_custom, "")
-        self.assertEqual(get_persona(cfg), "")
-
-
-class TriggerTests(unittest.TestCase):
+class TriggerTests(EngineTestCase):
     def setUp(self):
+        super().setUp()
         self.adapter = FakeAdapter(names={"小深"})
         self.engine = BotEngine(self.adapter, BotConfig())
 
@@ -244,26 +264,22 @@ class TriggerTests(unittest.TestCase):
         )
 
     def test_continuation_after_reply(self):
-        engine = BotEngine(self.adapter, BotConfig(continuation_seconds=120.0))
+        engine = BotEngine(self.adapter, BotConfig())
         engine._last_reply_to["测试群"] = ("张三", time.time())
-        # 刚被回复过的张三继续发言 → 接着回
+        # 上一次被回的就是张三，他接着说 → 进内核（由情绪决定接不接）
         self.assertTrue(
             engine._should_reply(make_record(sender="张三", content="补充一句"))
         )
-        # 没被回复过的李四发言 → 不回
+        # 没被回复过的李四发言 → 不算在跟我说话
         self.assertFalse(
             engine._should_reply(make_record(sender="李四", content="我也说"))
         )
 
-    def test_continuation_disabled(self):
-        engine = BotEngine(self.adapter, BotConfig(continuation_seconds=0.0))
-        engine._last_reply_to["测试群"] = ("张三", time.time())
-        self.assertFalse(engine._should_reply(make_record(sender="张三")))
-
-    def test_continuation_expired(self):
-        engine = BotEngine(self.adapter, BotConfig(continuation_seconds=30.0))
-        engine._last_reply_to["测试群"] = ("张三", time.time() - 60)
-        self.assertFalse(engine._should_reply(make_record(sender="张三")))
+    def test_continuation_has_no_time_window(self):
+        """「隔了三个小时才回上一句」不该被宿主挡掉，那是内核的判断。"""
+        engine = BotEngine(self.adapter, BotConfig())
+        engine._last_reply_to["测试群"] = ("张三", time.time() - 3 * 3600)
+        self.assertTrue(engine._should_reply(make_record(sender="张三")))
 
     def test_explain_no_reply_prints_bot_nickname(self):
         """群里没 @ 到机器人时给一行可读原因，并打出机器人当前昵称。"""
@@ -298,67 +314,39 @@ class TriggerTests(unittest.TestCase):
         self.assertIn("触发已关闭", lines[0])
 
 
-class MessageBuildTests(unittest.TestCase):
+class RecentContextTests(EngineTestCase):
+    """送给情绪引擎的「最近几轮对话」：带发言人、不含当前这条、受条数上限约束。"""
+
     def test_group_prefix_and_assistant(self):
-        adapter = FakeAdapter()
-        engine = BotEngine(
-            adapter, BotConfig(context_messages=10, persona_custom="人设")
-        )
-        r1 = make_record(content="第一句")
-        engine._record_inbound(r1)
+        engine = BotEngine(FakeAdapter(), BotConfig(context_messages=10))
+        engine._record_inbound(make_record(content="第一句"))
         engine._record_assistant("测试群", "回复一")
-        r2 = make_record(content="第二句")
-        engine._record_inbound(r2)
-        messages = engine._build_messages("测试群")
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("张三: 第一句", messages[1]["content"])
-        self.assertEqual(messages[2]["role"], "assistant")
-        self.assertEqual(messages[2]["content"], "回复一")
-        # 最后一条（触发消息）带「待回复」标记
-        self.assertEqual(messages[3]["content"], "[待回复] 张三: 第二句")
+        engine._record_inbound(make_record(content="第二句"))
+        lines = engine._recent_lines("测试群")
+        # 当前这条（第二句）已经在历史里，但不能重复喂给引擎。
+        self.assertEqual(lines, ["张三: 第一句", "我: 回复一"])
 
     def test_private_no_prefix(self):
-        adapter = FakeAdapter()
-        engine = BotEngine(adapter, BotConfig(persona_custom="人设"))
-        engine._record_inbound(
-            make_record(is_group=False, chat="朋友", sender="朋友")
-        )
-        messages = engine._build_messages("朋友")
-        self.assertEqual(messages[1]["content"], "[待回复] 你好")
+        engine = BotEngine(FakeAdapter(), BotConfig())
+        engine._record_inbound(make_record(is_group=False, chat="朋友", sender="朋友"))
+        engine._record_inbound(make_record(is_group=False, chat="朋友", sender="朋友"))
+        self.assertEqual(engine._recent_lines("朋友"), ["你好"])
 
     def test_context_limit(self):
-        adapter = FakeAdapter()
-        engine = BotEngine(
-            adapter, BotConfig(context_messages=2, persona_custom="人设")
-        )
+        engine = BotEngine(FakeAdapter(), BotConfig(context_messages=2))
         for i in range(5):
             engine._record_inbound(make_record(content=f"m{i}"))
-        messages = engine._build_messages("测试群")
-        # system + 仅 2 条历史
-        self.assertEqual(len(messages), 3)
-        self.assertIn("m3", messages[1]["content"])
-        self.assertIn("m4", messages[2]["content"])
+        lines = engine._recent_lines("测试群")
+        # 触发消息 m4 被排除，只剩上限内的一条历史
+        self.assertEqual(lines, ["张三: m3"])
 
-    def test_default_persona_not_injected(self):
-        engine = BotEngine(FakeAdapter(), BotConfig())
-        engine._record_inbound(make_record())
-        messages = engine._build_messages("测试群")
-        # 仅有「行为约束」这一条 system，不含任何角色人设
-        self.assertEqual(len(messages), 2)
-        self.assertNotIn("鲸鱼娘", messages[0]["content"])
-        self.assertIn("待回复", messages[0]["content"])
-        self.assertIn("纯文本", messages[0]["content"])
-        self.assertEqual(messages[1]["content"], "[待回复] 张三: 你好")
-
-    def test_custom_persona_appended_to_system(self):
-        engine = BotEngine(FakeAdapter(), BotConfig(persona_custom="你是一只猫。"))
-        engine._record_inbound(make_record())
-        messages = engine._build_messages("测试群")
-        self.assertIn("待回复", messages[0]["content"])
-        self.assertIn("你是一只猫。", messages[0]["content"])
+    def test_vision_disabled_no_images(self):
+        engine = BotEngine(FakeAdapter(), BotConfig(vision_enabled=False))
+        engine._record_inbound(make_record(content="[图片]"))
+        self.assertEqual(engine._image_uris("测试群"), [])
 
 
-class LLMClientTests(unittest.IsolatedAsyncioTestCase):
+class LLMClientTests(AsyncEngineTestCase):
     async def test_missing_key(self):
         with self.assertRaises(LLMError) as ctx:
             await LLMClient(BotConfig(api_key="")).chat(
@@ -397,15 +385,10 @@ class LLMClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.code, "empty_response")
 
 
-class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
+class EngineFlowTests(AsyncEngineTestCase):
     async def test_end_to_end(self):
         adapter = FakeAdapter()
-        cfg = BotConfig(
-            enabled=True,
-            cooldown_seconds=0.0,
-            persona_custom="人设",
-            reply_probability=1.0,
-        )
+        cfg = BotConfig(enabled=True)
         fake_llm = FakeLLM(cfg)
         engine = BotEngine(
             adapter, cfg, llm_factory=lambda c: fake_llm
@@ -423,7 +406,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_untriggered_group_message_is_explained_in_log(self):
         """端到端：群里没 @ 到机器人 → 不回复，但日志里能看到原因与机器人昵称。"""
         adapter = FakeAdapter(names={"小助手"})
-        cfg = BotConfig(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        cfg = BotConfig(enabled=True)
         engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
         await engine.start()
         await adapter.dispatch(make_record(content="@群助手 在吗", message_id="m1"))
@@ -437,19 +420,15 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_continuation_replies_without_at(self):
         adapter = FakeAdapter()
-        cfg = BotConfig(
-            enabled=True,
-            cooldown_seconds=0.0,
-            persona_custom="人设",
-            reply_probability=1.0,
-        )
+        cfg = BotConfig(enabled=True)
         engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
         await adapter.pump()
         self.assertEqual(engine._last_reply_to.get("测试群", ("", 0))[0], "张三")
-        # 张三随后没有 @ 的补充发言也应被接着回复
+        # 张三过一会儿（不是连发）再补一句、且没 @ 机器人，也应进内核
         adapter.sent.clear()
+        engine._last_cycle_at.clear()
         await adapter.dispatch(
             make_record(sender="张三", content="再补一句", message_id="m2")
         )
@@ -457,11 +436,14 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.sent), 1)
         await engine.stop()
 
-    async def test_cooldown_blocks_second(self):
+    async def test_burst_merge_skips_second(self):
+        """连发合并：刚跑完一轮，两秒内又来一条，算同一句话的补充。
+
+        这是防抖，不是「回复间隔」——间隔由情绪决定（见 PacingTests）。
+        """
         adapter = FakeAdapter()
-        cfg = BotConfig(enabled=True, cooldown_seconds=60.0, reply_probability=1.0)
         engine = BotEngine(
-            adapter, cfg, llm_factory=lambda c: FakeLLM(c)
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
         )
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
@@ -473,7 +455,7 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_untriggered_no_reply(self):
         adapter = FakeAdapter()
-        cfg = BotConfig(enabled=True, persona_custom="人设", reply_probability=1.0)
+        cfg = BotConfig(enabled=True)
         engine = BotEngine(
             adapter, cfg, llm_factory=lambda c: FakeLLM(c)
         )
@@ -482,11 +464,12 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
         await adapter.pump()
         self.assertEqual(adapter.sent, [])
         # 但上下文已记录，触发时可见
-        messages = engine._build_messages("测试群")
-        self.assertEqual(len(messages), 2)  # system + 1 条
+        self.assertEqual(engine._recent_lines("测试群"), [])
         await engine.stop()
 
-    async def test_llm_failure_no_send(self):
+    async def test_llm_failure_falls_back_to_rules(self):
+        """模型调用失败不再「一声不吭」：降级到规则版回一句，并把原因写进日志。"""
+
         class BrokenLLM:
             def __init__(self, config): pass
 
@@ -495,138 +478,105 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
 
         adapter = FakeAdapter()
         engine = BotEngine(
-            adapter, BotConfig(enabled=True, reply_probability=1.0), llm_factory=BrokenLLM
+            adapter, BotConfig(enabled=True), llm_factory=BrokenLLM
         )
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
         await adapter.pump()
-        self.assertEqual(adapter.sent, [])
-        self.assertEqual(engine.reply_count_today, 0)
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(engine.reply_count_today, 1)
         self.assertTrue(
             any("bad key" in line["message"] for line in engine.get_logs())
         )
         await engine.stop()
 
 
-class HumanizeConfigTests(unittest.TestCase):
-    """拟人化配置的默认值与范围纠正。"""
+class EmotionFlowTests(AsyncEngineTestCase):
+    """情绪引擎在完整链路中的行为：说话、沉默、按情绪拆条。"""
 
-    def test_defaults_on(self):
-        cfg = BotConfig()
-        self.assertTrue(cfg.humanize)
-        self.assertTrue(cfg.split_replies)
-        self.assertEqual(cfg.split_max_parts, 3)
+    LONG_REPLY = "你好呀。今天天气不错。要不要一起出去走走？我这边正好有空。"
 
-    def test_probability_clamped(self):
-        self.assertEqual(
-            BotConfig.from_dict({"reply_probability": 5}).reply_probability, 1.0
-        )
-        self.assertEqual(
-            BotConfig.from_dict({"reply_probability": -1}).reply_probability, 0.0
-        )
-
-    def test_split_bounds(self):
-        cfg = BotConfig.from_dict(
-            {"split_max_parts": 0, "split_delay_min": 2, "split_delay_max": 0}
-        )
-        self.assertEqual(cfg.split_max_parts, 1)
-        self.assertEqual(cfg.split_delay_min, 2.0)
-        self.assertEqual(cfg.split_delay_max, 2.0)  # 上限不低于下限
-
-    def test_roundtrip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "bot.json"
-            BotConfig(humanize=False, reply_probability=0.5).save(path)
-            loaded = BotConfig.load(path)
-            self.assertFalse(loaded.humanize)
-            self.assertEqual(loaded.reply_probability, 0.5)
-
-
-class SplitReplyTests(unittest.TestCase):
-    """分条发送：只切分不丢内容，且受条数上限约束。"""
-
-    @staticmethod
-    def _engine(**kwargs) -> BotEngine:
-        return BotEngine(FakeAdapter(), BotConfig(**kwargs))
-
-    def test_empty(self):
-        self.assertEqual(self._engine()._split_reply(""), [])
-
-    def test_short_reply_single(self):
-        self.assertEqual(self._engine()._split_reply("好的"), ["好的"])
-
-    def test_disabled_returns_single(self):
-        engine = self._engine(humanize=False)
-        long = "第一句。第二句。第三句。第四句。第五句。"
-        self.assertEqual(engine._split_reply(long), [long])
-
-    def test_split_long_reply_preserves_content(self):
-        engine = self._engine(split_min_length=10, split_max_parts=3)
-        reply = "你好呀。今天天气不错！要不要一起出去走走？我这边正好有空。"
-        parts = engine._split_reply(reply)
-        self.assertGreater(len(parts), 1)
-        self.assertLessEqual(len(parts), 3)
-        self.assertEqual("".join(parts), reply)
-        self.assertTrue(all(p.strip() for p in parts))
-
-    def test_split_respects_max_parts(self):
-        engine = self._engine(split_min_length=5, split_max_parts=2)
-        reply = "一。二。三。四。五。六。"
-        parts = engine._split_reply(reply)
-        self.assertEqual(len(parts), 2)
-        self.assertEqual("".join(parts), reply)
-
-    def test_no_sentence_boundary_kept_whole(self):
-        engine = self._engine(split_min_length=5, split_max_parts=3)
-        reply = "a" * 80  # 无句末标点，无法自然拆分
-        self.assertEqual(engine._split_reply(reply), [reply])
-
-
-class HumanizeFlowTests(unittest.IsolatedAsyncioTestCase):
-    """拟人化在完整链路中的行为：概率、分条、总开关。"""
-
-    LONG_REPLY = "你好呀。今天天气不错！要不要一起出去走走？我这边正好有空。"
-
-    async def test_probability_zero_never_replies(self):
+    async def test_always_replies_when_emotion_speaks(self):
+        """内核给出话就一定发出去——「回不回」不掷骰子。"""
         adapter = FakeAdapter()
-        cfg = BotConfig(enabled=True, cooldown_seconds=0.0, reply_probability=0.0)
-        engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
+        engine = BotEngine(
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+        await engine.start()
+        await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
+        await adapter.pump()
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(engine.reply_count_today, 1)
+        await engine.stop()
+
+    async def test_silent_decision_sends_nothing(self):
+        """内核判定这一轮不发声时，一条消息都不发。"""
+        from lingyu.bot.emotion import EmotionDecision
+
+        adapter = FakeAdapter()
+        engine = BotEngine(
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+
+        async def _silent(**_kwargs):
+            return EmotionDecision(silent=True, reason="调节要求收着")
+
+        engine._emotion.respond = _silent  # type: ignore[method-assign]
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
         await adapter.pump()
         self.assertEqual(adapter.sent, [])
         self.assertEqual(engine.reply_count_today, 0)
+        self.assertTrue(
+            any("不发声" in line["message"] for line in engine.get_logs())
+        )
         await engine.stop()
 
-    async def test_split_sends_multiple_messages(self):
+    @staticmethod
+    def _decide(engine, text, *, activation, intensity, strategy):
+        """把情绪结论换成固定节奏，专测「发送」这一段而不掺内核判断。"""
+        from lingyu.bot.emotion import EmotionDecision, pacing_plan
+
+        async def _respond(**_kwargs):
+            return EmotionDecision(
+                text=text,
+                kind="message",
+                reason="测试",
+                pacing=pacing_plan(
+                    text,
+                    activation=activation,
+                    intensity=intensity,
+                    strategy=strategy,
+                ),
+            )
+
+        engine._emotion.respond = _respond  # type: ignore[method-assign]
+
+    async def test_high_activation_splits_into_parts(self):
+        """高唤醒 + 强度够 → 拆成几条连发，拼回去仍是原文。"""
         adapter = FakeAdapter()
-        cfg = BotConfig(
-            enabled=True,
-            cooldown_seconds=0.0,
-            reply_probability=1.0,
-            split_min_length=10,
-            split_max_parts=3,
-            split_delay_min=0.0,
-            split_delay_max=0.0,
-        )
         engine = BotEngine(
-            adapter, cfg, llm_factory=lambda c: FakeLLM(c, reply=self.LONG_REPLY)
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+        self._decide(
+            engine, self.LONG_REPLY, activation=0.85, intensity=0.6, strategy="share"
         )
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
         await adapter.pump()
         self.assertGreater(len(adapter.sent), 1)
-        self.assertEqual(
-            "".join(text for _, text in adapter.sent), self.LONG_REPLY
-        )
+        self.assertEqual("".join(text for _, text in adapter.sent), self.LONG_REPLY)
         self.assertEqual(engine.reply_count_today, 1)
         await engine.stop()
 
-    async def test_humanize_off_single_message(self):
+    async def test_low_activation_sends_one_message(self):
+        """低唤醒 → 一整段说完（人低落时话是连着的）。"""
         adapter = FakeAdapter()
-        cfg = BotConfig(enabled=True, cooldown_seconds=0.0, humanize=False)
         engine = BotEngine(
-            adapter, cfg, llm_factory=lambda c: FakeLLM(c, reply=self.LONG_REPLY)
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+        self._decide(
+            engine, self.LONG_REPLY, activation=0.15, intensity=0.2, strategy="hold"
         )
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
@@ -634,103 +584,23 @@ class HumanizeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent, [("测试群", self.LONG_REPLY)])
         await engine.stop()
 
-
-class QuietHoursTests(unittest.TestCase):
-    """静默时段判定（含跨零点）。"""
-
-    @staticmethod
-    def _engine(**kwargs) -> BotEngine:
-        return BotEngine(FakeAdapter(), BotConfig(**kwargs))
-
-    @staticmethod
-    def _at(hour: int, minute: int) -> float:
-        return time.mktime((2026, 1, 1, hour, minute, 0, 0, 0, -1))
-
-    def test_disabled(self):
-        self.assertFalse(self._engine()._in_quiet_hours(self._at(3, 0)))
-
-    def test_same_start_end_disabled(self):
-        engine = self._engine(
-            quiet_hours_enabled=True,
-            quiet_hours_start="08:00",
-            quiet_hours_end="08:00",
+    async def test_lead_delay_is_skipped_when_zero(self):
+        """lead=0 时不该有额外等待（低唤醒、share 的常见情形）。"""
+        adapter = FakeAdapter()
+        engine = BotEngine(
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
         )
-        self.assertFalse(engine._in_quiet_hours(self._at(8, 0)))
-
-    def test_invalid_format_ignored(self):
-        engine = self._engine(
-            quiet_hours_enabled=True,
-            quiet_hours_start="25:00",
-            quiet_hours_end="08:00",
-        )
-        self.assertFalse(engine._in_quiet_hours(self._at(3, 0)))
-
-    def test_normal_range(self):
-        engine = self._engine(
-            quiet_hours_enabled=True,
-            quiet_hours_start="09:00",
-            quiet_hours_end="17:00",
-        )
-        self.assertTrue(engine._in_quiet_hours(self._at(10, 0)))
-        self.assertFalse(engine._in_quiet_hours(self._at(18, 0)))
-        self.assertFalse(engine._in_quiet_hours(self._at(8, 59)))
-
-    def test_wraps_midnight(self):
-        engine = self._engine(
-            quiet_hours_enabled=True,
-            quiet_hours_start="23:00",
-            quiet_hours_end="08:00",
-        )
-        self.assertTrue(engine._in_quiet_hours(self._at(23, 30)))
-        self.assertTrue(engine._in_quiet_hours(self._at(2, 0)))
-        self.assertFalse(engine._in_quiet_hours(self._at(12, 0)))
+        self._decide(engine, "好。", activation=0.2, intensity=0.1, strategy="share")
+        await engine.start()
+        await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
+        await adapter.pump()
+        self.assertEqual(len(adapter.sent), 1)
+        await engine.stop()
 
 
-class GroupRateLimitTests(unittest.TestCase):
-    """群级节流：窗口内超过上限即静默。"""
 
-    @staticmethod
-    def _engine(**kwargs) -> BotEngine:
-        return BotEngine(FakeAdapter(), BotConfig(**kwargs))
-
-    def test_disabled(self):
-        engine = self._engine(group_rate_enabled=False)
-        engine._note_reply("群", now=1000.0)
-        self.assertFalse(engine._rate_limited("群", 1001.0))
-
-    def test_under_then_at_limit(self):
-        engine = self._engine(
-            group_rate_enabled=True,
-            group_rate_window_minutes=30,
-            group_rate_max_replies=2,
-        )
-        engine._note_reply("群", now=1000.0)
-        self.assertFalse(engine._rate_limited("群", 1001.0))
-        engine._note_reply("群", now=1002.0)
-        self.assertTrue(engine._rate_limited("群", 1003.0))
-
-    def test_window_expiry(self):
-        engine = self._engine(
-            group_rate_enabled=True,
-            group_rate_window_minutes=1,
-            group_rate_max_replies=1,
-        )
-        engine._note_reply("群", now=1000.0)
-        self.assertTrue(engine._rate_limited("群", 1030.0))
-        self.assertFalse(engine._rate_limited("群", 1061.0))
-
-    def test_zero_limit_unlimited(self):
-        engine = self._engine(
-            group_rate_enabled=True,
-            group_rate_window_minutes=30,
-            group_rate_max_replies=0,
-        )
-        engine._note_reply("群", now=1000.0)
-        self.assertFalse(engine._rate_limited("群", 1001.0))
-
-
-class ProactiveTests(unittest.IsolatedAsyncioTestCase):
-    """偶发参与：候选筛选、概率、[SILENT] 哨兵与冷却。"""
+class ProactiveTests(AsyncEngineTestCase):
+    """重新开口：候选筛选（最后一句是我说的 + 沉默够久）、冷却与沉默。"""
 
     @staticmethod
     def _recent_group(**kwargs):
@@ -741,121 +611,137 @@ class ProactiveTests(unittest.IsolatedAsyncioTestCase):
         return record
 
     def _make(self, adapter, llm, **cfg_kwargs) -> BotEngine:
-        options = dict(
-            enabled=True,
-            humanize=False,
-            continuation_seconds=0.0,
-            group_rate_enabled=False,
-            proactive_enabled=True,
-            proactive_probability=1.0,
-            proactive_recent_seconds=600.0,
-            proactive_per_group_cooldown=0.0,
-        )
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         return BotEngine(adapter, BotConfig(**options), llm_factory=lambda c: llm)
 
-    def test_default_off(self):
-        self.assertFalse(BotConfig().proactive_enabled)
+    @staticmethod
+    def _age_last(engine, key: str, hours: float) -> None:
+        """把会话最后一条的时间往前拨，模拟「已经安静了这么久」。"""
+        stamp = time.time() - hours * 3600.0
+        engine._history[key][-1].timestamp = stamp
+        for meta in engine._reopen_meta.values():
+            if str(meta.get("chat_id") or "") == key:
+                # 入站略早于出站：先把整段对话往前拨，再让沉默从「我最后一句」算起。
+                meta["last_inbound_at"] = stamp - 1.0
+                meta["last_outbound_at"] = stamp
+
+    @staticmethod
+    def _speak_last(engine, record, reply: str) -> None:
+        """记录「我说的最后一句」，带上 record 才会登记重开元数据。"""
+        engine._record_assistant(record.chat, reply, record=record)
 
     async def test_no_candidates_no_send(self):
         adapter = FakeAdapter()
         engine = self._make(adapter, FakeLLM(BotConfig()))
-        await engine._proactive_tick()
+        await engine._reopen_tick()
         self.assertEqual(adapter.sent, [])
 
-    async def test_speaks_when_eligible(self):
+    async def test_reopens_when_quiet_long_enough(self):
         adapter = FakeAdapter()
-        engine = self._make(adapter, FakeLLM(BotConfig(), reply="哈哈确实"))
-        engine._record_inbound(self._recent_group())
-        await engine._proactive_tick()
-        self.assertEqual(adapter.sent, [("水群", "哈哈确实")])
+        engine = self._make(adapter, FakeLLM(BotConfig(), reply="最近还好吗"))
+        record = self._recent_group()
+        engine._record_inbound(record)
+        self._speak_last(engine, record, "那我先不打扰了")
+        self._age_last(engine, "水群", 8.0)
+        await engine._reopen_tick()
+        # 安静超过身份文件的 silence_reopen_hours，内核才会主动开一次口。
+        self.assertEqual(len(adapter.sent), 1)
         self.assertEqual(engine.reply_count_today, 1)
 
-    async def test_silent_sentinel_skips_send(self):
-        adapter = FakeAdapter()
-        engine = self._make(adapter, FakeLLM(BotConfig(), reply="[SILENT]"))
-        engine._record_inbound(self._recent_group())
-        await engine._proactive_tick()
-        self.assertEqual(adapter.sent, [])
-        self.assertEqual(engine.reply_count_today, 0)
-
-    async def test_probability_zero_never_speaks(self):
-        adapter = FakeAdapter()
-        engine = self._make(
-            adapter, FakeLLM(BotConfig(), reply="在的"), proactive_probability=0.0
-        )
-        engine._record_inbound(self._recent_group())
-        await engine._proactive_tick()
-        self.assertEqual(adapter.sent, [])
-
-    async def test_bot_spoke_last_skips(self):
+    async def test_bot_has_not_spoken_last_skips(self):
         adapter = FakeAdapter()
         engine = self._make(adapter, FakeLLM(BotConfig(), reply="在的"))
         engine._record_inbound(self._recent_group())
-        engine._record_assistant("水群", "我先说一句")
-        await engine._proactive_tick()
+        self._age_last(engine, "水群", 8.0)
+        await engine._reopen_tick()
         self.assertEqual(adapter.sent, [])
 
-    async def test_per_group_cooldown_blocks(self):
+    async def test_not_quiet_long_enough_skips(self):
         adapter = FakeAdapter()
-        engine = self._make(
-            adapter,
-            FakeLLM(BotConfig(), reply="在的"),
-            proactive_per_group_cooldown=3600.0,
-        )
-        engine._record_inbound(self._recent_group())
-        await engine._proactive_tick()
-        self.assertEqual(len(adapter.sent), 1)
-        await engine._proactive_tick()
-        self.assertEqual(len(adapter.sent), 1)
-
-    async def test_stale_group_skipped(self):
-        adapter = FakeAdapter()
-        engine = self._make(
-            adapter, FakeLLM(BotConfig(), reply="在的"), proactive_recent_seconds=10.0
-        )
+        engine = self._make(adapter, FakeLLM(BotConfig(), reply="在的"))
         record = self._recent_group()
-        record.timestamp = time.time() - 3600
         engine._record_inbound(record)
-        await engine._proactive_tick()
+        self._speak_last(engine, record, "刚说完")
+        self._age_last(engine, "水群", 0.5)
+        await engine._reopen_tick()
         self.assertEqual(adapter.sent, [])
 
+    async def test_silent_decision_skips_send(self):
+        """内核判定「已经问过一次，不再重复追问」时不发任何消息。"""
+        from lingyu.bot.emotion import EmotionDecision
 
-class SilenceFlowTests(unittest.IsolatedAsyncioTestCase):
-    """静默时段 / 群级节流在完整链路中阻断回复。"""
-
-    async def test_quiet_hours_blocks_reply(self):
         adapter = FakeAdapter()
-        now = time.time()
-        start = time.strftime("%H:%M", time.localtime(now - 3600))
-        end = time.strftime("%H:%M", time.localtime(now + 3600))
-        cfg = BotConfig(
-            enabled=True,
-            cooldown_seconds=0.0,
-            reply_probability=1.0,
-            quiet_hours_enabled=True,
-            quiet_hours_start=start,
-            quiet_hours_end=end,
+        engine = self._make(adapter, FakeLLM(BotConfig(), reply="在的"))
+        record = self._recent_group()
+        engine._record_inbound(record)
+        self._speak_last(engine, record, "我先说一句")
+        self._age_last(engine, "水群", 8.0)
+
+        async def _silent(**_kwargs):
+            return EmotionDecision(silent=True, reason="已经重新开口过一次")
+
+        engine._emotion.reopen = _silent  # type: ignore[method-assign]
+        await engine._reopen_tick()
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(engine.reply_count_today, 0)
+
+    async def test_eval_gap_blocks_repeated_ticks(self):
+        """同一段沉默不必每 5 分钟问内核一次：评估间隔是防抖，不是「多久回」。"""
+        adapter = FakeAdapter()
+        engine = self._make(adapter, FakeLLM(BotConfig(), reply="在的"))
+        record = self._recent_group()
+        engine._record_inbound(record)
+        self._speak_last(engine, record, "我先说一句")
+        self._age_last(engine, "水群", 8.0)
+        await engine._reopen_tick()
+        self.assertEqual(len(adapter.sent), 1)
+        # 评估间隔内即使更安静了也不会重复打扰
+        self._age_last(engine, "水群", 9.0)
+        await engine._reopen_tick()
+        self.assertEqual(len(adapter.sent), 1)
+
+    async def test_quiet_enough_is_decided_by_kernel(self):
+        """宿主不用「安静几小时」挡人：0.5 小时也进内核，由身份文件说还没到时候。"""
+        adapter = FakeAdapter()
+        engine = self._make(adapter, FakeLLM(BotConfig(), reply="在的"))
+        record = self._recent_group()
+        engine._record_inbound(record)
+        self._speak_last(engine, record, "刚说完")
+        self._age_last(engine, "水群", 0.5)
+        await engine._reopen_tick()
+        self.assertEqual(adapter.sent, [])
+        self.assertTrue(
+            any("不发声" in line["message"] for line in engine.get_logs())
         )
-        engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
+
+
+class NoHostGatesTests(AsyncEngineTestCase):
+    """宿主不再有「静默时段 / 群级节流 / 冷却」这些闸门。
+
+    这些以前是「多久回」的配置项，现在都在内核里：深夜由 regulation 判断，
+    是否收着说由情绪决定。这里钉住「宿主不会再拦人」——拦住就等于又回到了
+    「过点就不理」的机器。
+    """
+
+    async def test_no_quiet_hours_gate(self):
+        adapter = FakeAdapter()
+        engine = BotEngine(
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+        # 以前这个时刻会被静默时段挡住；现在照常进内核并回一句。
         await engine.start()
         await adapter.dispatch(make_record(is_at_me=True, message_id="m1"))
         await adapter.pump()
-        self.assertEqual(adapter.sent, [])
+        self.assertEqual(len(adapter.sent), 1)
         await engine.stop()
 
-    async def test_group_rate_limit_blocks_after_max(self):
+    async def test_no_group_rate_gate(self):
+        """两个不同的人先后 @ 它，都要进内核（不再被「群里回过几条」挡）。"""
         adapter = FakeAdapter()
-        cfg = BotConfig(
-            enabled=True,
-            cooldown_seconds=0.0,
-            reply_probability=1.0,
-            continuation_seconds=0.0,
-            group_rate_enabled=True,
-            group_rate_window_minutes=30.0,
-            group_rate_max_replies=1,
+        engine = BotEngine(
+            adapter, BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
         )
-        engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
         await engine.start()
         await adapter.dispatch(
             make_record(is_at_me=True, sender="张三", message_id="m1")
@@ -865,8 +751,23 @@ class SilenceFlowTests(unittest.IsolatedAsyncioTestCase):
             make_record(is_at_me=True, sender="李四", message_id="m2")
         )
         await adapter.pump()
-        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(len(adapter.sent), 2)
         await engine.stop()
+
+    def test_removed_knobs_are_gone(self):
+        """这些字段删掉就别再加回来：它们都该由情绪决定。"""
+        for name in (
+            "reply_probability", "cooldown_seconds", "continuation_seconds",
+            "humanize", "split_replies", "split_max_parts", "split_min_length",
+            "split_delay_min", "split_delay_max", "quiet_hours_enabled",
+            "quiet_hours_start", "quiet_hours_end", "group_rate_enabled",
+            "group_rate_window_minutes", "group_rate_max_replies",
+            "reopen_after_hours", "proactive_interval_min",
+            "proactive_interval_max", "proactive_per_group_cooldown",
+            "persona_custom",
+        ):
+            self.assertNotIn(name, BotConfig.__dataclass_fields__, name)
+
 
 
 class _FakeDB:
@@ -893,7 +794,7 @@ class _FakeBridge:
 ROOM_ID = "43081897466@chatroom"
 
 
-class ChatIdentityTests(unittest.TestCase):
+class ChatIdentityTests(EngineTestCase):
     """会话识别改为「ID 为稳定标识、发送前反查显示名」。"""
 
     def test_looks_like_chat_id(self):
@@ -967,7 +868,7 @@ class ChatIdentityTests(unittest.TestCase):
         self.assertEqual(record.chat_id, ROOM_ID)
 
 
-class SendTargetTests(unittest.IsolatedAsyncioTestCase):
+class SendTargetTests(AsyncEngineTestCase):
     """发送目标为会话 ID 时：能反查就发显示名，查不到就明确失败。"""
 
     async def test_unresolved_id_rejected(self):
@@ -1023,7 +924,7 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.resolve_chat_identifier(ROOM_ID), "玩什么游戏？")
 
 
-class ChatIdScopeTests(unittest.TestCase):
+class ChatIdScopeTests(EngineTestCase):
     """群范围过滤同时接受群名与会话 ID；历史分桶以 ID 为准。"""
 
     def test_scope_accepts_chat_id(self):
@@ -1034,12 +935,14 @@ class ChatIdScopeTests(unittest.TestCase):
         self.assertTrue(engine._should_reply(record))
 
     def test_history_bucket_keyed_by_chat_id(self):
-        engine = BotEngine(FakeAdapter(), BotConfig(persona_custom="人设"))
+        engine = BotEngine(FakeAdapter(), BotConfig())
         engine._record_inbound(make_record(chat=ROOM_ID, chat_id=ROOM_ID))
-        self.assertEqual(len(engine._build_messages(ROOM_ID)), 2)  # system + 1
+        engine._record_inbound(make_record(chat=ROOM_ID, chat_id=ROOM_ID))
+        # 历史按会话 ID 分桶（显示名可能解析失败），且不重复喂当前这条
+        self.assertEqual(len(engine._recent_lines(ROOM_ID)), 1)
 
 
-class QuoteParserTests(unittest.TestCase):
+class QuoteParserTests(EngineTestCase):
     """验证入库 wechat_bridge.py 的引用回复目标解析。"""
 
     @staticmethod
@@ -1068,8 +971,11 @@ class QuoteParserTests(unittest.TestCase):
         self.assertEqual(self._parser()(""), "")
 
 
-class VisionTests(unittest.TestCase):
-    """图像识别管道：开关、多模态上下文与图片数量上限。"""
+class VisionTests(EngineTestCase):
+    """图像识别管道：开关、图片上限与无效路径兜底。
+
+    图片不再拼进 messages，而是作为 ``images`` 交给情绪引擎的「感知」模块。
+    """
 
     @staticmethod
     def _png(tmp: str, name: str = "a.png") -> str:
@@ -1077,16 +983,15 @@ class VisionTests(unittest.TestCase):
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
         return str(path)
 
-    def test_disabled_keeps_text(self):
+    def test_disabled_no_images(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = BotEngine(FakeAdapter(), BotConfig(vision_enabled=False))
             engine._record_inbound(
                 make_record(content="看这个", image_path=self._png(tmp))
             )
-            messages = engine._build_messages("测试群")
-            self.assertIsInstance(messages[1]["content"], str)
+            self.assertEqual(engine._image_uris("测试群"), [])
 
-    def test_enabled_attaches_image(self):
+    def test_enabled_returns_data_uri(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = BotEngine(
                 FakeAdapter(), BotConfig(vision_enabled=True, vision_max_images=3)
@@ -1094,12 +999,9 @@ class VisionTests(unittest.TestCase):
             engine._record_inbound(
                 make_record(content="看这个", image_path=self._png(tmp))
             )
-            content = engine._build_messages("测试群")[1]["content"]
-            self.assertIsInstance(content, list)
-            self.assertEqual(content[0]["type"], "text")
-            self.assertTrue(
-                content[1]["image_url"]["url"].startswith("data:image/png;base64,")
-            )
+            uris = engine._image_uris("测试群")
+            self.assertEqual(len(uris), 1)
+            self.assertTrue(uris[0].startswith("data:image/png;base64,"))
 
     def test_max_images_cap(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1113,14 +1015,12 @@ class VisionTests(unittest.TestCase):
                         image_path=self._png(tmp, f"{index}.png"),
                     )
                 )
-            messages = engine._build_messages("测试群")
-            attached = [m for m in messages if isinstance(m["content"], list)]
-            self.assertEqual(len(attached), 1)
+            self.assertEqual(len(engine._image_uris("测试群")), 1)
 
-    def test_missing_file_falls_back_to_text(self):
+    def test_missing_file_skipped(self):
         engine = BotEngine(FakeAdapter(), BotConfig(vision_enabled=True))
         engine._record_inbound(make_record(content="图", image_path="X:/no.png"))
-        self.assertIsInstance(engine._build_messages("测试群")[1]["content"], str)
+        self.assertEqual(engine._image_uris("测试群"), [])
 
     def test_unsupported_extension_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1128,21 +1028,10 @@ class VisionTests(unittest.TestCase):
             path.write_bytes(b"x")
             engine = BotEngine(FakeAdapter(), BotConfig(vision_enabled=True))
             engine._record_inbound(make_record(content="图", image_path=str(path)))
-            self.assertIsInstance(engine._build_messages("测试群")[1]["content"], str)
-
-    def test_proactive_context_also_carries_image(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = BotEngine(
-                FakeAdapter(), BotConfig(vision_enabled=True, vision_max_images=1)
-            )
-            engine._record_inbound(
-                make_record(content="看这个", image_path=self._png(tmp))
-            )
-            messages = engine._build_proactive_messages("测试群")
-            self.assertIsInstance(messages[1]["content"], list)
+            self.assertEqual(engine._image_uris("测试群"), [])
 
 
-class BridgeNormalizeTests(unittest.TestCase):
+class BridgeNormalizeTests(EngineTestCase):
     """入库 wechat_bridge.py 的消息归一化（含 XML 声明前缀）。"""
 
     @staticmethod
@@ -1212,7 +1101,7 @@ class _FakeHistoryDb:
         return [{"sort_seq": self._newest[user]}]
 
 
-class BridgeStartupHistoryTests(unittest.TestCase):
+class BridgeStartupHistoryTests(EngineTestCase):
     """启动时不能把停机期间的历史消息当成新消息。
 
     背景：底层 ``wechatauto`` 的 Listener 从持久化水位续传，机器人停一晚再启动，
@@ -1332,7 +1221,7 @@ class BridgeStartupHistoryTests(unittest.TestCase):
             self.assertNotIn("g2@chatroom", data)
 
 
-class BridgeCardLookupTests(unittest.TestCase):
+class BridgeCardLookupTests(EngineTestCase):
     """卡片消息正文回查。
 
     背景：UIA 监听对「文件/链接/卡片」只给类型占位符，`<url>` 只落在数据库的
@@ -1400,7 +1289,7 @@ class BridgeCardLookupTests(unittest.TestCase):
         self.assertIn("https://example.com/v", out)
 
 
-class BridgeAtDetectionTests(unittest.TestCase):
+class BridgeAtDetectionTests(EngineTestCase):
     """入库 wechat_bridge.py 的「@ 机器人」识别与昵称自动刷新。
 
     背景：昵称只在连接时读一次，用户改了微信昵称就得重启程序才能生效。现在遇到
@@ -1527,7 +1416,7 @@ class BridgeAtDetectionTests(unittest.TestCase):
         self.assertEqual(bridge._self_wxid, "wxid_new")
 
 
-class BridgeRoomNameTests(unittest.TestCase):
+class BridgeRoomNameTests(EngineTestCase):
     """无名群（微信里没设群名称）的显示名兜底。
 
     背景：群聊如果没设群名称，contact.db 里的 ``nick_name`` / ``remark`` 都是空的，
@@ -1657,7 +1546,7 @@ class BridgeRoomNameTests(unittest.TestCase):
         self.assertEqual(db.group_member_calls, 1)
 
 
-class BridgeMediaContextTests(unittest.TestCase):
+class BridgeMediaContextTests(EngineTestCase):
     """媒体提取上下文解析。
 
     回归点：桥接层走全局监听（``AddListenAll``），其 chat 占位
@@ -1769,7 +1658,7 @@ class StubResolver:
         return links_mod.DownloadOutcome(path=self.download_path)
 
 
-class LinkExtractTests(unittest.TestCase):
+class LinkExtractTests(EngineTestCase):
     """从消息文本里抽取 URL。"""
 
     def test_extracts_http_and_bare_www(self):
@@ -1802,7 +1691,7 @@ class LinkExtractTests(unittest.TestCase):
         self.assertEqual(extract_urls(""), [])
 
 
-class LinkInfoTests(unittest.TestCase):
+class LinkInfoTests(EngineTestCase):
     """解析结果压成上下文文本。"""
 
     def test_summary_contains_fields(self):
@@ -1878,7 +1767,7 @@ class _FakeResponse:
         return False
 
 
-class ShortLinkTests(unittest.TestCase):
+class ShortLinkTests(EngineTestCase):
     """短链展开：yt-dlp 不认识 b23.tv 等主机，须先拿到真实地址。"""
 
     def _patch_urlopen(self, response):
@@ -2004,7 +1893,7 @@ class ShortLinkTests(unittest.TestCase):
         self.assertEqual(seen["url"], "https://www.bilibili.com/video/BV1xx411c7mD")
 
 
-class BridgeFileSendConfirmTests(unittest.TestCase):
+class BridgeFileSendConfirmTests(EngineTestCase):
     """附件发送后的「数据库回查确认」。
 
     回归点：``guia._paste_attachment_and_send`` 对**非图片**附件无条件返回成功
@@ -2285,7 +2174,7 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
         self.assertEqual(pressed, [])
 
 
-class BridgeRecallTests(unittest.TestCase):
+class BridgeRecallTests(EngineTestCase):
     """桥接层撤回：能力检查、调用底层 API、失败如实返回。"""
 
     @staticmethod
@@ -2417,7 +2306,7 @@ class _FakeGui:
         self.recalibrated += 1
 
 
-class StrictInputBoxTests(unittest.TestCase):
+class StrictInputBoxTests(EngineTestCase):
     """输入框严格定位：探测失败必须返回 None，不能给猜测坐标。
 
     回归点：wechatauto 的 ``get_input_box()`` 探测失败时会兜底返回一个按
@@ -2432,6 +2321,7 @@ class StrictInputBoxTests(unittest.TestCase):
         return BridgeFileSendConfirmTests._module()
 
     def setUp(self):
+        super().setUp()
         self.module = self._module()
         self._old_interval = self.module._INPUT_BOX_PROBE_INTERVAL
         self.module._INPUT_BOX_PROBE_INTERVAL = 0.0
@@ -2497,7 +2387,7 @@ class _FakeUia:
         self._clicks.append((x, y))
 
 
-class UiaInputBoxTests(unittest.TestCase):
+class UiaInputBoxTests(EngineTestCase):
     """输入框定位优先走 UIA：矩形精确、不需要截屏。
 
     回归点：像素探测依赖 ``right_pane_left``（= ``sidebar_ratio * render_w``），
@@ -2621,7 +2511,7 @@ class _PixelGui:
         return img
 
 
-class PixelInputBoxProbeTests(unittest.TestCase):
+class PixelInputBoxProbeTests(EngineTestCase):
     """像素兜底：探测行**从右半侧起扫**，不依赖可能是默认值的 ``sidebar_ratio``。
 
     回归点（0.8.9 实测）：本机 ``layout-*.json`` 里 ``sidebar_ratio: 0.22``
@@ -2668,7 +2558,7 @@ class PixelInputBoxProbeTests(unittest.TestCase):
 
 
 
-class WeChatWindowVisibilityTests(unittest.TestCase):
+class WeChatWindowVisibilityTests(EngineTestCase):
     """附件/图片发送前先把微信主窗恢复可见。
 
     回归点（0.8.9 实测）：窗口隐藏时 ``GetWindowRect`` 仍返回完全正确的矩形，
@@ -2752,7 +2642,7 @@ class _FakeWxDb:
         return [row for row in self.new if row.get("sort_seq", 0) > since_seq]
 
 
-class BrowserBridgeTests(unittest.TestCase):
+class BrowserBridgeTests(EngineTestCase):
     """浏览器桥里不依赖真实浏览器的部分。"""
 
     def _make(self, suffix, age):
@@ -2860,7 +2750,7 @@ class BrowserBridgeTests(unittest.TestCase):
         self.assertIsNone(browser_mod._pick_page_target([]))
 
 
-class BrowserStartDiagnosisTests(unittest.TestCase):
+class BrowserStartDiagnosisTests(EngineTestCase):
     """浏览器「秒退」时的诊断与重试。
 
     回归点：2026-10-07 两次链接解析只用了约 3 秒就报「浏览器进程已退出」，
@@ -2996,7 +2886,7 @@ class _RaisingBrowserSession:
         raise RuntimeError("模拟浏览器启动失败")
 
 
-class DouyinTests(unittest.TestCase):
+class DouyinTests(EngineTestCase):
     """抖音：域名识别、作品 ID、详情解析、浏览器桥与缓存。
 
     这里**不真的启动浏览器**——所有触网/起进程的入口都打桩。
@@ -3303,7 +3193,7 @@ class DouyinTests(unittest.TestCase):
         self.assertEqual(calls, ["44", "44"])
 
 
-class DouyinLinkTests(unittest.TestCase):
+class DouyinLinkTests(EngineTestCase):
     """抖音在 links.py 里的接线：解析走浏览器桥，下载走 play_addr 直链。"""
 
     def tearDown(self):
@@ -3406,7 +3296,7 @@ class DouyinLinkTests(unittest.TestCase):
         self.assertIsNone(path)
 
 
-class XhsTests(unittest.TestCase):
+class XhsTests(EngineTestCase):
     """小红书：URL 识别、状态解析、Cookie 过滤。"""
 
     # 与线上 ``window.__INITIAL_STATE__.note.noteDetailMap`` 同构的样例
@@ -3732,7 +3622,7 @@ class XhsTests(unittest.TestCase):
         self.assertGreater(many_h, plain_h)
 
 
-class XhsLinkTests(unittest.TestCase):
+class XhsLinkTests(EngineTestCase):
     """小红书在 links.py 里的接线：解析走 SSR 状态，视频走直链下载。"""
 
     def tearDown(self):
@@ -3829,7 +3719,7 @@ class XhsLinkTests(unittest.TestCase):
         self.assertIn("图文笔记", outcome.error)
 
 
-class TweetTests(unittest.TestCase):
+class TweetTests(EngineTestCase):
     """X 推文：URL 识别、token、JSON 解析、卡片渲染。"""
 
     def test_is_tweet_url(self):
@@ -4431,13 +4321,13 @@ class TweetTests(unittest.TestCase):
         self.assertEqual(self._card_height(same), self._card_height(plain))
 
 
-class XhsEngineTests(unittest.IsolatedAsyncioTestCase):
+class XhsEngineTests(AsyncEngineTestCase):
     """引擎：小红书笔记发卡片图；视频笔记再下载视频；关掉开关不发卡片。"""
 
     URL = "https://www.xiaohongshu.com/explore/64f0a1b2000000001f00abcd?xsec_token=ABC"
 
     def _engine(self, adapter, **cfg_kwargs):
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
         llm = FakeLLM(cfg)
@@ -4556,11 +4446,11 @@ class XhsEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("暂不支持下载" in text for _, text in adapter.sent))
 
 
-class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
+class TweetEngineTests(AsyncEngineTestCase):
     """引擎：推文链接发卡片图；含视频时再下载视频回发。"""
 
     def _engine(self, adapter, **cfg_kwargs):
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
         llm = FakeLLM(cfg)
@@ -4711,7 +4601,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
         from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
 
@@ -4786,7 +4676,7 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
         from lingyu.bot import tweet as tweet_mod
 
         adapter = FakeAdapter()
-        cfg = BotConfig(enabled=True, cooldown_seconds=0.0)
+        cfg = BotConfig(enabled=True)
         llm = FakeLLM(cfg, reply="你好世界。")
         engine = BotEngine(adapter, cfg, llm_factory=lambda c: llm)
         info = tweet_mod.Tweet(
@@ -4835,11 +4725,11 @@ class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([Path(p).name for _, p in adapter.files], ["card.png"])
 
 
-class LinkAckTests(unittest.IsolatedAsyncioTestCase):
+class LinkAckTests(AsyncEngineTestCase):
     """链接服务：识别到链接就回**固定**提示（不经过大模型），私聊 / 群聊都生效。"""
 
     def _engine(self, adapter, **cfg_kwargs):
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
         llm = FakeLLM(cfg)
@@ -4904,13 +4794,6 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.sent, [])
 
-    async def test_quiet_hours_skip_ack(self):
-        adapter = FakeAdapter()
-        engine = self._engine(adapter)
-        engine._in_quiet_hours = lambda now=None: True
-        await engine._handle(make_record(content=MEDIA_URL))
-        self.assertEqual(adapter.sent, [])
-
     async def test_same_message_id_is_acked_once(self):
         adapter = FakeAdapter()
         engine = self._engine(adapter)
@@ -4927,7 +4810,8 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [text for _, text in adapter.sent], ["正在解析链接", "本鲸鱼娘收到啦。"]
         )
-        self.assertEqual(engine._llm.calls, 1)
+        # 情绪引擎一轮会调多次模型（感知/评估/表达），不再断言恰好 1 次。
+        self.assertGreaterEqual(engine._llm.calls, 1)
 
     async def test_llm_followup_can_be_disabled(self):
         """关掉后带链接的消息只回固定提示，不再调用模型。"""
@@ -4975,7 +4859,7 @@ class LinkAckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started, [MEDIA_URL])
 
 
-class LinkSiteFilterTests(unittest.TestCase):
+class LinkSiteFilterTests(EngineTestCase):
     """链接服务只处理媒体站点：购物/新闻等普通网页不解析、也不提示失败。"""
 
     def test_supported_sites(self):
@@ -5030,11 +4914,11 @@ class LinkSiteFilterTests(unittest.TestCase):
         self.assertTrue(links_mod.is_supported_url(url, ["qq.com"]))
 
 
-class LinkScopeEngineTests(unittest.IsolatedAsyncioTestCase):
+class LinkScopeEngineTests(AsyncEngineTestCase):
     """引擎层面：普通网页链接不进链接服务，媒体链接照旧。"""
 
     def _engine(self, adapter, **cfg_kwargs):
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
         return BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
@@ -5089,18 +4973,18 @@ class LinkScopeEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([text for _, text in adapter.sent], ["正在解析链接"])
 
 
-class RecallCommandTests(unittest.IsolatedAsyncioTestCase):
+class RecallCommandTests(AsyncEngineTestCase):
     """「@机器人 撤回」：撤掉机器人最新发出的媒体消息。"""
 
     def _engine(self, adapter, **cfg_kwargs):
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
         return BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
 
     async def _bot_sent_media(self, engine, chat="测试群", text="正在解析链接"):
         """模拟机器人先回了一句提示，再发出一条媒体。"""
-        await engine._send_reply(chat, text)
+        await engine._send_plain(chat, text)
         await engine._send_file(chat, "C:/tmp/v.mp4", "链接内容")
 
     def test_command_variants_are_recognized(self):
@@ -5148,7 +5032,7 @@ class RecallCommandTests(unittest.IsolatedAsyncioTestCase):
         adapter = FakeAdapter()
         engine = self._engine(adapter)
         await self._bot_sent_media(engine)
-        await engine._send_reply("测试群", "下载失败：网络不通，先不发了。")
+        await engine._send_plain("测试群", "下载失败：网络不通，先不发了。")
         await engine._handle(
             make_record(is_at_me=True, message_id="m9", content="撤回一下")
         )
@@ -5277,7 +5161,7 @@ class RecallCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class LinkConfigTests(unittest.TestCase):
+class LinkConfigTests(EngineTestCase):
     """链接解析配置的默认值与范围纠正。"""
 
     def test_defaults(self):
@@ -5387,7 +5271,7 @@ class LinkConfigTests(unittest.TestCase):
         )
 
 
-class RecallConfigTests(unittest.TestCase):
+class RecallConfigTests(EngineTestCase):
     """撤回相关配置的默认值与范围纠正。"""
 
     def test_defaults(self):
@@ -5437,7 +5321,7 @@ class RecallConfigTests(unittest.TestCase):
         self.assertEqual(cfg.recall_admins, ["张三", "李四"])
 
 
-class SendAttemptsWiringTests(unittest.TestCase):
+class SendAttemptsWiringTests(EngineTestCase):
     """「附件发送失败后重试次数」从配置推到适配层。"""
 
     def test_pushed_on_engine_creation(self):
@@ -5476,7 +5360,105 @@ class SendAttemptsWiringTests(unittest.TestCase):
         )
 
 
-class LinkCookiesTests(unittest.TestCase):
+class MultiAdapterTests(AsyncEngineTestCase):
+    """微信与 QQ 同时接入：各自订阅消息，回复回到消息来源那一端。"""
+
+    @staticmethod
+    def _adapter(platform, names=None):
+        adapter = FakeAdapter(names=names)
+        adapter.platform = platform
+        return adapter
+
+    async def test_start_subscribes_every_adapter(self):
+        wechat = self._adapter("wechat")
+        qq = self._adapter("qq")
+        engine = BotEngine(wechat, BotConfig(), adapters=[wechat, qq])
+        await engine.start()
+        self.assertEqual(len(wechat.listeners), 1)
+        self.assertEqual(len(qq.listeners), 1)
+        # stop 必须把两端的监听都摘干净（留下回调会继续往队列里塞消息）。
+        await engine.stop()
+        self.assertEqual(wechat.listeners, [])
+        self.assertEqual(qq.listeners, [])
+
+    async def test_reply_routes_back_to_source_adapter(self):
+        wechat = self._adapter("wechat")
+        qq = self._adapter("qq")
+        engine = BotEngine(wechat, BotConfig(), adapters=[wechat, qq])
+        await engine.start()
+        try:
+            # 两条都是「群里没 @ 我」的普通消息：只登记来源，不触发回复。
+            await qq.dispatch(make_record(chat="QQ群", message_id="q1"))
+            await wechat.dispatch(make_record(chat="微信群", message_id="w1"))
+            await engine._send_plain("QQ群", "回 QQ")
+            await engine._send_plain("微信群", "回微信")
+        finally:
+            await engine.stop()
+        self.assertEqual(qq.sent, [("QQ群", "回 QQ")])
+        self.assertEqual(wechat.sent, [("微信群", "回微信")])
+
+    async def test_chat_id_also_routes_to_source(self):
+        """单聊的显示名与 ID 不同：按 chat_id 发送时也要回到来源端。"""
+        wechat = self._adapter("wechat")
+        qq = self._adapter("qq")
+        engine = BotEngine(wechat, BotConfig(), adapters=[wechat, qq])
+        await engine.start()
+        try:
+            await qq.dispatch(
+                make_record(
+                    chat="QQ好友", chat_id="c2c_123", is_group=False, message_id="q2"
+                )
+            )
+            await engine._send_plain("c2c_123", "hi")
+        finally:
+            await engine.stop()
+        self.assertEqual(qq.sent, [("c2c_123", "hi")])
+        self.assertEqual(wechat.sent, [])
+
+    async def test_set_adapters_moves_listeners(self):
+        """保存配置后热切换：旧适配器摘掉监听，新适配器立刻接上。"""
+        wechat = self._adapter("wechat")
+        qq = self._adapter("qq")
+        engine = BotEngine(wechat, BotConfig(), adapters=[wechat, qq])
+        await engine.start()
+        new_qq = self._adapter("qq")
+        await engine.set_adapters([wechat, new_qq])
+        try:
+            self.assertEqual(qq.listeners, [], "被替换的适配器不该再收到消息")
+            self.assertEqual(len(wechat.listeners), 1)
+            self.assertEqual(len(new_qq.listeners), 1)
+            await new_qq.dispatch(make_record(chat="新QQ群", message_id="q3"))
+            await engine._send_plain("新QQ群", "hi")
+            self.assertEqual(new_qq.sent, [("新QQ群", "hi")])
+        finally:
+            await engine.stop()
+        self.assertEqual(wechat.listeners, [])
+        self.assertEqual(new_qq.listeners, [])
+
+    def test_status_snapshot_reports_both(self):
+        wechat = self._adapter("wechat")
+        qq = self._adapter("qq")
+        snap = BotEngine(wechat, BotConfig(), adapters=[wechat, qq]).status_snapshot()
+        self.assertEqual(snap["platform"], "both")
+        self.assertEqual(len(snap["adapters"]), 2)
+        # 兼容字段仍指第一个适配器（旧调用方只读 adapter）。
+        self.assertEqual(snap["adapter"], snap["adapters"][0])
+
+    def test_status_snapshot_single_platform(self):
+        wechat = self._adapter("wechat")
+        snap = BotEngine(wechat, BotConfig()).status_snapshot()
+        self.assertEqual(snap["platform"], "wechat")
+        self.assertEqual(len(snap["adapters"]), 1)
+
+    def test_send_attempts_pushed_to_every_adapter(self):
+        wechat = self._adapter("wechat")
+        qq = self._adapter("qq")
+        BotEngine(wechat, BotConfig(link_send_attempts=3), adapters=[wechat, qq])
+        self.assertEqual(wechat.send_attempts, 3)
+        self.assertEqual(qq.send_attempts, 3)
+
+
+class LinkCookiesTests(EngineTestCase):
     """cookies.txt 支持：路径规整、失败提示、缓存清理、传给 yt-dlp。"""
 
     @staticmethod
@@ -5655,11 +5637,11 @@ class LinkCookiesTests(unittest.TestCase):
         self.assertIn("未能提取标题", info.error)
 
 
-class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
+class LinkEngineTests(AsyncEngineTestCase):
     """引擎：链接信息注入上下文 + 下载回发。"""
 
     def _engine(self, adapter, **cfg_kwargs):
-        options = dict(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        options = dict(enabled=True)
         options.update(cfg_kwargs)
         cfg = BotConfig(**options)
         llm = FakeLLM(cfg)
@@ -5816,7 +5798,7 @@ class LinkEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._downloading_urls, set())
 
 
-class LinkDownloadTests(unittest.TestCase):
+class LinkDownloadTests(EngineTestCase):
     """下载路径抓取：合流后必须返回最终文件，而不是已被删除的分片。"""
 
     class _FakeYDL:
@@ -5961,7 +5943,7 @@ class LinkDownloadTests(unittest.TestCase):
         self.assertIn("体积上限", outcome.error)
 
 
-class StorageQuotaTests(unittest.TestCase):
+class StorageQuotaTests(EngineTestCase):
     """下载目录占用统计与「最旧优先」自动清理。"""
 
     @staticmethod
@@ -6027,12 +6009,12 @@ class StorageQuotaTests(unittest.TestCase):
             self.assertEqual(storage.enforce_quota(Path(tmp) / "缺", 10), [])
 
 
-class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
+class DownloadQuotaEngineTests(AsyncEngineTestCase):
     """引擎：下载回发完成后按配置上限清理下载目录。"""
 
     def _engine(self, **cfg_kwargs):
         cfg = BotConfig(
-            enabled=True, cooldown_seconds=0.0, reply_probability=1.0, **cfg_kwargs
+            enabled=True, **cfg_kwargs
         )
         return BotEngine(FakeAdapter(), cfg, llm_factory=lambda c: FakeLLM(c))
 
@@ -6085,17 +6067,16 @@ class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(old.exists(), "配额为 0 表示不限制，不应删除任何文件")
 
 
-class DownloadRetryEngineTests(unittest.IsolatedAsyncioTestCase):
+class DownloadRetryEngineTests(AsyncEngineTestCase):
     """引擎：下载失败自动重试，用尽次数后往聊天里发提示。"""
 
     def setUp(self):
+        super().setUp()
         self.adapter = FakeAdapter()
 
     def _engine(self, **cfg_kwargs):
         cfg = BotConfig(
             enabled=True,
-            cooldown_seconds=0.0,
-            reply_probability=1.0,
             link_download_enabled=True,
             **cfg_kwargs,
         )
