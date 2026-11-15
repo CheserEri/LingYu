@@ -467,16 +467,24 @@ _SHORT_LINK_TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: TikTok 分享面板复制出来的是 ``https://www.tiktok.com/t/<code>/``——主机仍在
+#: tiktok.com 上（不是 ``vm.tiktok.com`` 那种子域短链），路径里没有作品 ID。
+#: 不展开的话 ``extract_video_id`` 取不到 ID，热评截图会直接报「短链请先展开」。
+_TIKTOK_SHARE_PATH_RE = re.compile(r"^/t/[A-Za-z0-9]+/?$")
+
 
 def _is_short_link(url: str) -> bool:
-    """是否属于已知短链主机（据此决定要不要先展开）。"""
-    host = urllib.parse.urlsplit(url).netloc.lower()
+    """是否属于已知短链（据此决定要不要先展开）。"""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.netloc.lower()
     if "@" in host:  # 去掉 userinfo
         host = host.rsplit("@", 1)[-1]
     host = host.split(":", 1)[0]
     if host.startswith("www."):
         host = host[4:]
-    return host in _SHORT_LINK_HOSTS
+    if host in _SHORT_LINK_HOSTS:
+        return True
+    return host == "tiktok.com" and bool(_TIKTOK_SHARE_PATH_RE.match(parts.path or ""))
 
 
 @dataclass

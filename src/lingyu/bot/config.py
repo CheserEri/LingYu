@@ -35,7 +35,12 @@ def _env_platform() -> str:
 class BotConfig:
     """自动回复运行参数（均可在桌面界面修改）。"""
 
-    # 自动回复总开关。
+    # 助手服务总开关（桌面「运行状态」页的启动/停止）。
+    # 关闭后引擎不运行，聊天、链接解析、撤回全部暂停；它不管具体功能，
+    # 具体开不开由下面 enabled / link_parse_enabled / recall_enabled 决定。
+    service_enabled: bool = True
+
+    # 聊天与情感总开关（只决定「要不要开口」）。
     enabled: bool = False
 
     # ---- 接入平台 ----
@@ -216,13 +221,13 @@ class BotConfig:
 
     @property
     def engine_required(self) -> bool:
-        """是否需要启动消息引擎。
-
-        「聊天回复」「链接解析」「撤回」是三件独立的事：``enabled`` 只决定
-        要不要开口说话，不影响另外两项。任何一项开着，引擎就得在跑，
-        否则关掉聊天会连带把链接解析与撤回一起停掉。
-        """
+        """是否有功能需要引擎（聊天 / 链接解析 / 撤回任一开启）。"""
         return bool(self.enabled or self.link_parse_enabled or self.recall_enabled)
+
+    @property
+    def service_active(self) -> bool:
+        """引擎是否应该运行：服务总开关打开，且至少有一项功能开启。"""
+        return bool(self.service_enabled and self.engine_required)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -252,6 +257,9 @@ class BotConfig:
             config.qq_enabled = config.platform == "qq"
         config.qq_app_id = str(config.qq_app_id or "").strip()
         config.qq_app_secret = str(config.qq_app_secret or "").strip()
+        # 旧配置没有服务总开关：默认视为已开启，保持升级前「启动即工作」的行为。
+        config.service_enabled = bool(config.service_enabled)
+        config.enabled = bool(config.enabled)
         config.context_messages = max(1, int(config.context_messages))
         config.temperature = float(config.temperature)
         config.max_tokens = max(1, int(config.max_tokens))

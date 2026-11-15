@@ -363,16 +363,21 @@ class DesktopApi:
         # 界面那份只在内存里（进程一退就没了），再转发一份给 loguru 才能落盘。
         self.engine.on_log = forward_engine_log
         # 多端并行连接：一端失败不影响另一端，界面可单独重连。
-        results = await asyncio.gather(
-            *(adapter.connect() for adapter in self.adapters),
-            return_exceptions=True,
-        )
+        # 服务总开关关着时不连终端——「启动」按钮会重新连接。
+        if self.config.service_enabled:
+            results = await asyncio.gather(
+                *(adapter.connect() for adapter in self.adapters),
+                return_exceptions=True,
+            )
+        else:
+            results = []
+            self.engine.log("info", "助手服务已停止：本次启动不连接终端。")
         for adapter, result in zip(self.adapters, results):
             if isinstance(result, BaseException):
                 self.engine.log(
                     "warning", f"{self._adapter_label(adapter)} 连接失败：{result}"
                 )
-        if self.config.engine_required:
+        if self.config.service_active:
             await self.engine.start()
 
     @staticmethod
@@ -472,6 +477,8 @@ class DesktopApi:
         # 界面不回填密钥：提交空串表示沿用已保存的 AppSecret。
         if not new.qq_app_secret:
             new.qq_app_secret = self.config.qq_app_secret
+        service_started = bool(new.service_enabled and not self.config.service_enabled)
+        service_stopped = bool(self.config.service_enabled and not new.service_enabled)
         binding_changed = (
             self.config.platform != new.platform
             or self.config.wechat_enabled != new.wechat_enabled
@@ -484,10 +491,16 @@ class DesktopApi:
             # 终端开关 / 凭据变了：立刻重建全部适配器并连接，不需要重启程序。
             connect_result = await self._switch_adapters_async(new)
         else:
-            if new.engine_required and not self.engine.running:
+            if service_started:
+                # 「启动服务」顺带重试一次终端连接：连接坏了也能靠这个按钮救回来。
+                connect_result = await self._connect_async()
+            if new.service_active and not self.engine.running:
                 await self.engine.start()
-            elif not new.engine_required and self.engine.running:
+            elif not new.service_active and self.engine.running:
                 await self.engine.stop()
+            if service_stopped:
+                # 服务停止后不再占用微信 / QQ 连接，等下次「启动」再连。
+                await self._disconnect_adapters_async()
             # 就地更新共享对象：引擎与本 API 持有同一引用，立即生效。
             self.config.__dict__.update(new.to_dict())
             self.config.save()
@@ -497,15 +510,19 @@ class DesktopApi:
         state["connect"] = connect_result
         return state
 
-    async def _switch_adapters_async(self, new: BotConfig) -> dict:
-        """按终端开关 / 凭据重建全部适配器，保留引擎与人格状态。"""
+    async def _disconnect_adapters_async(self) -> None:
+        """断开全部终端；单个端断开失败只记日志，不挡住其余步骤。"""
         for adapter in self.adapters:
             try:
                 await adapter.disconnect()
-            except Exception as exc:  # noqa: BLE001 - 旧连接断不开不该挡住新配置
+            except Exception as exc:  # noqa: BLE001 - 断开失败不该挡住配置保存
                 self.engine.log(
                     "warning", f"断开{self._adapter_label(adapter)}失败：{exc}"
                 )
+
+    async def _switch_adapters_async(self, new: BotConfig) -> dict:
+        """按终端开关 / 凭据重建全部适配器，保留引擎与人格状态。"""
+        await self._disconnect_adapters_async()
         # 就地更新共享对象：引擎与本 API 持有同一引用，立即生效。
         self.config.__dict__.update(new.to_dict())
         self.config.save()
@@ -513,25 +530,28 @@ class DesktopApi:
         self.adapter = self.adapters[0]
         # set_adapters 会按引擎原本的运行状态停/启，监听自动挂到新适配器上。
         await self.engine.set_adapters(self.adapters)
-        if self.config.engine_required and not self.engine.running:
+        if self.config.service_active and not self.engine.running:
             await self.engine.start()
-        elif not self.config.engine_required and self.engine.running:
+        elif not self.config.service_active and self.engine.running:
             await self.engine.stop()
 
         entries: list[dict] = []
-        for adapter in self.adapters:
-            label = self._adapter_label(adapter)
-            try:
-                result = await adapter.connect()
-                entry = result.to_dict()
-            except Exception as exc:  # noqa: BLE001 - 连接失败要回给界面，而不是抛进 JS
-                entry = {
-                    "ok": False,
-                    "error": {"message": str(exc) or exc.__class__.__name__},
-                }
-            entry["platform"] = str(getattr(adapter, "platform", "wechat") or "wechat")
-            entry["label"] = label
-            entries.append(entry)
+        if self.config.service_enabled:
+            for adapter in self.adapters:
+                label = self._adapter_label(adapter)
+                try:
+                    result = await adapter.connect()
+                    entry = result.to_dict()
+                except Exception as exc:  # noqa: BLE001 - 连接失败要回给界面，而不是抛进 JS
+                    entry = {
+                        "ok": False,
+                        "error": {"message": str(exc) or exc.__class__.__name__},
+                    }
+                entry["platform"] = str(
+                    getattr(adapter, "platform", "wechat") or "wechat"
+                )
+                entry["label"] = label
+                entries.append(entry)
         failed = [item for item in entries if not item.get("ok")]
         return {
             "ok": not failed,

@@ -51,11 +51,17 @@ function bindDraftToControls() {
         if (label) label.textContent = fmtRange(el.value);
       } else draft[key] = el.value;
       if (key === "enabled") {
-        // 总开关本身就是「应用」动作：与运行状态页的按钮走同一条保存链路，
-        // 勾上就起引擎、取消就停引擎，不需要再点「保存设置」。
+        // 聊天总开关本身就是「应用」动作：不需要再点「保存设置」。
         saveAll()
           .then(() => toast(draft.enabled ? "聊天与情感已开启" : "已停止聊天"))
           .catch((err) => toast("应用总开关失败：" + err, "err"));
+        return;
+      }
+      if (key === "link_parse_enabled") {
+        // 链接解析总开关同样立即生效，和聊天开关互不影响。
+        saveAll()
+          .then(() => toast(draft.link_parse_enabled ? "链接解析已开启" : "链接解析已关闭"))
+          .catch((err) => toast("应用链接解析总开关失败：" + err, "err"));
         return;
       }
       if (key === "wechat_enabled" || key === "qq_enabled") {
@@ -91,22 +97,53 @@ function bindDraftToControls() {
   $("#recall-admins-input").value = (draft.recall_admins || []).join("\n");
 
   syncChatMaster();
+  syncLinkMaster();
 }
 
 // 总开关的状态徽标与说明：关闭时页面仍可编辑，只是明确提示「现在不会聊天」。
 function syncChatMaster() {
   const on = !!draft && !!draft.enabled;
+  // 服务总开关是前提：它停着的时候，聊天自己的开关开着也不会工作。
+  const serviceOn = !draft || draft.service_enabled !== false;
   const chip = $("#chat-state");
   if (chip) {
-    chip.textContent = on ? "运行中" : "已停止";
-    chip.className = "chat-state " + (on ? "on" : "off");
+    chip.textContent = !serviceOn ? "服务已停止" : (on ? "运行中" : "已停止");
+    chip.className = "chat-state " + (on && serviceOn ? "on" : "off");
   }
   const hint = $("#chat-master-hint");
   if (!hint) return;
+  if (!serviceOn) {
+    hint.innerHTML =
+      "「运行状态」页的<b>助手服务</b>处于停止状态，这里开着也不会工作；" +
+      "到首页点「启动」即可。";
+    return;
+  }
   hint.innerHTML = on
     ? "总开关已开启：按下面的「聊天」触发条件与「情感」设置工作。"
-    : "总开关已关闭：<b>不回复任何消息</b>，情绪内核也不参与。" +
-      "链接解析、热评截图、下载回发与撤回<b>仍然工作</b>——它们各有自己的开关。";
+    : "总开关已关闭：<b>不回复任何消息</b>，情绪内核也不参与；" +
+      "链接解析、热评截图、下载回发与撤回仍按各自开关工作。";
+}
+
+// 链接解析总开关：只影响链接相关功能，不影响聊天。
+function syncLinkMaster() {
+  const on = !!draft && !!draft.link_parse_enabled;
+  const serviceOn = !draft || draft.service_enabled !== false;
+  const chip = $("#link-state");
+  if (chip) {
+    chip.textContent = !serviceOn ? "服务已停止" : (on ? "已开启" : "已关闭");
+    chip.className = "chat-state " + (on && serviceOn ? "on" : "off");
+  }
+  const hint = $("#link-master-hint");
+  if (!hint) return;
+  if (!serviceOn) {
+    hint.innerHTML =
+      "「运行状态」页的<b>助手服务</b>处于停止状态，这里开着也不会解析；" +
+      "到首页点「启动」即可。";
+    return;
+  }
+  hint.innerHTML = on
+    ? "解析、下载、卡片与热评截图按下面的设置工作；它和聊天互不影响。需要「运行状态」页的助手服务处于运行中。"
+    : "关闭后不再解析、下载、发卡片或截图，也不回固定提示；<b>不影响聊天回复</b>。";
 }
 
 function collectDraft() {
@@ -143,7 +180,9 @@ async function saveAll() {
       .join("；");
     toast("已保存，部分终端连接失败：" + detail, "err");
   } else if (state.applied) {
-    toast("已切换并连接");
+    toast(state.config && state.config.service_enabled === false
+      ? "设置已保存（助手服务未启动）"
+      : "已切换并连接");
   } else {
     toast("设置已保存");
   }
@@ -211,12 +250,20 @@ $("#test-qq").addEventListener("click", async () => {
 // ---------------- 总开关 / 连接 ----------------
 $("#btn-toggle").addEventListener("click", async () => {
   collectDraft();
-  draft.enabled = !draft.enabled;
+  draft.service_enabled = !draft.service_enabled;
   const state = await window.pywebview.api.save_config(draft);
   draft = state.config;
   bindDraftToControls();
   renderStatus(state);
-  toast(draft.enabled ? "自动回复已开启" : "自动回复已停止");
+  const failed = ((state.connect && state.connect.adapters) || []).filter((a) => !a.ok);
+  if (failed.length) {
+    const detail = failed
+      .map((a) => `${a.label || a.platform}：${a.error?.message || "连接失败"}`)
+      .join("；");
+    toast("服务已" + (draft.service_enabled ? "启动" : "停止") + "，但终端连接失败：" + detail, "err");
+    return;
+  }
+  toast(draft.service_enabled ? "助手服务已启动" : "助手服务已停止");
 });
 
 $("#btn-connect").addEventListener("click", async () => {
@@ -511,17 +558,25 @@ function renderStatus(state) {
     list.length > 1
       ? `已连接 ${connected.length}/${list.length}`
       : (w.ok ? "已连接" : "未连接");
-  // 监听 = 引擎在跑；聊天开关只管「要不要开口」，两者不再是一回事。
+  // 监听 = 引擎在跑（服务总开关 + 至少一项功能开启）。
   $("#s-listen").textContent = engine.running ? "监听中" : "未监听";
-  // 「自动回复」卡片只看聊天总开关：关掉后链接解析仍会工作。
-  const chatOn = !!(state.config && state.config.enabled);
-  $("#s-bot").textContent = chatOn ? "运行中" : "已停止";
+  // 首页卡片只看服务总开关；聊天/链接解析是否工作由各自页面的总开关决定。
+  const serviceOn = !!(state.config && state.config.service_enabled);
+  $("#s-bot").textContent = serviceOn ? "运行中" : "已停止";
   const btn = $("#btn-toggle");
-  btn.textContent = chatOn ? "停止" : "开启";
-  btn.classList.toggle("primary", !chatOn);
-  btn.style.background = chatOn ? "#fff" : "";
-  btn.style.color = chatOn ? "#ef4444" : "";
-  btn.style.borderColor = chatOn ? "#fecaca" : "";
+  btn.textContent = serviceOn ? "停止" : "启动";
+  btn.classList.toggle("primary", !serviceOn);
+  btn.style.background = serviceOn ? "#fff" : "";
+  btn.style.color = serviceOn ? "#ef4444" : "";
+  btn.style.borderColor = serviceOn ? "#fecaca" : "";
+  const serviceHint = $("#service-hint");
+  if (serviceHint) {
+    const anyFeature = !!(state.config && (state.config.enabled ||
+      state.config.link_parse_enabled || state.config.recall_enabled));
+    serviceHint.innerHTML = serviceOn && !anyFeature
+      ? "服务已启动，但<b>聊天、链接解析、撤回都关着</b>，现在不会做任何事。"
+      : "启动时会重新连接终端并运行已开启的功能；<b>聊天</b>与<b>链接解析</b>的具体开关在各自页面。";
+  }
 
   $("#s-count").textContent = engine.reply_count_today;
   $("#s-last").textContent = fmtTime(engine.last_trigger_at);
@@ -537,6 +592,9 @@ function renderStatus(state) {
         : `在线：${connected.map((x) => (x.platform === "qq" ? "QQ" : "微信")).join("、") || "无"}`
       : (w.backend ? "后端：" + w.backend : (w.error?.message || "—"));
 
+  // 服务开关变了，聊天 / 链接解析的徽标要跟着变（服务停着时它们不工作）。
+  syncChatMaster();
+  syncLinkMaster();
   renderBinding(state);
 }
 

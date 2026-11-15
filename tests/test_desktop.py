@@ -549,6 +549,94 @@ class QQBindingApiTests(unittest.TestCase):
 
         self.assertFalse(engine.running)
 
+    def test_service_switch_off_stops_engine_even_if_chat_on(self):
+        """服务总开关关闭时，聊天开着也不监听。"""
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(enabled=True, service_enabled=False)
+        engine = self._engine(running=True)
+        api = self._api(cfg, SimpleNamespace(get_status=lambda: self._status()), engine)
+
+        with mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            asyncio.run(api._save_config_async(BotConfig.from_dict(cfg.to_dict())))
+
+        self.assertFalse(engine.running)
+
+    def test_starting_service_reconnects_and_starts_engine(self):
+        """首页「启动」= 重连终端 + 起引擎。"""
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        class _Adapter:
+            platform = "wechat"
+
+            def __init__(self):
+                self.connects = 0
+
+            async def connect(self):
+                self.connects += 1
+                return SimpleNamespace(to_dict=lambda: {"ok": True, "state": "connected"})
+
+            @staticmethod
+            def get_status():
+                return QQBindingApiTests._status()
+
+        adapter = _Adapter()
+        cfg = BotConfig(
+            enabled=True, service_enabled=False, link_parse_enabled=False,
+            recall_enabled=False,
+        )
+        engine = self._engine(running=False)
+        api = self._api(cfg, adapter, engine, adapters=[adapter])
+
+        with mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            asyncio.run(
+                api._save_config_async(
+                    BotConfig.from_dict({**cfg.to_dict(), "service_enabled": True})
+                )
+            )
+
+        self.assertEqual(adapter.connects, 1)
+        self.assertTrue(engine.running)
+
+    def test_stopping_service_disconnects_adapters(self):
+        """停止服务要断开终端，不能只是关掉引擎。"""
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        class _Adapter:
+            platform = "wechat"
+
+            def __init__(self):
+                self.disconnects = 0
+
+            async def disconnect(self):
+                self.disconnects += 1
+                return SimpleNamespace(to_dict=lambda: {"ok": True})
+
+            @staticmethod
+            def get_status():
+                return QQBindingApiTests._status()
+
+        adapter = _Adapter()
+        cfg = BotConfig(enabled=True, service_enabled=True)
+        engine = self._engine(running=True)
+        api = self._api(cfg, adapter, engine, adapters=[adapter])
+
+        with mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            asyncio.run(
+                api._save_config_async(
+                    BotConfig.from_dict({**cfg.to_dict(), "service_enabled": False})
+                )
+            )
+
+        self.assertFalse(engine.running)
+        self.assertEqual(adapter.disconnects, 1)
+
     def test_build_adapters_can_enable_both_terminals(self):
         from lingyu.bot import BotConfig
 

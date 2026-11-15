@@ -75,15 +75,16 @@
           </div>
 
           <div class="card status-card">
-            <div class="card-label">自动回复</div>
+            <div class="card-label">助手服务</div>
             <div class="big-toggle">
               <div class="card-value" id="s-bot">已停止</div>
-              <button class="btn primary lg" id="btn-toggle">开启</button>
+              <button class="btn primary lg" id="btn-toggle">启动</button>
             </div>
             <div class="mini-stats">
               <div><span class="mini-num" id="s-count">0</span><span class="mini-label">今日回复</span></div>
               <div><span class="mini-num" id="s-last">—</span><span class="mini-label">最后触发</span></div>
             </div>
+            <p class="hint" id="service-hint">启动时会重新连接终端并运行已开启的功能；<b>聊天</b>与<b>链接解析</b>的具体开关在各自页面。</p>
           </div>
         </div>
 
@@ -123,7 +124,7 @@
           </div>
         </div>
 
-        <p class="hint">提示：自动回复在本程序运行期间有效。微信模式需要 PC 客户端已登录且主窗口可见；QQ 模式需要机器人保持在线。</p>
+        <p class="hint">提示：这里是助手服务的启动/停止；聊天与链接解析是否工作，由各自页面的总开关决定。微信模式需要 PC 客户端已登录且主窗口可见；QQ 模式需要机器人保持在线。</p>
       </section>
 
       <!-- 聊天与情感（总开关 + 群聊设置 + 情绪内核） -->
@@ -133,7 +134,7 @@
         <div class="card" id="chat-master-card">
           <label class="switch-row"><span>启用聊天与情感（总开关）<i class="chat-state off" id="chat-state">已停止</i></span>
             <input type="checkbox" class="switch" data-key="enabled"/></label>
-          <p class="hint" id="chat-master-hint">关闭后<b>不回复任何消息</b>，情绪内核也不参与。链接解析、热评截图、下载回发与撤回<b>仍然工作</b>——它们各有自己的开关。</p>
+          <p class="hint" id="chat-master-hint">这是聊天自己的总开关：关闭后<b>不回复任何消息</b>，情绪内核也不参与；链接解析、热评截图、下载回发与撤回仍按各自开关工作。需要「运行状态」页的助手服务处于运行中。</p>
         </div>
 
         <div class="group-title">聊天</div>
@@ -238,10 +239,14 @@
       <section class="page" id="page-links">
         <h1 class="page-title">链接解析</h1>
 
+        <div class="card" id="link-master-card">
+          <label class="switch-row"><span>启用链接解析（总开关）<i class="chat-state on" id="link-state">已开启</i></span>
+            <input type="checkbox" class="switch" data-key="link_parse_enabled"/></label>
+          <p class="hint" id="link-master-hint">关闭后不再解析、下载、发卡片或截图，也不回固定提示；<b>不影响聊天回复</b>。需要「运行状态」页的助手服务处于运行中。</p>
+        </div>
+
         <div class="card">
           <div class="card-label">解析链接内容</div>
-          <label class="switch-row"><span>检测到链接时自动解析并告诉模型</span>
-            <input type="checkbox" class="switch" data-key="link_parse_enabled"/></label>
           <div class="grid-2">
             <div class="field">
               <label>单次最多解析（个）</label>

@@ -262,6 +262,12 @@ get_recent_messages …`），因此 `service.py` 与 `bot/engine.py` 不需要�
 `qq_enabled` 两个开关控制，可同时为 `true`（两端并行）；旧配置缺少这两个字段时
 按 `platform` 推导，且保证至少有一个终端开启。
 
+界面里有三层开关：`service_enabled`（助手服务，首页启动/停止，停止时断开终端）、
+`enabled`（聊天与情感，只决定要不要开口）、`link_parse_enabled`（链接解析，只决定
+解析/下载/卡片/热评截图）。引擎仅在
+`service_enabled and (enabled or link_parse_enabled or recall_enabled)` 时运行；
+关掉聊天不影响链接解析与撤回，服务停止则全部暂停。
+
 ### 客户端配置示例
 
 ```json

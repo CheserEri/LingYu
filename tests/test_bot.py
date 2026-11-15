@@ -230,6 +230,19 @@ class ConfigTests(EngineTestCase):
             ).engine_required
         )
 
+    def test_service_switch_gates_everything(self):
+        """服务总开关关闭时，即使聊天开着，引擎也不该运行。"""
+        cfg = BotConfig(enabled=True, service_enabled=False)
+        self.assertTrue(cfg.engine_required)
+        self.assertFalse(cfg.service_active)
+        cfg.service_enabled = True
+        self.assertTrue(cfg.service_active)
+        # 服务开着但所有功能都关掉，引擎同样没有可做的事。
+        cfg.enabled = False
+        cfg.link_parse_enabled = False
+        cfg.recall_enabled = False
+        self.assertFalse(cfg.service_active)
+
 
 class TriggerTests(EngineTestCase):
     def setUp(self):
@@ -1853,6 +1866,26 @@ class ShortLinkTests(EngineTestCase):
         self.assertTrue(links_mod._is_short_link("https://www.b23.tv/abc"))
         self.assertFalse(links_mod._is_short_link("https://www.bilibili.com/video/BV1"))
         self.assertFalse(links_mod._is_short_link("https://example.com/b23.tv"))
+
+    def test_tiktok_share_path_is_short_link(self):
+        """TikTok 分享面板给的是 www.tiktok.com/t/<code>/，主机不变、路径没有 ID。"""
+        self.assertTrue(
+            links_mod._is_short_link("https://www.tiktok.com/t/ZPLKukcFL/")
+        )
+        self.assertTrue(links_mod._is_short_link("https://www.tiktok.com/t/ZTPDYW28D"))
+        self.assertFalse(
+            links_mod._is_short_link("https://www.tiktok.com/@user/video/7412345678")
+        )
+        self.assertFalse(links_mod._is_short_link("https://www.tiktok.com/@user"))
+
+    def test_tiktok_share_link_expands_to_canonical(self):
+        real = "https://www.tiktok.com/@user/video/7412345678901234567"
+        with self._patch_urlopen(_FakeResponse(real)):
+            target, err = links_mod.LinkResolver()._expand_short_link(
+                "https://www.tiktok.com/t/ZPLKukcFL/"
+            )
+        self.assertEqual(err, "")
+        self.assertEqual(target, real)
 
     def test_normal_url_is_not_expanded(self):
         """非短链主机不应产生任何网络请求。"""

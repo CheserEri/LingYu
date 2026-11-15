@@ -60,6 +60,15 @@ class TikTokLinkTests(unittest.TestCase):
         )
         self.assertEqual(tiktok._parse_rows([]), ("", 0, 0))
 
+    def test_parse_rows_accepts_month_day_time(self):
+        """桌面非英文界面把时间写成「10-2」（省略年份），不能漏掉点赞数与回复数。"""
+        when, likes, replies = tiktok._parse_rows(
+            ["y", "", "这音乐太带派了😭", "10-2", "", "回复", "", "173", "查看 13 条回复"]
+        )
+        self.assertEqual(when, "10-2")
+        self.assertEqual(likes, 173)
+        self.assertEqual(replies, 13)
+
     def test_to_comment(self):
         item = {
             "user": "うえさま",
