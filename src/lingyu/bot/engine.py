@@ -307,7 +307,7 @@ class BotEngine:
             adapter.add_message_listener(listener)
         self._consume_task = asyncio.create_task(self._consume())
         self._proactive_task = asyncio.create_task(self._proactive_loop())
-        self._log("info", "自动回复已开启。")
+        self._log("info", "消息引擎已启动（聊天 / 链接解析 / 撤回按各自开关工作）。")
 
     async def set_adapters(self, adapters: list[Any]) -> None:
         """替换全部适配器（多端并行 / 平台或凭据变更），保留会话与人格状态。
@@ -354,7 +354,7 @@ class BotEngine:
         self._comment_tasks.clear()
         self._comment_task_chat.clear()
         self._commenting_urls.clear()
-        self._log("info", "自动回复已停止。")
+        self._log("info", "消息引擎已停止（聊天与链接解析都不再工作）。")
 
     def _enqueue(self, record: MessageRecord, adapter: Any = None) -> None:
         # 适配层回调在事件循环线程中同步调用，put_nowait 安全。
@@ -547,6 +547,11 @@ class BotEngine:
         # 链接服务：与「这条消息要不要回」无关。群里没 @ 机器人也该解析，
         # 因为这是确定性动作，不是「接话」。放在 _should_reply 之前。
         acked = await self._handle_links(record)
+
+        # 聊天总开关只管「要不要开口」：关掉后撤回与链接解析照常工作，
+        # 但不进入情绪内核，也不产生任何聊天回复。
+        if not self._config.enabled:
+            return
 
         if not self._should_reply(record):
             self._explain_no_reply(record)

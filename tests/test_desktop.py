@@ -517,6 +517,38 @@ class QQBindingApiTests(unittest.TestCase):
         self.assertTrue(state["connect"]["ok"])
         self.assertEqual(state["connect"]["adapters"][0]["platform"], "qq")
 
+    def test_link_parsing_keeps_engine_running_with_chat_off(self):
+        """聊天总开关关掉，只要链接解析还开着，引擎就应继续监听。"""
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(enabled=False, link_parse_enabled=True, recall_enabled=True)
+        engine = self._engine()
+        api = self._api(cfg, SimpleNamespace(get_status=lambda: self._status()), engine)
+
+        with mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            asyncio.run(api._save_config_async(BotConfig.from_dict(cfg.to_dict())))
+
+        self.assertTrue(engine.running, "链接解析还开着，引擎不该停")
+
+    def test_all_features_off_stops_engine(self):
+        """聊天、链接解析、撤回全部关闭时引擎才停。"""
+        import asyncio
+
+        from lingyu.bot import BotConfig
+
+        cfg = BotConfig(
+            enabled=False, link_parse_enabled=False, recall_enabled=False
+        )
+        engine = self._engine(running=True)
+        api = self._api(cfg, SimpleNamespace(get_status=lambda: self._status()), engine)
+
+        with mock.patch.object(BotConfig, "save", lambda self, path=None: None):
+            asyncio.run(api._save_config_async(BotConfig.from_dict(cfg.to_dict())))
+
+        self.assertFalse(engine.running)
+
     def test_build_adapters_can_enable_both_terminals(self):
         from lingyu.bot import BotConfig
 

@@ -372,7 +372,7 @@ class DesktopApi:
                 self.engine.log(
                     "warning", f"{self._adapter_label(adapter)} 连接失败：{result}"
                 )
-        if self.config.enabled:
+        if self.config.engine_required:
             await self.engine.start()
 
     @staticmethod
@@ -484,9 +484,9 @@ class DesktopApi:
             # 终端开关 / 凭据变了：立刻重建全部适配器并连接，不需要重启程序。
             connect_result = await self._switch_adapters_async(new)
         else:
-            if new.enabled and not self.engine.running:
+            if new.engine_required and not self.engine.running:
                 await self.engine.start()
-            elif not new.enabled and self.engine.running:
+            elif not new.engine_required and self.engine.running:
                 await self.engine.stop()
             # 就地更新共享对象：引擎与本 API 持有同一引用，立即生效。
             self.config.__dict__.update(new.to_dict())
@@ -513,9 +513,9 @@ class DesktopApi:
         self.adapter = self.adapters[0]
         # set_adapters 会按引擎原本的运行状态停/启，监听自动挂到新适配器上。
         await self.engine.set_adapters(self.adapters)
-        if self.config.enabled and not self.engine.running:
+        if self.config.engine_required and not self.engine.running:
             await self.engine.start()
-        elif not self.config.enabled and self.engine.running:
+        elif not self.config.engine_required and self.engine.running:
             await self.engine.stop()
 
         entries: list[dict] = []

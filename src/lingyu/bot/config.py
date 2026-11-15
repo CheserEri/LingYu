@@ -214,6 +214,16 @@ class BotConfig:
         """去掉末尾斜杠，便于拼接 /chat/completions。"""
         return self.api_base.strip().rstrip("/")
 
+    @property
+    def engine_required(self) -> bool:
+        """是否需要启动消息引擎。
+
+        「聊天回复」「链接解析」「撤回」是三件独立的事：``enabled`` 只决定
+        要不要开口说话，不影响另外两项。任何一项开着，引擎就得在跑，
+        否则关掉聊天会连带把链接解析与撤回一起停掉。
+        """
+        return bool(self.enabled or self.link_parse_enabled or self.recall_enabled)
+
     def to_dict(self) -> dict:
         return asdict(self)
 

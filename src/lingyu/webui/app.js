@@ -105,8 +105,8 @@ function syncChatMaster() {
   if (!hint) return;
   hint.innerHTML = on
     ? "总开关已开启：按下面的「聊天」触发条件与「情感」设置工作。"
-    : "总开关已关闭：<b>完全停止聊天</b>——不回复任何消息，情绪内核也不运行。" +
-      "它就是「运行状态」页的自动回复开关，两边改哪边都立即生效。";
+    : "总开关已关闭：<b>不回复任何消息</b>，情绪内核也不参与。" +
+      "链接解析、热评截图、下载回发与撤回<b>仍然工作</b>——它们各有自己的开关。";
 }
 
 function collectDraft() {
@@ -511,14 +511,17 @@ function renderStatus(state) {
     list.length > 1
       ? `已连接 ${connected.length}/${list.length}`
       : (w.ok ? "已连接" : "未连接");
-  $("#s-listen").textContent = w.listening ? "监听中" : "未监听";
-  $("#s-bot").textContent = engine.running ? "运行中" : "已停止";
+  // 监听 = 引擎在跑；聊天开关只管「要不要开口」，两者不再是一回事。
+  $("#s-listen").textContent = engine.running ? "监听中" : "未监听";
+  // 「自动回复」卡片只看聊天总开关：关掉后链接解析仍会工作。
+  const chatOn = !!(state.config && state.config.enabled);
+  $("#s-bot").textContent = chatOn ? "运行中" : "已停止";
   const btn = $("#btn-toggle");
-  btn.textContent = engine.running ? "停止" : "开启";
-  btn.classList.toggle("primary", !engine.running);
-  btn.style.background = engine.running ? "#fff" : "";
-  btn.style.color = engine.running ? "#ef4444" : "";
-  btn.style.borderColor = engine.running ? "#fecaca" : "";
+  btn.textContent = chatOn ? "停止" : "开启";
+  btn.classList.toggle("primary", !chatOn);
+  btn.style.background = chatOn ? "#fff" : "";
+  btn.style.color = chatOn ? "#ef4444" : "";
+  btn.style.borderColor = chatOn ? "#fecaca" : "";
 
   $("#s-count").textContent = engine.reply_count_today;
   $("#s-last").textContent = fmtTime(engine.last_trigger_at);

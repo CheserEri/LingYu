@@ -212,6 +212,24 @@ class ConfigTests(EngineTestCase):
             path.write_text("not json", encoding="utf-8")
             self.assertIsInstance(BotConfig.load(path), BotConfig)
 
+    def test_engine_required_is_independent_of_chat_switch(self):
+        """聊天关掉不影响链接解析 / 撤回：任何一项开着引擎就得跑。"""
+        self.assertFalse(
+            BotConfig(
+                enabled=False, link_parse_enabled=False, recall_enabled=False
+            ).engine_required
+        )
+        self.assertTrue(
+            BotConfig(
+                enabled=False, link_parse_enabled=True, recall_enabled=False
+            ).engine_required
+        )
+        self.assertTrue(
+            BotConfig(
+                enabled=False, link_parse_enabled=False, recall_enabled=True
+            ).engine_required
+        )
+
 
 class TriggerTests(EngineTestCase):
     def setUp(self):
@@ -5751,6 +5769,22 @@ class LinkEngineTests(AsyncEngineTestCase):
         )
         await adapter.pump()
         self.assertNotIn("[链接]", self._user_text(llm))
+        await engine.stop()
+
+    async def test_links_work_when_chat_switch_is_off(self):
+        """关掉聊天总开关：链接照常处理，但一条聊天回复都不发。"""
+        adapter = FakeAdapter()
+        engine, llm = self._engine(adapter, enabled=False)
+        url = MEDIA_URL
+        engine._links = StubResolver({url: LinkInfo(url=url, ok=True, title="X")})
+        await engine.start()
+        await adapter.dispatch(
+            make_record(is_at_me=True, message_id="m1", content=f"看看 {url}")
+        )
+        await adapter.pump()
+        # 固定链接提示属于链接服务，不经过模型，也不受聊天开关影响。
+        self.assertEqual(adapter.sent, [("测试群", "正在解析链接")])
+        self.assertEqual(llm.calls, 0)
         await engine.stop()
 
     async def test_prefetch_covers_whole_context(self):
