@@ -33,7 +33,7 @@ from typing import Any, Callable
 from ..schemas import MessageRecord
 from .config import BotConfig
 from . import recall as recall_mod
-from . import storage, tweet, xiaohongshu
+from . import comments, storage, tweet, xiaohongshu
 from .card import note_to_card
 from .emotion import EmotionBridge, EmotionDecision, SessionStore
 from .links import (
@@ -210,6 +210,10 @@ class BotEngine:
         # 下载任务 → 会话显示名：撤回时要把该会话还没发出去的下载一起掐掉，
         # 免得刚撤完又冒出来一条同样的内容。
         self._download_task_chat: dict[asyncio.Task, str] = {}
+        # 评论区热评截图：关键词按需触发时单独起任务；同一 URL 只截一次。
+        self._comment_tasks: set[asyncio.Task] = set()
+        self._comment_task_chat: dict[asyncio.Task, str] = {}
+        self._commenting_urls: set[str] = set()
 
         # 撤回：记录机器人最近发出的消息（文本 + 附件），供「@机器人 撤回」定位。
         self._recall_book = recall_mod.RecallBook()
@@ -345,6 +349,11 @@ class BotEngine:
             task.cancel()
         self._download_tasks.clear()
         self._downloading_urls.clear()
+        for task in list(self._comment_tasks):
+            task.cancel()
+        self._comment_tasks.clear()
+        self._comment_task_chat.clear()
+        self._commenting_urls.clear()
         self._log("info", "自动回复已停止。")
 
     def _enqueue(self, record: MessageRecord, adapter: Any = None) -> None:
@@ -639,6 +648,14 @@ class BotEngine:
                 continue
             task.cancel()
             cancelled += 1
+        # 热评截图也是机器人发出的媒体，同样要掐掉。
+        for task in list(self._comment_tasks):
+            if self._comment_task_chat.get(task) != chat:
+                continue
+            if task.done():
+                continue
+            task.cancel()
+            cancelled += 1
         return cancelled
 
     async def _handle_recall(self, record: MessageRecord) -> bool:
@@ -926,6 +943,12 @@ class BotEngine:
                 return False
             self._link_handled_ids.append(record.message_id)
 
+        # 关键词按需：消息里带「热评」且是抖音/TikTok 链接时，即使没开
+        # 「下载并回发」也单独回一张热评图。下载那条路会自己附带，重复触发
+        # 由 ``_commenting_urls`` 去重。
+        if config.link_comments_enabled and self._comment_keyword_hit(record.content):
+            self._schedule_comments(record)
+
         ack = config.link_ack_text.strip()
         if not (config.link_ack_enabled and ack):
             # 提示关掉时仍要把链接内容回发，否则这个功能就完全没动作了。
@@ -966,6 +989,88 @@ class BotEngine:
 
         task.add_done_callback(_done)
 
+    # ------------------------------------------------------------------ 热评截图
+
+    def _comment_keyword_hit(self, text: str) -> bool:
+        """消息里是否出现了「热评」这类按需触发词。"""
+        keywords = self._config.comment_keyword_list()
+        return any(word in (text or "") for word in keywords)
+
+    def _schedule_comments(self, record: MessageRecord) -> None:
+        """把「按需取热评」放到后台执行，不阻塞消息消费循环。"""
+        urls = [
+            url
+            for url in self._supported_urls(record.content)
+            if comments.supports(url)
+        ][:2]
+        if not urls:
+            return
+        task = asyncio.create_task(self._comments_for_message(record, urls))
+        self._comment_tasks.add(task)
+        self._comment_task_chat[task] = record.chat
+
+        def _done(_task: "asyncio.Task[None]") -> None:
+            self._comment_tasks.discard(task)
+            self._comment_task_chat.pop(task, None)
+
+        task.add_done_callback(_done)
+
+    async def _comments_for_message(
+        self, record: MessageRecord, urls: list[str]
+    ) -> None:
+        outdir = self._config.download_dir()
+        # 截图要发回聊天，目录得先进适配器的发送白名单（见 _ensure_download_dir_allowed）。
+        self._ensure_download_dir_allowed(outdir)
+        for url in urls:
+            await self._send_comments(record, url, outdir)
+
+    async def _send_comments(
+        self, record: MessageRecord, url: str, outdir: Path
+    ) -> None:
+        """取抖音 / TikTok 评论区热评，渲染成一张图发回聊天。
+
+        失败只写日志、不往聊天里发提示：热评是**附加**内容，视频本身该发的
+        已经发过了，再补一条「截图失败」只会让聊天更吵。
+        """
+        if not self._config.link_comments_enabled:
+            return
+        if url in self._commenting_urls:
+            return
+        self._commenting_urls.add(url)
+        try:
+            loop = asyncio.get_running_loop()
+            # 分享短链（v.douyin.com / vm.tiktok.com）里没有作品 ID，先展开。
+            target = await loop.run_in_executor(
+                None, self._links.expand_short_link, url
+            )
+            digest = await loop.run_in_executor(
+                None,
+                lambda: comments.for_url(
+                    target,
+                    limit=self._config.link_comments_count,
+                    logger=self._log,
+                    timeout=self._config.link_parse_timeout,
+                ),
+            )
+            if not digest.ok:
+                self._log("warning", f"评论区截图失败 {url}：{digest.error}")
+                return
+            if not digest.comments:
+                self._log("info", f"没有取到评论，跳过截图：{url}")
+                return
+            card = await loop.run_in_executor(
+                None,
+                lambda: comments.render_card(digest, outdir, logger=self._log),
+            )
+            if not card:
+                self._log("warning", f"评论区截图渲染失败：{url}")
+                return
+            await self._send_file(record.chat, card, "评论区截图")
+        except Exception as exc:  # 附加内容不该影响主流程
+            self._log("warning", f"评论区截图异常 {url}：{exc}")
+        finally:
+            self._commenting_urls.discard(url)
+
     async def _download_and_send(self, record: MessageRecord) -> None:
         """把触发消息里链接的内容发回当前聊天。
 
@@ -984,6 +1089,10 @@ class BotEngine:
                     await self._send_tweet(record, url, outdir)
                 elif xiaohongshu.is_xhs_url(url):
                     await self._send_xhs(record, url, outdir)
+                elif comments.supports(url):
+                    # 抖音 / TikTok：先把视频发出去，再补一张评论区热评图。
+                    await self._download_and_send_one(record, url, outdir)
+                    await self._send_comments(record, url, outdir)
                 else:
                     await self._download_and_send_one(record, url, outdir)
         finally:

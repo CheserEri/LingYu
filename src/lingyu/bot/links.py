@@ -445,6 +445,8 @@ _SHORT_LINK_HOSTS = {
     "v.douyin.com",   # 抖音
     "xhslink.com",    # 小红书
     "xhslink.cn",     # 小红书（App 分享文案用这个）
+    "vm.tiktok.com",  # TikTok 分享短链
+    "vt.tiktok.com",
     "t.cn",           # 微博
     "sourl.cn",
     "dwz.cn",
@@ -460,6 +462,7 @@ _SHORT_LINK_TARGET_RE = re.compile(
     r"|douyin\.com/video/\d+"
     r"|xiaohongshu\.com/[A-Za-z0-9/_\-]+(?:\?[A-Za-z0-9=&%_\-.~:+/]*)?"
     r"|weibo\.com/[A-Za-z0-9/_\-]+"
+    r"|tiktok\.com/@[A-Za-z0-9._\-]+/(?:video|photo)/\d+"
     r")",
     re.IGNORECASE,
 )

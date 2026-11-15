@@ -3206,7 +3206,8 @@ class DouyinTests(EngineTestCase):
         self.assertTrue(video.ok)
         self.assertEqual(video.title, "标题")
         self.assertEqual(video.video_url, "https://v/1.mp4")
-        self.assertEqual(calls["xhr"], 2)  # 第一次 403，重试后成功
+        # 1 次 403 + 1 次详情成功 + 1 次顺带取评论（都在同一个页面会话里）
+        self.assertEqual(calls["xhr"], 3)
         self.assertIn("/video/123", calls["navigate"])
         self.assertTrue(calls["closed"])
 

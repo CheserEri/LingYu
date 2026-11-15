@@ -163,6 +163,14 @@ class BotConfig:
     # 头像/昵称/正文/竖排长图/页脚）。图文笔记只发卡片（不下载原图），
     # 视频笔记在卡片之后再下载视频回发。
     link_xhs_card_enabled: bool = True
+    # 抖音 / TikTok 视频额外发一张「评论区热评」截图（前 N 条，按点赞排序）。
+    # 与「下载并回发」相互独立：消息里带关键词（默认「热评」）时，即使没开
+    # 下载也会单独回一张热评图。
+    link_comments_enabled: bool = True
+    # 截图里取几条热评（1–20）。
+    link_comments_count: int = 10
+    # 「按需触发」关键词（逗号分隔）；留空 = 只能等下载时自动附带。
+    link_comments_keywords: str = "热评"
     # 识别到链接时先回一句**固定**提示（不经过大模型），让用户知道正在处理。
     # 私聊与群聊都生效（群聊里不必 @ 机器人）。
     link_ack_enabled: bool = True
@@ -277,6 +285,13 @@ class BotConfig:
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)
         config.link_tweet_translate = bool(config.link_tweet_translate)
         config.link_xhs_card_enabled = bool(config.link_xhs_card_enabled)
+        config.link_comments_enabled = bool(config.link_comments_enabled)
+        config.link_comments_count = min(
+            20, max(1, int(config.link_comments_count))
+        )
+        config.link_comments_keywords = str(
+            config.link_comments_keywords or ""
+        ).strip()
         # 目标语言留空即回到默认值——空串会让提示词变成「翻译成」这种半句话。
         config.link_tweet_translate_target = (
             str(config.link_tweet_translate_target or "").strip() or "简体中文"
@@ -325,6 +340,11 @@ class BotConfig:
     def recall_keyword_list(self) -> list[str]:
         """撤回指令词列表。"""
         return parse_recall_keywords(self.recall_keywords)
+
+    def comment_keyword_list(self) -> list[str]:
+        """评论区截图的关键词（配置里用逗号/换行分隔）。"""
+        raw = re.split(r"[,，、;；\s]+", str(self.link_comments_keywords or ""))
+        return [item.strip() for item in raw if item.strip()]
 
     def download_dir(self) -> Path:
         """链接下载目录：显式配置优先，否则用 %APPDATA%\\lingyu\\downloads。"""

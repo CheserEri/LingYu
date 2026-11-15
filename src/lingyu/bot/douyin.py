@@ -48,7 +48,10 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:  # 只用于类型标注，避免与 comments.py 循环导入
+    from .comments import Comment
 
 # --------------------------------------------------------------------------- #
 # SM3（GB/T 32905-2016）
@@ -754,12 +757,311 @@ def _cache_store(aweme_id: str, video: DouyinVideo) -> None:
 
 
 def forget_cached(aweme_id: str = "") -> None:
-    """清详情缓存；不传 ID 则全清（直链过期导致下载失败时用）。"""
+    """清详情缓存；不传 ID 则全清（直链过期导致下载失败时用）。
+
+    评论缓存跟着一起清：两者都来自同一次浏览器会话，只清一半会让「重新取」
+    拿回旧评论。
+    """
     with _CACHE_LOCK:
         if aweme_id:
             _DETAIL_CACHE.pop(aweme_id, None)
+            _COMMENT_CACHE.pop(aweme_id, None)
         else:
             _DETAIL_CACHE.clear()
+            _COMMENT_CACHE.clear()
+
+
+# --------------------------------------------------------------------------- #
+# 评论区
+# --------------------------------------------------------------------------- #
+
+_COMMENT_API_PATH = "/aweme/v1/web/comment/list/"
+#: 评论区缓存 TTL：热评变化很慢，半小时内复用足够。
+_COMMENT_TTL = 1800.0
+_COMMENT_CACHE_SIZE = 64
+_COMMENT_CACHE: "OrderedDict[str, tuple[float, list[Comment], int]]" = OrderedDict()
+#: 解析作品时顺带取回多少条（多取一些，按点赞排序后再截前 N 条）。
+_COMMENT_PREFETCH_COUNT = 20
+
+
+@dataclass
+class DouyinComments:
+    """一次评论抓取的结果。"""
+
+    aweme_id: str = ""
+    comments: list["Comment"] = field(default_factory=list)
+    #: 评论区总条数（接口的 ``total``），卡片标题用。
+    total: int = 0
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+def _comment_path(aweme_id: str, count: int) -> str:
+    """评论区接口的相对地址（参数顺序参与签名，勿随意调整）。"""
+    params = [
+        item for item in _web_params(aweme_id) if item[0] != "update_version_code"
+    ]
+    params += [
+        ("cursor", "0"),
+        ("count", str(max(1, int(count)))),
+        ("item_type", "0"),
+        ("whale_cut_token", ""),
+        ("cut_version", "1"),
+        ("rcFT", ""),
+    ]
+    return f"{_COMMENT_API_PATH}?{urllib.parse.urlencode(params)}"
+
+
+def _avatar_url(user: dict[str, Any]) -> str:
+    """取评论者头像地址（``avatar_thumb`` 优先，尺寸小、够画 60px 圆）。"""
+    for key in ("avatar_thumb", "avatar_medium", "avatar_larger"):
+        group = user.get(key) if isinstance(user, dict) else None
+        urls = (group or {}).get("url_list") or []
+        for url in urls:
+            text = str(url or "").strip()
+            if text.startswith("http"):
+                return text
+    return ""
+
+
+def parse_comments(payload: dict[str, Any]) -> list["Comment"]:
+    """把接口返回的 ``comments`` 转成 :class:`Comment`，**按点赞倒序**。
+
+    接口返回的是「最相关」顺序，并非点赞顺序（实测前三条 167 / 1 / 418），
+    所以「热评」得自己再排一次。
+    """
+    from .comments import Comment, relative_time
+
+    result: list[Comment] = []
+    for item in payload.get("comments") or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        author = str((item.get("user") or {}).get("nickname") or "").strip()
+        avatar_url = _avatar_url(item.get("user") or {})
+        try:
+            likes = int(item.get("digg_count") or 0)
+        except (TypeError, ValueError):
+            likes = 0
+        try:
+            replies = int(item.get("reply_comment_total") or 0)
+        except (TypeError, ValueError):
+            replies = 0
+        try:
+            created = int(item.get("create_time") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        result.append(
+            Comment(
+                author=author,
+                text=text,
+                likes=likes,
+                time_text=relative_time(created),
+                region=str(item.get("ip_label") or "").strip(),
+                replies=replies,
+                avatar_url=avatar_url,
+            )
+        )
+    result.sort(key=lambda comment: comment.likes, reverse=True)
+    return result
+
+
+def _comments_lookup(aweme_id: str) -> tuple[list["Comment"], int] | None:
+    now = time.time()
+    with _CACHE_LOCK:
+        entry = _COMMENT_CACHE.get(aweme_id)
+        if entry is None:
+            return None
+        ts, comments, total = entry
+        if now - ts > _COMMENT_TTL:
+            _COMMENT_CACHE.pop(aweme_id, None)
+            return None
+        _COMMENT_CACHE.move_to_end(aweme_id)
+        return comments, total
+
+
+def _comments_store(
+    aweme_id: str, comments: list["Comment"], total: int = 0
+) -> None:
+    with _CACHE_LOCK:
+        _COMMENT_CACHE[aweme_id] = (time.time(), comments, int(total))
+        _COMMENT_CACHE.move_to_end(aweme_id)
+        while len(_COMMENT_CACHE) > _COMMENT_CACHE_SIZE:
+            _COMMENT_CACHE.popitem(last=False)
+
+
+def forget_comments(aweme_id: str = "") -> None:
+    """清评论缓存（不传 ID 则全清）。"""
+    with _CACHE_LOCK:
+        if aweme_id:
+            _COMMENT_CACHE.pop(aweme_id, None)
+        else:
+            _COMMENT_CACHE.clear()
+
+
+def _fetch_comments_in_page(
+    page: Any,
+    aweme_id: str,
+    count: int,
+    log: Callable[[str, str], None],
+    *,
+    attempts: int = 3,
+    interval: float = 0.4,
+) -> tuple[list["Comment"], int, str]:
+    """在**已经打开作品页**的会话里取评论；返回 ``(评论, 总条数, 错误说明)``。"""
+    reason = ""
+    for _ in range(max(1, attempts)):
+        try:
+            status, body = page.xhr_get(
+                _comment_path(aweme_id, count), timeout_ms=10000
+            )
+        except Exception as exc:  # 页面可能正在客户端路由，下一轮再试
+            reason = f"页面尚未就绪：{exc}"
+            time.sleep(interval)
+            continue
+        if status == 200:
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                # 200 但返回 HTML：页面还在加载，签名环境没就绪，等下一轮。
+                reason = "评论接口返回的是页面而不是数据（尚未就绪）"
+                time.sleep(interval)
+                continue
+            status_code = payload.get("status_code")
+            if status_code not in (0, None):
+                reason = f"评论接口拒绝请求（status_code={status_code}）"
+                time.sleep(interval)
+                continue
+            try:
+                total = int(payload.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            return parse_comments(payload), total, ""
+        reason = (body or "").strip()[:120] or f"HTTP {status}"
+        time.sleep(interval)
+    return [], 0, reason or "抖音评论获取失败"
+
+
+def _piggyback_comments(
+    page: Any, aweme_id: str, log: Callable[[str, str], None]
+) -> None:
+    """解析作品成功后顺带把评论取回来（同一次会话，只多一个 XHR）。
+
+    失败只记日志：评论是附加内容，不能反过来让「解析 / 下载」失败。
+    """
+    try:
+        comments, total, error = _fetch_comments_in_page(
+            page, aweme_id, _COMMENT_PREFETCH_COUNT, log
+        )
+    except Exception as exc:
+        log("info", f"顺带获取抖音评论失败（不影响解析）：{exc}")
+        return
+    if not error:
+        _comments_store(aweme_id, comments, total)
+    else:
+        log("info", f"顺带获取抖音评论失败（不影响解析）：{error}")
+
+
+def fetch_comments_via_browser(
+    aweme_id: str,
+    *,
+    logger: Callable[[str, str], None] | None = None,
+    timeout: float = 30.0,
+    attempts: int = 20,
+    interval: float = 0.5,
+    count: int = 20,
+) -> DouyinComments:
+    """单独为一条作品开浏览器取评论（没有现成会话时用）。
+
+    平时用不到：:func:`fetch_video_via_browser` 成功后已经顺带取回并缓存了，
+    只有「只想要评论、不想等视频解析」的路径才会走到这里。
+    """
+    if not aweme_id:
+        return DouyinComments(error="未能从链接中识别作品 ID")
+
+    from . import browser
+
+    if not browser.browser_available():
+        return DouyinComments(
+            aweme_id=aweme_id,
+            error="未找到 Chrome/Edge，无法读取抖音评论（安装 Edge 后重试）",
+        )
+
+    log = logger or (lambda level, message: None)
+    if not _BROWSER_LOCK.acquire(timeout=_BROWSER_LOCK_TIMEOUT):
+        message = (
+            f"上一次浏览器解析超过 {_BROWSER_LOCK_TIMEOUT:.0f} 秒仍未结束，"
+            "本次跳过（重启程序可恢复）"
+        )
+        log("warning", f"抖音评论获取跳过：{message}")
+        return DouyinComments(aweme_id=aweme_id, error=message)
+
+    error = ""
+    comments: list["Comment"] = []
+    total = 0
+    try:
+        page = browser.BrowserSession(logger=log, timeout=timeout)
+        try:
+            page.start()
+            page.navigate(f"https://www.douyin.com/video/{aweme_id}")
+            page.wait_for(
+                "location.host.indexOf('douyin.com') >= 0",
+                timeout=min(timeout, 15.0),
+            )
+            # 等页面真正加载完：评论 XHR 要用页面已经装好的签名环境。
+            page.wait_for(
+                "document.readyState === 'complete'", timeout=min(timeout, 20.0)
+            )
+            comments, total, error = _fetch_comments_in_page(
+                page, aweme_id, count, log, attempts=attempts, interval=interval
+            )
+        finally:
+            # 会话清理很慢，同样丢后台，别挡住结果返回。
+            page.close(blocking=False)
+    except Exception as exc:
+        return DouyinComments(
+            aweme_id=aweme_id, error=f"浏览器获取抖音评论失败：{exc}"
+        )
+    finally:
+        _BROWSER_LOCK.release()
+
+    if error:
+        return DouyinComments(aweme_id=aweme_id, error=error)
+    _comments_store(aweme_id, comments, total)
+    return DouyinComments(aweme_id=aweme_id, comments=comments, total=total)
+
+
+def comments_for(
+    aweme_id: str,
+    *,
+    limit: int = 10,
+    logger: Callable[[str, str], None] | None = None,
+    timeout: float = 30.0,
+    force: bool = False,
+) -> DouyinComments:
+    """带缓存的评论获取，返回按点赞倒序的前 ``limit`` 条。"""
+    if not aweme_id:
+        return DouyinComments(error="未能从链接中识别作品 ID")
+    count = max(1, min(20, int(limit or 10)))
+    if not force:
+        hit = _comments_lookup(aweme_id)
+        if hit is not None:
+            comments, total = hit
+            return DouyinComments(
+                aweme_id=aweme_id, comments=comments[:count], total=total
+            )
+    batch = fetch_comments_via_browser(aweme_id, logger=logger, timeout=timeout)
+    return DouyinComments(
+        aweme_id=aweme_id,
+        comments=batch.comments[:count],
+        total=batch.total,
+        error=batch.error,
+    )
 
 
 def fetch_video_via_browser(
@@ -835,7 +1137,11 @@ def fetch_video_via_browser(
                         break
                     detail = payload.get("aweme_detail")
                     if detail:
-                        return parse_detail(detail)
+                        video = parse_detail(detail)
+                        # 评论区在同一个页面里顺带取回并缓存：签名已就绪，只多
+                        # 一个 XHR；失败不影响解析结果（见 _piggyback_comments）。
+                        _piggyback_comments(page, aweme_id, log)
+                        return video
                     reason = (
                         "接口未返回作品数据"
                         f"（status_code={payload.get('status_code')}）"

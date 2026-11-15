@@ -14,7 +14,7 @@ $$("#nav .nav-item").forEach((item) => {
     item.classList.add("active");
     $("#page-" + item.dataset.page).classList.add("active");
     // 情绪是「观测」页：切进来时按需拉一次，避免常驻轮询读状态文件。
-    if (item.dataset.page === "emotion") {
+    if (item.dataset.page === "chat") {
       loadEmotion();
       loadPersona();
     }
@@ -50,6 +50,14 @@ function bindDraftToControls() {
         const label = rangeLabel(el);
         if (label) label.textContent = fmtRange(el.value);
       } else draft[key] = el.value;
+      if (key === "enabled") {
+        // 总开关本身就是「应用」动作：与运行状态页的按钮走同一条保存链路，
+        // 勾上就起引擎、取消就停引擎，不需要再点「保存设置」。
+        saveAll()
+          .then(() => toast(draft.enabled ? "聊天与情感已开启" : "已停止聊天"))
+          .catch((err) => toast("应用总开关失败：" + err, "err"));
+        return;
+      }
       if (key === "wechat_enabled" || key === "qq_enabled") {
         // 至少保留一个终端，否则保存后没有任何适配器可接消息。
         if (!draft.wechat_enabled && !draft.qq_enabled) {
@@ -81,6 +89,24 @@ function bindDraftToControls() {
 
   // 撤回指令的允许成员
   $("#recall-admins-input").value = (draft.recall_admins || []).join("\n");
+
+  syncChatMaster();
+}
+
+// 总开关的状态徽标与说明：关闭时页面仍可编辑，只是明确提示「现在不会聊天」。
+function syncChatMaster() {
+  const on = !!draft && !!draft.enabled;
+  const chip = $("#chat-state");
+  if (chip) {
+    chip.textContent = on ? "运行中" : "已停止";
+    chip.className = "chat-state " + (on ? "on" : "off");
+  }
+  const hint = $("#chat-master-hint");
+  if (!hint) return;
+  hint.innerHTML = on
+    ? "总开关已开启：按下面的「聊天」触发条件与「情感」设置工作。"
+    : "总开关已关闭：<b>完全停止聊天</b>——不回复任何消息，情绪内核也不运行。" +
+      "它就是「运行状态」页的自动回复开关，两边改哪边都立即生效。";
 }
 
 function collectDraft() {
@@ -122,7 +148,11 @@ async function saveAll() {
     toast("设置已保存");
   }
 }
-$("#save-chats").addEventListener("click", saveAll);
+$("#save-chat").addEventListener("click", async () => {
+  await saveAll();
+  loadEmotion();
+  loadPersona();
+});
 $("#save-links").addEventListener("click", saveAll);
 $("#save-recall").addEventListener("click", saveAll);
 $("#save-model").addEventListener("click", saveAll);
@@ -176,11 +206,6 @@ $("#test-qq").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
   }
-});
-$("#save-emotion").addEventListener("click", async () => {
-  await saveAll();
-  loadEmotion();
-  loadPersona();
 });
 
 // ---------------- 总开关 / 连接 ----------------

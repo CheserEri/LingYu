@@ -21,13 +21,9 @@
           <svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
           <span>运行状态</span>
         </button>
-        <button class="nav-item" data-page="emotion">
+        <button class="nav-item" data-page="chat">
           <svg viewBox="0 0 24 24"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z"/></svg>
-          <span>情绪</span>
-        </button>
-        <button class="nav-item" data-page="chats">
-          <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.5A8 8 0 1 1 21 12z"/></svg>
-          <span>群聊设置</span>
+          <span>聊天与情感</span>
         </button>
         <button class="nav-item" data-page="links">
           <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l2.4-2.4a5 5 0 0 0-7.1-7.1L11.5 4.4"/><path d="M14 11a5 5 0 0 0-7.1 0L4.5 13.4a5 5 0 0 0 7.1 7.1l.9-.9"/></svg>
@@ -130,9 +126,41 @@
         <p class="hint">提示：自动回复在本程序运行期间有效。微信模式需要 PC 客户端已登录且主窗口可见；QQ 模式需要机器人保持在线。</p>
       </section>
 
-      <!-- 情绪 -->
-      <section class="page" id="page-emotion">
-        <h1 class="page-title">情绪</h1>
+      <!-- 聊天与情感（总开关 + 群聊设置 + 情绪内核） -->
+      <section class="page" id="page-chat">
+        <h1 class="page-title">聊天与情感</h1>
+
+        <div class="card" id="chat-master-card">
+          <label class="switch-row"><span>启用聊天与情感（总开关）<i class="chat-state off" id="chat-state">已停止</i></span>
+            <input type="checkbox" class="switch" data-key="enabled"/></label>
+          <p class="hint" id="chat-master-hint">关闭后<b>完全停止聊天</b>：不回复任何消息，情绪内核也不运行。它就是「运行状态」页的自动回复开关，两边改哪边都立即生效。</p>
+        </div>
+
+        <div class="group-title">聊天</div>
+
+        <div class="card">
+          <div class="card-label">触发条件</div>
+          <label class="switch-row"><span>群里有人 @我 时回复</span>
+            <input type="checkbox" class="switch" data-key="trigger_at"/></label>
+          <label class="switch-row"><span>群里有人引用/回复我的消息时回复</span>
+            <input type="checkbox" class="switch" data-key="trigger_reply"/></label>
+          <label class="switch-row"><span>私聊消息也回复</span>
+            <input type="checkbox" class="switch" data-key="reply_private"/></label>
+        </div>
+
+        <div class="card">
+          <div class="card-label">作用范围</div>
+          <div class="segmented">
+            <button type="button" class="seg active" data-scope="all">所有群</button>
+            <button type="button" class="seg" data-scope="custom">仅指定群</button>
+          </div>
+          <div class="field" id="groups-field" style="display:none">
+            <label>群名称列表（每行一个，需与微信显示的群名一致）</label>
+            <textarea rows="5" id="groups-input" placeholder="玩什么游戏？&#10;另一个群"></textarea>
+          </div>
+        </div>
+
+        <div class="group-title">情感</div>
 
         <div class="card">
           <label class="switch-row"><span>启用混合人格内核（身份 · 心境 · 情节记忆 · 人格札记）</span>
@@ -202,35 +230,8 @@
         <div class="actions">
           <button class="btn ghost" id="btn-reset-emotion">清空所有会话心境</button>
           <button class="btn ghost" id="btn-reset-persona">清空人格札记</button>
-          <button class="btn primary" id="save-emotion">保存设置</button>
+          <button class="btn primary" id="save-chat">保存设置</button>
         </div>
-      </section>
-
-      <!-- 群聊设置 -->
-      <section class="page" id="page-chats">
-        <h1 class="page-title">群聊设置</h1>
-        <div class="card">
-          <div class="card-label">触发条件</div>
-          <label class="switch-row"><span>群里有人 @我 时回复</span>
-            <input type="checkbox" class="switch" data-key="trigger_at"/></label>
-          <label class="switch-row"><span>群里有人引用/回复我的消息时回复</span>
-            <input type="checkbox" class="switch" data-key="trigger_reply"/></label>
-          <label class="switch-row"><span>私聊消息也回复</span>
-            <input type="checkbox" class="switch" data-key="reply_private"/></label>
-        </div>
-
-        <div class="card">
-          <div class="card-label">作用范围</div>
-          <div class="segmented">
-            <button type="button" class="seg active" data-scope="all">所有群</button>
-            <button type="button" class="seg" data-scope="custom">仅指定群</button>
-          </div>
-          <div class="field" id="groups-field" style="display:none">
-            <label>群名称列表（每行一个，需与微信显示的群名一致）</label>
-            <textarea rows="5" id="groups-input" placeholder="玩什么游戏？&#10;另一个群"></textarea>
-          </div>
-        </div>
-        <div class="actions"><button class="btn primary" id="save-chats">保存设置</button></div>
       </section>
 
       <!-- 链接解析 -->
@@ -338,6 +339,23 @@
           <label class="switch-row"><span>笔记链接额外发一张卡片图（与推文同一套版式）</span>
             <input type="checkbox" class="switch" data-key="link_xhs_card_enabled"/></label>
           <p class="hint">检测到小红书笔记链接时，本地把笔记渲染成一张图片（头像、昵称、标题+正文、配图、赞/评论）发回聊天。配图<b>竖排合成一张长图</b>（一条消息发完，不裁切、不拆条），超过 4 张时页脚标「共 N 张图」。<b>视频笔记</b>在卡片之后再下载视频一并回发；<b>图文笔记只发卡片</b>，不逐张发原图。需先开启上面的「下载并回发」。</p>
+        </div>
+        <div class="card">
+          <div class="card-label">抖音 / TikTok 评论区热评</div>
+          <label class="switch-row"><span>视频链接额外发一张「前十条热评」截图</span>
+            <input type="checkbox" class="switch" data-key="link_comments_enabled"/></label>
+          <p class="hint">抖音 / TikTok 视频下载后再发一张评论区热评图（按<b>点赞数</b>倒排——抖音接口本身不是按赞排序的）。抖音的评论是在解析作品时<b>顺带</b>取回的，不会多开一次浏览器；TikTok 的评论接口对未登录请求返回空体，改为打开评论侧栏读页面内容，会多花十几秒。</p>
+          <div class="grid-2">
+            <div class="field">
+              <label>截图取几条</label>
+              <input type="number" min="1" max="20" data-key="link_comments_count"/>
+            </div>
+            <div class="field">
+              <label>按需触发关键词</label>
+              <input type="text" data-key="link_comments_keywords" placeholder="热评"/>
+            </div>
+          </div>
+          <p class="hint">消息里出现关键词且带抖音 / TikTok 链接时，<b>即使没开「下载并回发」</b>也会单独回一张热评图；多个关键词用逗号分隔。</p>
         </div>
         <div class="actions"><button class="btn primary" id="save-links">保存设置</button></div>
       </section>
